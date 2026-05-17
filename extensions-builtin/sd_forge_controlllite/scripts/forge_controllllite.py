@@ -1,3 +1,5 @@
+import torch
+import torch.nn.functional as F
 from lib_controllllite.lib_controllllite import LLLiteLoader
 from lib_controllllite.lib_controllllite_anima import (
     ControlNetLLLiteDiT,
@@ -5,21 +7,26 @@ from lib_controllllite.lib_controllllite_anima import (
     load_lllite_weights_from_dict,
 )
 
+from backend.utils import load_torch_file
 from modules_forge.shared import add_supported_control_model
 from modules_forge.supported_controlnet import ControlModelPatcher
 
 
 class ControlLLLiteAnimaPatcher(ControlModelPatcher):
+
     @staticmethod
     def try_build_from_state_dict(state_dict, ckpt_path):
         if not any(k.startswith("lllite_dit") for k in state_dict):
             return None
-        return ControlLLLiteAnimaPatcher(state_dict)
+        _, metadata = load_torch_file(ckpt_path, return_metadata=True)
+        inpaint_masked_input: bool = (metadata or {}).get("lllite.inpaint_masked_input", None) == "true"
+        return ControlLLLiteAnimaPatcher(state_dict, inpaint=inpaint_masked_input)
 
-    def __init__(self, state_dict):
+    def __init__(self, state_dict: dict[str, torch.Tensor], inpaint: bool):
         super().__init__()
         self.state_dict = state_dict
-        self._lllite_net = None
+        self._is_inpaint = inpaint
+        self._lllite_net: ControlNetLLLiteDiT = None
 
     def process_before_every_sampling(self, process, cond, mask, *args, **kwargs):
         unet = process.sd_model.forge_objects.unet
@@ -31,8 +38,18 @@ class ControlLLLiteAnimaPatcher(ControlModelPatcher):
             self._lllite_net = ControlNetLLLiteDiT(dit, **cfg)
             load_lllite_weights_from_dict(self._lllite_net, self.state_dict)
             self._lllite_net = self._lllite_net.eval().to(device=device, dtype=dtype)
+            del self.state_dict
 
         cond_image = cond * 2.0 - 1.0
+        if self._is_inpaint:
+            assert isinstance(mask, torch.Tensor)
+            if mask.shape != cond_image.shape:
+                mask = F.interpolate(mask, size=(cond_image.shape[2], cond_image.shape[3]), mode="nearest")
+            inpaint_mask = mask.to(device=cond_image.device, dtype=cond_image.dtype)
+            cond_image = cond_image * (inpaint_mask < 0.5)
+            inpaint_mask = inpaint_mask * 2.0 - 1.0
+            cond_image = torch.cat([cond_image, inpaint_mask], dim=1)
+
         self._lllite_net.set_cond_image(cond_image.to(device=device, dtype=dtype))
         self._lllite_net.set_multiplier(self.strength)
         self._lllite_net.set_step_range(num_steps=process.steps, start_percent=self.start_percent, end_percent=self.end_percent)
