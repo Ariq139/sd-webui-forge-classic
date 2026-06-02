@@ -58,9 +58,20 @@ def gr_show(visible=True):
     return {"visible": visible, "__type__": "update"}
 
 
+def use_cfg(val: float | None):
+    return gr.skip() if val is None else gr.update(interactive=(val > 1.0))
+
+
 def no_config(*comps: gr.components.Component):
     for comp in comps:
         setattr(comp, "_internal_preset_param", True)
+
+
+def cleanup():
+    from modules_forge.main_thread import last_exception
+
+    if last_exception == "OOM":
+        sd_models.unload_model_weights()
 
 
 # Using constants for these since the variation selector isn't visible.
@@ -230,7 +241,7 @@ def create_ui():
                         with gr.Row():
                             distilled_cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Distilled CFG Scale", value=3.0, elem_id="txt2img_distilled_cfg_scale", scale=4)
                             cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="txt2img_cfg_scale", scale=4)
-                            cfg_scale.change(lambda v: gr.update(interactive=(v > 1.0)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
+                            cfg_scale.change(fn=use_cfg, inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
                             scripts.scripts_txt2img.setup_ui_for_section(category)
 
                     elif category == "accordions":
@@ -287,7 +298,7 @@ def create_ui():
                                     with gr.Column():
                                         hr_negative_prompt = gr.Textbox(label="Hires negative prompt", elem_id="hires_neg_prompt", show_label=False, lines=3, placeholder="Negative prompt for hires fix pass.\nLeave empty to use the same negative prompt as in first pass.", elem_classes=["prompt"])
 
-                                hr_cfg.change(lambda v: gr.update(interactive=(v > 1.0)), inputs=[hr_cfg], outputs=[hr_negative_prompt], queue=False, show_progress=False)
+                                hr_cfg.change(fn=use_cfg, inputs=[hr_cfg], outputs=[hr_negative_prompt], queue=False, show_progress=False)
 
                             scripts.scripts_txt2img.setup_ui_for_section(category)
 
@@ -374,8 +385,8 @@ def create_ui():
                 show_progress=False,
             )
 
-            toprow.prompt.submit(**txt2img_args)
-            toprow.submit.click(**txt2img_args)
+            toprow.prompt.submit(**txt2img_args).then(fn=cleanup)
+            toprow.submit.click(**txt2img_args).then(fn=cleanup)
 
             def select_gallery_image(index):
                 index = int(index)
@@ -540,8 +551,7 @@ def create_ui():
                                         img2img_batch_inpaint_mask_dir = gr.Textbox(label="Inpaint batch mask directory (required for inpaint batch processing only)", **shared.hide_dirs, elem_id="img2img_batch_inpaint_mask_dir")
                                 tab_batch_upload.select(fn=lambda: "upload", outputs=[img2img_batch_source_type])
                                 tab_batch_from_dir.select(fn=lambda: "from dir", outputs=[img2img_batch_source_type])
-                                with gr.Accordion("PNG info", open=False):
-                                    img2img_batch_use_png_info = gr.Checkbox(label="Append png info to prompts", elem_id="img2img_batch_use_png_info")
+                                with InputAccordion(False, label="Append PNG Info", elem_id="img2img_batch_use_png_info") as img2img_batch_use_png_info:
                                     img2img_batch_png_info_dir = gr.Textbox(label="PNG info directory", **shared.hide_dirs, placeholder="Leave empty to use input directory", elem_id="img2img_batch_png_info_dir")
                                     img2img_batch_png_info_props = gr.CheckboxGroup(["Prompt", "Negative prompt", "Seed", "CFG scale", "Sampler", "Steps", "Model hash", "Filename"], label="Parameters to take from png info", info="Prompts from png info will be appended to prompts set in ui.")
 
@@ -631,7 +641,7 @@ def create_ui():
                             distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=24.0, step=0.5, label="Distilled CFG Scale", value=3.0, elem_id="img2img_distilled_cfg_scale", scale=4)
                             cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="img2img_cfg_scale", scale=4)
                             image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label="Image CFG Scale", value=1.5, elem_id="img2img_image_cfg_scale", visible=False)
-                            cfg_scale.change(lambda v: gr.update(interactive=(v > 1.0)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
+                            cfg_scale.change(fn=use_cfg, inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
                             scripts.scripts_img2img.setup_ui_for_section(category)
 
                     elif category == "accordions":
@@ -746,8 +756,8 @@ def create_ui():
                 show_progress=False,
             )
 
-            toprow.prompt.submit(**img2img_args)
-            toprow.submit.click(**img2img_args)
+            toprow.prompt.submit(**img2img_args).then(fn=cleanup)
+            toprow.submit.click(**img2img_args).then(fn=cleanup)
 
             res_switch_btn.click(lambda w, h: (h, w), inputs=[width, height], outputs=[width, height], show_progress=False)
 
