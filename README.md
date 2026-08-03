@@ -22,25 +22,36 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 
 <br>
 
-## Features [Jun.]
+## Features [Aug.]
 > Most base features of the original [Automatic1111 Webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) should still function
 
 #### New Features
 
+- [X] Support [Krea 2](https://huggingface.co/krea/Krea-2-Turbo)
+    - `Turbo` / `Raw`
+- [X] Support **Krea 2 Identity Edit**
+    - require specific [LoRA](https://civitai.com/models/2761113/krea-2-identity-edit)
+    - enable in **Settings/Stable Diffusion**
 - [X] Support [Anima](https://huggingface.co/circlestone-labs/Anima)
+- [X] Support **Anima Edit**
+    - require specific [LoRA](https://civitai.com/models/2650553/anima-edit)
+    - enable in **Settings/Stable Diffusion**
 - [X] Support [Flux.2-Klein](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
-    - `4B` / `9B` *(**not** `FLUX.2-Dev`)*
+    - `4B` / `9B` (**not** `FLUX.2-Dev`)
 
 > [!Important]
 > To use `Flux.2-Klein` for regular `img2img`, toggle the functionality in **Settings/Stable Diffusion**
 
 - [X] Support [Ernie-Image](https://huggingface.co/baidu/ERNIE-Image)
     - `ernie-image` / `ernie-image-turbo`
+- [X] Support [PiD 1.5](https://huggingface.co/nvidia/PiD)
+    - `sdxl` / `qwen` / `flux1` / `flux2` (**not** `PixelDiT`)
+    - use `PiD Integrated` to automatically upscale after generation
 - [X] Support [Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image)
     - `z-image` / `z-image-turbo`
 - [X] Support [Wan 2.2](https://github.com/Wan-Video/Wan2.2)
+    - `14B` (**not** `5B`)
     - use `Refiner` to achieve **High Noise** / **Low Noise** switching
-        - enable `Refiner` in **Settings/Refiner**
 
 > [!Important]
 > To export a video, you need to have **[FFmpeg](https://ffmpeg.org/)** installed
@@ -65,8 +76,8 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > To be detected as a **Kontext** model, the model must include "`kontext`" in its path *(**e.g.** file name or folder name)*
 
 - Implement `ImageStitch Integrated`
-    - [X] support Multi-Image Inputs for `flux.2-klein` / `flux-kontext` / `qwen-image-edit`
-    - [X] support FirstLastFrameToVideo for `wan 2.2`
+    - [X] support multi-image inputs for **Edit** models
+    - [X] support FirstLastFrameToVideo for `Wan 2.2`
 - [X] Support [Nunchaku](https://github.com/nunchaku-tech/nunchaku) (`SVDQ`) Models
     - `flux-dev`, `flux-krea`, `flux-kontext`, `qwen-image`, `qwen-image-edit`, `z-image-turbo`
     - only `Flux` and `Qwen` support LoRA currently
@@ -75,7 +86,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - `Neta-Lumina` / `NetaYume-Lumina`
 - [X] Support [Chroma1-HD](https://huggingface.co/lodestones/Chroma1-HD)
 - [X] Support **MixedPrecision** Models
-    - `fp4mixed` / `fp8mixed` / `mxfp8` / `nvfp4` / `fp8_scaled`
+    - `fp4mixed` / `fp8mixed` / `mxfp8` / `nvfp4` / `fp8_scaled` / `int8_convrot` / `convrot_w4a4`
 - [X] Support [Flux.2-Small-Decoder](https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/blob/main/full_encoder_small_decoder.safetensors) & [Qwen2D VAE](https://huggingface.co/Anzhc/Qwen2D-VAE/blob/main/Qwen2D_VAE.safetensors)
 
 <br>
@@ -105,9 +116,6 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - see [Commandline](#by-neo)
 - [X] Support [SageAttention](https://github.com/thu-ml/SageAttention), [FlashAttention](https://github.com/Dao-AILab/flash-attention), `fp16_accumulation`, `torch._scaled_mm`
     - see [Commandline](#by-neo)
-- [X] Implement Triton Kernel for `matmul` in `torch.int8`
-    - speed up inference after quantization
-    - enable by selecting `int8` in the `Diffusion in Low Bits`
 - [X] Implement [Radial Attention](https://github.com/mit-han-lab/radial-attention)
     - speed up `Wan 2.2`
     - require **manually** installing [SpargeAttn](https://github.com/thu-ml/SpargeAttn)
@@ -132,6 +140,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - [X] Implement full precision calculation for `Mask blur` blending
     - enable in **Settings/img2img**
 - [X] Support TAESD / TAEHV live preview for all models
+- [X] Support video previews for ExtraNetworks
 - [X] Support loading upscalers in `half` precision
     - speed up; reduce quality
     - enable in **Settings/Upscaling**
@@ -144,6 +153,9 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - [SDXL](https://huggingface.co/kohya-ss/controlnet-lllite/tree/main) / [Anima](https://huggingface.co/kohya-ss/Anima-LLLite/tree/main)
 - [X] Support **Union** Controlnet
     - [SDXL](https://huggingface.co/xinsir/controlnet-union-sdxl-1.0) / [Chenkin](https://civitai.com/models/2527960/chenkin-unicontrol-xl)
+- [X] Support **Region** Controlnet
+    - [Anima](https://huggingface.co/Sen-sou/Anima-LLLite-Regional-Controlnet)
+    - use the **Region** mode to create color masks
 
 #### Removed Features
 
@@ -159,6 +171,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - [X] Some Samplers & Schedulers
 - [X] Some Compatibility Settings
 - [X] Stealth Infotext
+- [X] `bitsandbytes` Support
 
 #### Optimizations
 
@@ -193,12 +206,14 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - deobfuscate
     - eraser
     - hotkeys
+    - mobile friendly
 - [X] Optimize upscaler logics
 - [X] Optimize certain operations in `Spandrel`
 - [X] Optimize certain operations for `VAE`
 - [X] Speed up model loading
-- [X] Improve memory management
 - [X] Improve color correction
+- [X] Improve memory management
+- [X] Unload all models on `OutOfMemory`
 - [X] Update the implementation for `X/Y/Z Plot`
 - [X] Update the implementation for `Soft Inpainting`
 - [X] Update the implementation for `MultiDiffusion`
@@ -217,11 +232,15 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - change Units to `gr.Tab`
     - improve `masks` & `buttons`
     - remove multi-inputs, as they are "[misleading](https://github.com/lllyasviel/stable-diffusion-webui-forge/discussions/932)"
-- [X] Disable Refiner by default
-    - enable again in **Settings/Refiner**
-- [X] No longer install `bitsandbytes` by default
-    - see [Commandline](#by-neo)
-- [X] Improved non-Nvidia support
+- [X] Checkpoint Merger Rewrite
+    - update ui
+    - support modern models
+- [X] Refiner Rewrite
+    - update ui
+    - improve tooltips
+    - implement `Refiner CFG Scale`
+- [X] Improve inference speed
+- [X] Improve non-Nvidia support
 - [X] Lint & Format
 - [X] Update `Pillow`
     - faster image processing
@@ -298,7 +317,6 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - will also attempt to install `triton` automatically
 - `--flash`: Install the `flash_attn` package to speed up generation
 - `--nunchaku`: Install the `nunchaku` package to inference SVDQ models
-- `--bnb`: Install the `bitsandbytes` package to do low-bits (`nf4`) inference
 - `--onnxruntime-gpu`: Install the `onnxruntime` with the latest GPU support
 
 <br>
@@ -310,6 +328,11 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - `--tiled-conv2d`: Replace `Conv2d` ops with tiled variants
     - has greater reduction for **SD1** and **SDXL** VAE; less for **Wan** VAE
     - `64` / `128` / `256` / `512`
+
+<br>
+
+- `--enable-triton-backend`: Enable the use of Triton backend in `comfy-kitchen`
+    - *might* speed up inference
 
 <br>
 
@@ -358,6 +381,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 <br>
 
 > [!Tip]
+> - For **AMD**, refer to <a href="https://github.com/CS1o/Stable-Diffusion-Info/wiki/Webui-Installation-Guides#amd-forge-neo-with-rocm"><ins>CS1o</ins> 's Guide</a>
 > - For **Linux** and **macOS**, refer to [Wiki](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Unix)
 > - For **Docker** (`Nvidia`), refer to [Docker](docker/)
 
@@ -429,12 +453,4 @@ Buy me a <a href="https://ko-fi.com/Haoming">Coffee</a> ☕~
 <sub><i>
 <a href="https://paypal.me/hmgamingdonation">PayPal</a> me 💳~
 </i></sub>
-</p>
-
-<br>
-
-<p align="center">
-	<a href="https://www.star-history.com/?repos=Haoming02%2Fsd-webui-forge-classic&type=date&legend=top-left">
-		<img src="https://api.star-history.com/chart?repos=Haoming02/sd-webui-forge-classic&type=date&legend=top-left">
-	</a>
 </p>

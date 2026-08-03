@@ -18,7 +18,7 @@ from modules.processing import (
     StableDiffusionProcessingImg2Img,
     process_images,
 )
-from modules.sd_models import get_closet_checkpoint_match
+from modules.sd_models import get_closet_checkpoint_match, model_data
 from modules.shared import opts, state
 from modules.ui import _STEP, plaintext_to_html, sRound
 from modules_forge import main_thread
@@ -209,13 +209,18 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     image = images.fix_image(image)
     mask = images.fix_image(mask)
 
+    if "pid" in model_data.forge_loading_parameters["checkpoint_info"].filename.lower() and not (selected_scale_tab == 1 and scale_by == 4.0):
+        processing.logger.warning("Resize by 4x is recommended for PiD")
+
     if selected_scale_tab == 1 and not is_batch:
-        assert image, "Can't scale by because no image is selected"
+        assert image, 'Failed to "Resize by" because no input image is provided'
+        if mode in (2, 3, 4):
+            assert not inpaint_full_res, '"Only masked" does not support "Resize by"'
 
         width = sRound(image.width * scale_by)
         height = sRound(image.height * scale_by)
 
-    assert 0.0 <= denoising_strength <= 1.0, "can only work with strength in [0.0, 1.0]"
+    assert 0.0 <= denoising_strength <= 1.0, "Denoising Strength only supports [0.0, 1.0]"
 
     p = StableDiffusionProcessingImg2Img(
         outpath_samples=opts.outdir_samples or opts.outdir_img2img_samples,

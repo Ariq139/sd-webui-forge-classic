@@ -5,7 +5,6 @@ from backend import memory_management
 from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
 from backend.misc.image_resize import adaptive_resize
-from backend.modules.k_prediction import PredictionDiscreteFlow
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
@@ -27,7 +26,7 @@ class Wan(ForgeDiffusionEngine):
 
         vae = VAE(model=huggingface_components["vae"], is_wan=True)
 
-        k_predictor = PredictionDiscreteFlow(estimated_config)
+        k_predictor = self._get_predictor()
 
         unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
@@ -98,6 +97,8 @@ class Wan(ForgeDiffusionEngine):
             memory_management.logger.info("[Wan] ImageToVideo")
         elif self.start_image is None and self.end_image is not None:
             memory_management.logger.info("[Wan] LastFrameToVideo")
+        else:
+            raise SystemError("No images passed to Wan I2V...?")
 
         image = torch.ones((length, h, w, 3), device="cpu", dtype=torch.float32).mul(0.5)
         mask = torch.ones((1, 1, latent_shape[2] * 4, latent_shape[-2], latent_shape[-1]), device="cpu", dtype=torch.float32)
@@ -147,36 +148,32 @@ class Wan(ForgeDiffusionEngine):
     @torch.inference_mode()
     def encode_first_stage(self, x: torch.Tensor):
         b, _, h, w = x.shape
-        if x.size(0) > 1:
-            x = x[0].unsqueeze(0)  # enforce batch_size of 1
-        x = x.mul(0.5).add(0.5)
+        x = x[0].mul(0.5).add(0.5).unsqueeze(0)  # enforce batch_size of 1
 
         if dynamic_args.is_referencing:
             if b == 1:
                 # FirstLastFrameToVideo
                 self.end_image = x.cpu()
+                assert self.forge_objects.unet.model.diffusion_model.in_dim == 36
                 return
             else:
                 # LastFrameToVideo
                 self.end_image = x.cpu()
+                assert self.forge_objects.unet.model.diffusion_model.in_dim == 36
 
         else:
             if b == 1:
                 # img2img
                 sample = self.forge_objects.vae.encode(x.movedim(1, -1))
                 sample = self.forge_objects.vae.first_stage_model.process_in(sample)
+                assert self.forge_objects.unet.model.diffusion_model.in_dim == 16
                 return sample.to(x)
             else:
                 # FirstFrameToVideo
                 self.start_image = x.cpu()
+                assert self.forge_objects.unet.model.diffusion_model.in_dim == 36
 
         latent = torch.zeros([1, 16, ((b - 1) // 4) + 1, h // 8, w // 8], device=self.forge_objects.vae.device)
         self.image_to_video(b, list(latent.shape))
         sample = self.forge_objects.vae.first_stage_model.process_in(latent)
-        return sample.to(x)
-
-    @torch.inference_mode()
-    def decode_first_stage(self, x):
-        sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
         return sample.to(x)
