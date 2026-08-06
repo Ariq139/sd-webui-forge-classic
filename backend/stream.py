@@ -27,7 +27,7 @@ def get_vae_stream():
 
 
 def should_use_stream() -> bool:
-    return current_stream is not None and mover_stream is not None and not torch.compiler.is_compiling()
+    return memory_management.async_transfers_enabled() and current_stream is not None and not torch.compiler.is_compiling()
 
 
 current_stream = get_current_stream()

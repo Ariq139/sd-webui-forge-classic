@@ -161,7 +161,7 @@ class VAE:
         self.first_stage_model.to(self.vae_dtype)
         self.output_device = memory_management.intermediate_device()
 
-        self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
+        self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device, memory_component="vae")
         self.is_wan = is_wan
 
     def clone(self):

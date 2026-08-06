@@ -47,6 +47,30 @@ setup_logger(logger)
 cpu = torch.device("cpu")
 
 
+# Optional MMGP-inspired controls.
+#
+# Conceptual reference and original implementation:
+# https://github.com/deepbeepmeep/mmgp
+#
+# Forge does not replace its ModelPatcher with MMGP. These controls adapt the
+# compatible ideas (budgets, pinned host memory, asynchronous transfers, and
+# residency preferences) to Forge's existing model lifecycle. They are kept
+# separate so each feature can be enabled independently and disabled without
+# changing the default loading behavior.
+MEMORY_FEATURES = {
+    "enabled": False,
+    "budgets": False,
+    "pinned_memory": False,
+    "async_transfers": False,
+    "residency_hints": False,
+}
+MEMORY_BUDGETS_BYTES: dict[str, int] = {}
+MEMORY_RESIDENCY_COMPONENTS: set[str] = set()
+MEMORY_WORKING_VRAM_BYTES = 0
+MEMORY_PINNED_MEMORY_PERCENT = 45.0
+MEMORY_ASYNC_STREAMS = 2
+
+
 class VRAMState(Enum):
     DISABLED = 0  # No vram present: no need to move models to vram
     NO_VRAM = 1  # Very low vram: enable all the options to save vram
@@ -560,7 +584,9 @@ def extra_reserved_memory() -> float:
 
 
 def minimum_inference_memory() -> float:
-    return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
+    base_memory = (1024 * 1024 * 1024) * 0.8
+    working_memory = MEMORY_WORKING_VRAM_BYTES if feature_enabled("budgets") else 0
+    return max(base_memory, working_memory) + extra_reserved_memory()
 
 
 def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = []):
@@ -572,16 +598,24 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     cleanup_models_gc()
     unloaded_model = []
     can_unload = []
+    hinted_can_unload = []
     unloaded_models = []
 
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
-                can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
+                candidate = (-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i)
+                if residency_hint_enabled(shift_model.model):
+                    hinted_can_unload.append(candidate)
+                else:
+                    can_unload.append(candidate)
                 shift_model.currently_used = False
 
-    for x in sorted(can_unload):
+    # MMGP-style residency preference: hinted models are considered after
+    # ordinary cache entries. This is not a hard pin; hinted models are still
+    # unloaded as a last resort when the next operation needs the memory.
+    for x in sorted(can_unload) + sorted(hinted_can_unload):
         i = x[-1]
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
@@ -688,6 +722,17 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
 
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
+
+        # Forge's --lowvram/--novram calculation remains the source of truth for
+        # the VRAM mode. An optional component budget is an additional weight
+        # loading cap; it can make an existing offload decision more conservative,
+        # but it does not replace the VRAM state or disable low/novram behavior.
+        # It does not cap activation/workspace memory, which is protected
+        # separately by minimum_inference_memory().
+        component_budget = memory_budget_for_model(model)
+        if component_budget > 0 and not is_device_cpu(torch_dev):
+            if lowvram_model_memory == 0 or lowvram_model_memory > component_budget:
+                lowvram_model_memory = component_budget
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
         current_loaded_models.insert(0, loaded_model)
@@ -1392,12 +1437,19 @@ stream_counters: dict[torch.device, int] = {}
 
 
 def get_offload_stream(device: torch.device):
-    if NUM_STREAMS == 0:
+    if not async_transfers_enabled() or NUM_STREAMS == 0:
         return None
     if torch.compiler.is_compiling():
         return None
 
     stream_counter = stream_counters.get(device, 0)
+
+    if device in STREAMS and len(STREAMS[device]) != NUM_STREAMS:
+        # A settings change can happen while a generation is finishing. Keep
+        # old stream objects alive until this call rather than clearing them
+        # asynchronously from another thread.
+        del STREAMS[device]
+        stream_counters.pop(device, None)
 
     if device in STREAMS:
         ss = STREAMS[device]
@@ -1441,6 +1493,7 @@ PINNING_ALLOWED_TYPES = "Parameter"
 
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
+PINNING_ENABLED = bool(args.pin_shared_memory)
 
 if args.pin_shared_memory:
     if is_nvidia() or is_amd():
@@ -1463,7 +1516,7 @@ def discard_cuda_async_error():
 
 def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY
-    if MAX_PINNED_MEMORY <= 0:
+    if not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0:
         return False
 
     if type(tensor).__name__ != PINNING_ALLOWED_TYPES:
@@ -1498,9 +1551,6 @@ def pin_memory(tensor):
 
 def unpin_memory(tensor):
     global TOTAL_PINNED_MEMORY
-    if MAX_PINNED_MEMORY <= 0:
-        return False
-
     if not is_device_cpu(tensor.device):
         return False
 
@@ -1523,6 +1573,117 @@ def unpin_memory(tensor):
         discard_cuda_async_error()
 
     return False
+
+
+def feature_enabled(feature: str) -> bool:
+    """Return whether an optional memory feature is currently active."""
+    return bool(MEMORY_FEATURES.get("enabled", False) and MEMORY_FEATURES.get(feature, False))
+
+
+def async_transfers_enabled() -> bool:
+    """Keep the existing CLI stream option working independently of UI settings."""
+    return bool(args.cuda_stream is not None or feature_enabled("async_transfers"))
+
+
+def memory_component_for_model(model) -> str:
+    return getattr(model, "memory_component", "auto")
+
+
+def memory_budget_for_model(model) -> int:
+    if not feature_enabled("budgets"):
+        return 0
+    return max(0, int(MEMORY_BUDGETS_BYTES.get(memory_component_for_model(model), 0)))
+
+
+def residency_hint_enabled(model) -> bool:
+    return feature_enabled("residency_hints") and memory_component_for_model(model) in MEMORY_RESIDENCY_COMPONENTS
+
+
+def configure_memory_features(
+    *,
+    enabled: bool = False,
+    budgets: bool = False,
+    pinned_memory: bool = False,
+    async_transfers: bool = False,
+    residency_hints: bool = False,
+    model_budgets_mb: dict[str, int | float] | None = None,
+    working_vram_mb: int | float = 0,
+    pinned_memory_percent: int | float = 45,
+    async_streams: int = 2,
+    residency_components: set[str] | list[str] | tuple[str, ...] = (),
+):
+    """Apply MMGP-inspired settings without replacing Forge's manager.
+
+    The public MMGP implementation is available at:
+    https://github.com/deepbeepmeep/mmgp
+
+    This adapter deliberately keeps Forge's ModelPatcher, quantized tensor
+    types, and model cache as the source of truth.
+    """
+    global MEMORY_FEATURES
+    global MEMORY_BUDGETS_BYTES
+    global MEMORY_RESIDENCY_COMPONENTS
+    global MEMORY_WORKING_VRAM_BYTES
+    global MEMORY_PINNED_MEMORY_PERCENT
+    global MEMORY_ASYNC_STREAMS
+    global NUM_STREAMS
+    global PINNING_ENABLED
+    global MAX_PINNED_MEMORY
+
+    MEMORY_FEATURES = {
+        "enabled": bool(enabled),
+        "budgets": bool(budgets),
+        "pinned_memory": bool(pinned_memory),
+        "async_transfers": bool(async_transfers),
+        "residency_hints": bool(residency_hints),
+    }
+    MEMORY_BUDGETS_BYTES = {}
+    for component, value in (model_budgets_mb or {}).items():
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
+    MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ())
+    try:
+        MEMORY_WORKING_VRAM_BYTES = max(0, int(float(working_vram_mb) * 1024 * 1024))
+    except (TypeError, ValueError):
+        MEMORY_WORKING_VRAM_BYTES = 0
+    try:
+        MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, float(pinned_memory_percent)))
+    except (TypeError, ValueError):
+        MEMORY_PINNED_MEMORY_PERCENT = 45.0
+    try:
+        MEMORY_ASYNC_STREAMS = min(8, max(1, int(async_streams)))
+    except (TypeError, ValueError):
+        MEMORY_ASYNC_STREAMS = 2
+
+    requested_streams = MEMORY_ASYNC_STREAMS if feature_enabled("async_transfers") else 0
+    if args.cuda_stream is not None:
+        requested_streams = max(requested_streams, int(args.cuda_stream))
+    if requested_streams != NUM_STREAMS:
+        NUM_STREAMS = requested_streams
+        stream_counters.clear()
+
+    PINNING_ENABLED = bool(args.pin_shared_memory or feature_enabled("pinned_memory"))
+    if PINNING_ENABLED and (is_nvidia() or is_amd()):
+        pinned_percent = MEMORY_PINNED_MEMORY_PERCENT if feature_enabled("pinned_memory") else (45.0 if WINDOWS else 95.0)
+        MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * (pinned_percent / 100.0)
+    elif not args.pin_shared_memory:
+        MAX_PINNED_MEMORY = -1
+
+    # Settings changes can invoke this function once per changed option. Keep
+    # the diagnostic available without flooding normal startup output.
+    logger.debug(
+        "Optional memory features: enabled=%s budgets=%s pinned=%s async=%s residency=%s streams=%s",
+        MEMORY_FEATURES["enabled"],
+        feature_enabled("budgets"),
+        feature_enabled("pinned_memory"),
+        async_transfers_enabled(),
+        feature_enabled("residency_hints"),
+        NUM_STREAMS,
+    )
 
 
 # region Conv3d

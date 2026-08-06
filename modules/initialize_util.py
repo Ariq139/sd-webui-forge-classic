@@ -175,6 +175,38 @@ def reserve_memory():
     set_reserved_memory(opts.setting_allocated_vram)
 
 
+def configure_memory_features():
+    from backend.memory_management import configure_memory_features as apply_memory_features
+    from modules.shared import opts
+
+    apply_memory_features(
+        enabled=getattr(opts, "forge_memory_management_enabled", False),
+        budgets=getattr(opts, "forge_memory_budgets_enabled", False),
+        pinned_memory=getattr(opts, "forge_memory_pinned_memory_enabled", False),
+        async_transfers=getattr(opts, "forge_memory_async_transfers_enabled", False),
+        residency_hints=getattr(opts, "forge_memory_residency_hints_enabled", False),
+        model_budgets_mb={
+            "unet": getattr(opts, "forge_memory_unet_budget_mb", 0),
+            "text_encoder": getattr(opts, "forge_memory_text_encoder_budget_mb", 0),
+            "vae": getattr(opts, "forge_memory_vae_budget_mb", 0),
+            "controlnet": getattr(opts, "forge_memory_controlnet_budget_mb", 0),
+        },
+        working_vram_mb=getattr(opts, "forge_memory_working_vram_mb", 0),
+        pinned_memory_percent=getattr(opts, "forge_memory_pinned_memory_percent", 45),
+        async_streams=getattr(opts, "forge_memory_async_streams", 2),
+        residency_components=[
+            component
+            for component, option in (
+                ("unet", "forge_memory_keep_unet_loaded"),
+                ("text_encoder", "forge_memory_keep_text_encoder_loaded"),
+                ("vae", "forge_memory_keep_vae_loaded"),
+                ("controlnet", "forge_memory_keep_controlnet_loaded"),
+            )
+            if getattr(opts, option, False)
+        ],
+    )
+
+
 def clear_references():
     from backend.args import dynamic_args
 
@@ -187,6 +219,27 @@ def configure_opts_onchange():
     shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
     shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
     shared.opts.onchange("setting_allocated_vram", reserve_memory)
+    memory_feature_keys = (
+        "forge_memory_management_enabled",
+        "forge_memory_budgets_enabled",
+        "forge_memory_pinned_memory_enabled",
+        "forge_memory_async_transfers_enabled",
+        "forge_memory_residency_hints_enabled",
+        "forge_memory_working_vram_mb",
+        "forge_memory_unet_budget_mb",
+        "forge_memory_text_encoder_budget_mb",
+        "forge_memory_vae_budget_mb",
+        "forge_memory_controlnet_budget_mb",
+        "forge_memory_pinned_memory_percent",
+        "forge_memory_async_streams",
+        "forge_memory_keep_unet_loaded",
+        "forge_memory_keep_text_encoder_loaded",
+        "forge_memory_keep_vae_loaded",
+        "forge_memory_keep_controlnet_loaded",
+    )
+    for key in memory_feature_keys:
+        shared.opts.onchange(key, configure_memory_features, call=False)
+    configure_memory_features()
     shared.opts.onchange("klein_no_reference", clear_references)
     shared.opts.onchange("anima_do_reference", clear_references)
     shared.opts.onchange("krea2_do_reference", clear_references)

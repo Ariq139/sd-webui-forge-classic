@@ -205,6 +205,39 @@ The file can be viewed in <a href="chrome:tracing">Chrome</a> or on the <a href=
 
 options_templates.update(
     options_section(
+        ("memory-management", "Memory Management", "system"),
+        {
+            "forge_memory_management_explanation": OptionHTML("""
+These optional controls add MMGP-inspired memory policies on top of Forge's existing model patcher.<br>
+They are disabled by default. Enable the global switch first, then enable individual features below.<br>
+Lower budgets and more offloading can reduce VRAM usage but may increase generation time.<br>
+They do not replace Forge's VRAM modes or flags (<code>--gpu-only</code>, <code>--highvram</code>, <code>--lowvram</code>, <code>--novram</code>, <code>--cpu</code>, <code>--disable-smart-memory</code>, or <code>--reserve-vram</code>).<br>
+When enabled, a per-component budget may add a stricter weight-loading cap and the working-VRAM setting may make existing offloading more conservative; it does not disable the existing low/novram logic.<br>
+The legacy CLI options <code>--cuda-stream</code> and <code>--pin-shared-memory</code> remain independent compatibility options.<br>
+Conceptual reference and original implementation: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
+            """),
+            "forge_memory_management_enabled": OptionInfo(False, "Enable optional memory-management features").info("master switch; Forge's existing memory manager is always active"),
+            "forge_memory_budgets_enabled": OptionInfo(False, "Enable per-component VRAM budgets").info("limits loaded weight memory for the diffusion model, text encoder, VAE, and ControlNet"),
+            "forge_memory_pinned_memory_enabled": OptionInfo(False, "Enable pinned CPU memory").info("can speed CPU-to-GPU transfers at the cost of higher RAM usage"),
+            "forge_memory_async_transfers_enabled": OptionInfo(False, "Enable asynchronous weight transfers").info("uses additional CUDA/XPU streams to overlap weight movement"),
+            "forge_memory_residency_hints_enabled": OptionInfo(False, "Enable model residency hints").info("keeps selected components resident when possible; they are still unloaded as an OOM fallback"),
+            "forge_memory_working_vram_mb": OptionInfo(0, "Reserved working VRAM (MB)", gr.Number, {"minimum": 0, "maximum": 262144, "precision": 0}).info("minimum VRAM kept available for activations and inference; 0 = automatic"),
+            "forge_memory_unet_budget_mb": OptionInfo(0, "Diffusion model budget (MB)", gr.Number, {"minimum": 0, "maximum": 262144, "precision": 0}).info("0 = no per-component limit"),
+            "forge_memory_text_encoder_budget_mb": OptionInfo(0, "Text encoder budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = no per-component limit"),
+            "forge_memory_vae_budget_mb": OptionInfo(0, "VAE budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = no per-component limit"),
+            "forge_memory_controlnet_budget_mb": OptionInfo(0, "ControlNet budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = no per-component limit"),
+            "forge_memory_pinned_memory_percent": OptionInfo(45, "Maximum pinned RAM (%)", gr.Slider, {"minimum": 10, "maximum": 90, "step": 5}).info("Windows defaults to 45%; increase only if the system has sufficient RAM"),
+            "forge_memory_async_streams": OptionInfo(2, "Asynchronous transfer streams", gr.Slider, {"minimum": 1, "maximum": 8, "step": 1}).info("more streams may improve overlap but use more memory"),
+            "forge_memory_keep_unet_loaded": OptionInfo(False, "Prefer keeping the diffusion model resident"),
+            "forge_memory_keep_text_encoder_loaded": OptionInfo(False, "Prefer keeping the text encoder resident"),
+            "forge_memory_keep_vae_loaded": OptionInfo(False, "Prefer keeping the VAE resident"),
+            "forge_memory_keep_controlnet_loaded": OptionInfo(False, "Prefer keeping ControlNet resident"),
+        },
+    )
+)
+
+options_templates.update(
+    options_section(
         ("API", "API", "system"),
         {
             "api_enable_requests": OptionInfo(True, 'Allow "http://" and "https://" URLs as input images', restrict_api=True),

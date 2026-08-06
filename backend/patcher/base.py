@@ -148,7 +148,7 @@ def key_param_name_to_key(key: str, param: str) -> str:
 
 
 class ModelPatcher:
-    def __init__(self, model: torch.nn.Module, load_device: torch.device, offload_device: torch.device, size: int = 0, *, current_device: torch.device = None, weight_inplace_update: bool = False):
+    def __init__(self, model: torch.nn.Module, load_device: torch.device, offload_device: torch.device, size: int = 0, *, current_device: torch.device = None, weight_inplace_update: bool = False, memory_component: str = "auto"):
         self.size = size
         self.model = model
         self.current_device = current_device or offload_device
@@ -162,6 +162,9 @@ class ModelPatcher:
         self.model_options = {"transformer_options": {}}
         self.load_device = load_device
         self.offload_device = offload_device
+        # Logical component name used by the optional MMGP-inspired policies.
+        # It is metadata only; normal Forge patching is unchanged.
+        self.memory_component = memory_component
         self.weight_inplace_update = weight_inplace_update
         self.force_cast_weights = False
         self.patches_uuid = uuid.uuid4()
@@ -199,7 +202,7 @@ class ModelPatcher:
         return self.model.lowvram_patch_counter
 
     def clone(self):
-        n = self.__class__(self.model, self.load_device, self.offload_device, self.model_size(), current_device=self.current_device, weight_inplace_update=self.weight_inplace_update)
+        n = self.__class__(self.model, self.load_device, self.offload_device, self.model_size(), current_device=self.current_device, weight_inplace_update=self.weight_inplace_update, memory_component=self.memory_component)
 
         n.patches = {}
         for k in self.patches:
