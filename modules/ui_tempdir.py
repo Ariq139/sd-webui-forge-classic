@@ -23,7 +23,9 @@ def check_tmp_file(gradio_app: gr.Blocks, filename: os.PathLike) -> bool:
     return any(filename in fileset for fileset in gradio_app.temp_file_sets)
 
 
-def save_pil_to_file(pil_image: Image.Image, cache_dir: os.PathLike = None, format: str = "png"):
+def save_pil_to_file(pil_image: Image.Image, cache_dir: os.PathLike = None, name: str = "image", format: str = "webp"):
+    """Save an image using Gradio 5's cache API while preserving PNG metadata."""
+
     already_saved_as = getattr(pil_image, "already_saved_as", None)
     if already_saved_as and os.path.isfile(already_saved_as):
         register_tmp_file(shared.demo, already_saved_as)
@@ -34,8 +36,8 @@ def save_pil_to_file(pil_image: Image.Image, cache_dir: os.PathLike = None, form
     if shared.opts.temp_dir:
         dir = shared.opts.temp_dir
     else:
-        dir = cache_dir
-        os.makedirs(dir, exist_ok=True)
+        dir = cache_dir or tempfile.gettempdir()
+    os.makedirs(dir, exist_ok=True)
 
     use_metadata = False
     metadata = PngImagePlugin.PngInfo()
@@ -45,7 +47,11 @@ def save_pil_to_file(pil_image: Image.Image, cache_dir: os.PathLike = None, form
             use_metadata = True
 
     file_obj = tempfile.NamedTemporaryFile(delete=False, suffix=".png", dir=dir)
-    pil_image.save(file_obj, pnginfo=(metadata if use_metadata else None))
+    try:
+        pil_image.save(file_obj, format="PNG", pnginfo=(metadata if use_metadata else None))
+    finally:
+        file_obj.close()
+
     return file_obj.name
 
 
@@ -71,6 +77,9 @@ async def async_move_files_to_cache(data, block, postprocess=False, check_in_upl
     from gradio.utils import get_upload_folder, is_in_or_equal, is_static_file
     from gradio_client import utils as client_utils
 
+    api_prefix = getattr(gradio.processing_utils, "API_PREFIX", "")
+    is_file_obj = getattr(client_utils, "is_file_obj_with_meta", client_utils.is_file_obj)
+
     async def _move_to_cache(d: dict):
         payload = FileData(**d)
         payload.path = payload.path.rsplit("?", 1)[0]
@@ -95,11 +104,12 @@ async def async_move_files_to_cache(data, block, postprocess=False, check_in_upl
                     if keep_in_cache:
                         block.keep_in_cache.add(payload.path)
 
-        url_prefix = "/stream/" if payload.is_stream else "/file="
+        url_prefix = f"{api_prefix}/stream/" if payload.is_stream else f"{api_prefix}/file="
         if block.proxy_url:
             proxy_url = block.proxy_url.rstrip("/")
-            url = f"/proxy={proxy_url}{url_prefix}{payload.path}"
-        elif client_utils.is_http_url_like(payload.path) or payload.path.startswith(f"{url_prefix}"):
+            proxy_prefix = f"{api_prefix}/proxy={proxy_url}" if api_prefix else f"/proxy={proxy_url}"
+            url = f"{proxy_prefix}{url_prefix}{payload.path}"
+        elif client_utils.is_http_url_like(payload.path) or payload.path.startswith(f"{url_prefix}") or payload.path.startswith("/file=") or payload.path.startswith("/stream/"):
             url = payload.path
         else:
             url = f"{url_prefix}{payload.path}"
@@ -110,13 +120,13 @@ async def async_move_files_to_cache(data, block, postprocess=False, check_in_upl
     if isinstance(data, (GradioRootModel, GradioModel)):
         data = data.model_dump()
 
-    return await client_utils.async_traverse(data, _move_to_cache, client_utils.is_file_obj)
+    return await client_utils.async_traverse(data, _move_to_cache, is_file_obj)
 
 
 def install_ui_tempdir_override():
     """
     override save to file function so that it also writes PNG info.
-    override gradio4's move_files_to_cache function to prevent it from writing a copy into a temporary directory.
+    override Gradio's move_files_to_cache function to prevent it from writing a copy into a temporary directory.
     """
 
     gradio.processing_utils.save_pil_to_cache = save_pil_to_file

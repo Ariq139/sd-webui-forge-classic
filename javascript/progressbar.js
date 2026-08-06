@@ -43,16 +43,22 @@ function formatTime(secs) {
     }
 }
 
-let originalAppTitle = undefined;
+let originalAppTitle = document.title && document.title !== "undefined" ? document.title : "Stable Diffusion";
 
 onUiLoaded(function () {
-    originalAppTitle = document.title;
+    if (document.title && document.title !== "undefined") {
+        originalAppTitle = document.title;
+    }
 });
 
-function setTitle(progress) {
-    let title = originalAppTitle;
+function progressTitleEnabled() {
+    return typeof opts === "undefined" || opts.show_progress_in_title !== false;
+}
 
-    if (opts.show_progress_in_title && progress) {
+function setTitle(progress) {
+    let title = originalAppTitle || "Stable Diffusion";
+
+    if (progressTitleEnabled() && progress) {
         title = "[" + progress.trim() + "] " + title;
     }
 
@@ -148,7 +154,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
                     progressText += " ETA: " + formatTime(res.eta);
                 }
 
-                setTitle(progressText);
+                setTitle(progressText || "Generating");
 
                 if (res.textinfo && res.textinfo.indexOf("\n") == -1) {
                     progressText = res.textinfo + " " + progressText;
@@ -220,6 +226,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
         );
     };
 
+    setTitle("Generating");
     funProgress(id_task, 0);
 
     if (gallery) {

@@ -56,7 +56,7 @@
     }
 
     function setupBracketChecking(id_prompt, id_counter) {
-        const textarea = gradioApp().querySelector(`#${id_prompt} > label > textarea`);
+        const textarea = gradioApp().querySelector(`#${id_prompt} textarea[data-testid='textbox']`);
         const counter = gradioApp().getElementById(id_counter);
 
         if (textarea && counter)

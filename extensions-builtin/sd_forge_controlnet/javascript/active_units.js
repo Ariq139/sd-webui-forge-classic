@@ -31,7 +31,8 @@
     class ControlNetUnitTab {
         constructor(cnet, tab, index) {
             this.cnet = cnet;
-            this.unitHeader = tab.parentNode.querySelector(".tab-nav").querySelectorAll("button")[index];
+            const tabList = tab.parentNode?.querySelector(":scope > .tab-wrapper > .tab-container[role='tablist']");
+            this.unitHeader = tabList?.querySelectorAll("button[role='tab']")[index];
 
             this.enabledCheckbox = tab.querySelector(".cnet-unit-enabled input");
             this.inputImage = tab.querySelector('.cnet-input-image-group .cnet-image input[type="file"]');

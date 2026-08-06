@@ -1,5 +1,5 @@
 GitPython==3.1.57
-Pillow==12.3.0
+Pillow==11.3.0
 accelerate==1.14.0
 audioop-lts==0.2.2;python_version>="3.13"
 av==17.1.0
@@ -9,6 +9,8 @@ diskcache==5.6.3
 einops==0.8.2
 facexlib==0.3.0
 fastapi==0.127.1
+gradio==5.29.0
+gradio_rangeslider==0.0.8
 httpx==0.28.1
 huggingface-hub==0.36.2
 inflection==0.5.1

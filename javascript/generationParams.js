@@ -15,10 +15,12 @@ function setupListeners() {
     }
     if (!modal) {
         modal = gradioApp().getElementById("lightboxModal");
-        modalObserver.observe(modal, {
-            attributes: true,
-            attributeFilter: ["style"],
-        });
+        if (modal) {
+            modalObserver.observe(modal, {
+                attributes: true,
+                attributeFilter: ["style"],
+            });
+        }
     }
 
     if (!txt2img_gallery || !img2img_gallery || !modal) setTimeout(setupListeners, 50);
@@ -26,7 +28,7 @@ function setupListeners() {
 
 let modalObserver = new MutationObserver(function (mutations) {
     mutations.forEach(function (mutationRecord) {
-        let selectedTab = gradioApp().querySelector("#tabs div button.selected")?.innerText;
+        let selectedTab = gradioApp().querySelector("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab'].selected")?.innerText;
         if (mutationRecord.target.style.display === "none" && (selectedTab === "txt2img" || selectedTab === "img2img")) {
             gradioApp()
                 .getElementById(selectedTab + "_generation_info_button")

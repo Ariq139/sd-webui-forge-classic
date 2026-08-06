@@ -10,7 +10,7 @@ function dimensionChange(e, is_width, is_height) {
         currentHeight = e.target.value * 1.0;
     }
 
-    let inImg2img = gradioApp().querySelector("#tab_img2img").style.display == "block";
+    let inImg2img = getComputedStyle(gradioApp().querySelector("#tab_img2img")).display != "none";
 
     if (!inImg2img) {
         return;
@@ -89,7 +89,7 @@ onAfterUiUpdate(function () {
 
     let tabImg2img = gradioApp().querySelector("#tab_img2img");
     if (tabImg2img) {
-        if (tabImg2img.style.display == "block") {
+        if (getComputedStyle(tabImg2img).display != "none") {
             let inputs = gradioApp().querySelectorAll("input");
             inputs.forEach(function (e) {
                 let is_width =

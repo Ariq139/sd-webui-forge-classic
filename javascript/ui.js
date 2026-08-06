@@ -9,7 +9,7 @@ function set_theme(theme) {
 
 function all_gallery_buttons() {
     const allGalleryButtons = gradioApp().querySelectorAll(
-        '[style="display: block;"].tabitem div[id$=_gallery].gradio-gallery .thumbnails > .thumbnail-item.thumbnail-small',
+        '#tabs > .tabitem[id^=tab_]:not([style*="display: none"]) div[id$=_gallery].gradio-gallery .thumbnails > .thumbnail-item.thumbnail-small',
     );
     const visibleGalleryButtons = [];
     allGalleryButtons.forEach(function (elem) {
@@ -56,14 +56,14 @@ function extract_image_from_gallery(gallery) {
 window.args_to_array = Array.from; // Compatibility with e.g. extensions that may expect this to be around
 
 function switch_to_txt2img() {
-    gradioApp().querySelector("#tabs").querySelectorAll("button")[0].click();
+    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[0]?.click();
 
     return Array.from(arguments);
 }
 
 function switch_to_img2img_tab(no) {
-    gradioApp().querySelector("#tabs").querySelectorAll("button")[1].click();
-    gradioApp().getElementById("mode_img2img").querySelectorAll("button")[no].click();
+    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[1]?.click();
+    gradioApp().getElementById("mode_img2img").querySelectorAll(".tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[no]?.click();
 }
 
 function switch_to_img2img() {
@@ -87,13 +87,13 @@ function switch_to_inpaint_sketch() {
 }
 
 function switch_to_extras() {
-    gradioApp().querySelector("#tabs").querySelectorAll("button")[2].click();
+    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[2]?.click();
 
     return Array.from(arguments);
 }
 
 function get_tab_index(tabId) {
-    const buttons = gradioApp().getElementById(tabId).querySelector("div").querySelectorAll("button");
+    const buttons = gradioApp().getElementById(tabId).querySelectorAll(".tab-wrapper > .tab-container[role='tablist'] > button[role='tab']");
     for (let i = 0; i < buttons.length; i++) {
         if (buttons[i].classList.contains("selected")) {
             return i;
@@ -426,7 +426,7 @@ function selectCheckpoint(name) {
 }
 
 function currentImg2imgSourceResolution(w, h, r) {
-    const img = gradioApp().querySelector('#mode_img2img > div[style="display: block;"] :is(img, canvas)');
+    const img = gradioApp().querySelector('#mode_img2img > .tabitem:not([style*="display: none"]) :is(img, canvas)');
     if (!img) return [0, 0, r];
     const width = img.naturalWidth || img.width;
     const height = img.naturalHeight || img.height;

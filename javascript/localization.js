@@ -166,7 +166,7 @@ function download_localization() {
     document.body.removeChild(element);
 }
 
-document.addEventListener("DOMContentLoaded", function () {
+function setupLocalization() {
     if (!hasLocalization()) {
         return;
     }
@@ -201,4 +201,10 @@ document.addEventListener("DOMContentLoaded", function () {
             });
         }).observe(gradioApp(), { childList: true });
     }
-});
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setupLocalization);
+} else {
+    setupLocalization();
+}

@@ -201,3 +201,6 @@ function setupAllResizeHandles() {
 }
 
 onUiLoaded(setupAllResizeHandles);
+
+// Gradio 5 resolves component _js callbacks from window.
+window.setupAllResizeHandles = setupAllResizeHandles;

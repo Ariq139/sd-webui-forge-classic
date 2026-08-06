@@ -39,7 +39,9 @@ function recalculate_prompts_img2img() {
 function setupTokenCounting(id, id_counter, id_button) {
     let prompt = gradioApp().getElementById(id);
     let counter = gradioApp().getElementById(id_counter);
-    let textarea = gradioApp().querySelector(`#${id} > label > textarea`);
+    let textarea = gradioApp().querySelector(`#${id} textarea[data-testid='textbox']`);
+
+    if (!prompt || !counter || !textarea) return;
 
     if (counter.parentElement == prompt.parentElement) {
         return;

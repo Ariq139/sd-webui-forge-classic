@@ -283,13 +283,28 @@ def requirements_met(requirements_file):
     return True
 
 
+def package_version_matches(package, required_version):
+    """Return whether an installed package has the exact requested version."""
+
+    import packaging.version
+
+    try:
+        installed_version = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+    return packaging.version.parse(installed_version) == packaging.version.parse(required_version)
+
+
 def prepare_environment():
     torch_index_url = os.environ.get("TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu130")
     torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url {torch_index_url}")
     xformers_package = os.environ.get("XFORMERS_PACKAGE", f"xformers==0.0.35 --extra-index-url {torch_index_url}")
 
     packaging_package = os.environ.get("PACKAGING_PACKAGE", "packaging==26.2")
-    gradio_package = os.environ.get("GRADIO_PACKAGE", "gradio==4.40.0 gradio_rangeslider==0.0.8")
+    gradio_package = os.environ.get("GRADIO_PACKAGE", "gradio==5.29.0 gradio_rangeslider==0.0.8")
+    gradio_match = re.search(r"(?:^|\s)gradio==([^\s]+)", gradio_package)
+    gradio_required_version = gradio_match.group(1) if gradio_match else None
     requirements_file = os.environ.get("REQS_FILE", "requirements.txt")
 
     try:
@@ -400,7 +415,7 @@ assert cuda or xpu or mps
         run_pip("install ngrok", "ngrok")
         startup_timer.record("install ngrok")
 
-    if not is_installed("gradio"):
+    if not is_installed("gradio") or (gradio_required_version and not package_version_matches("gradio", gradio_required_version)):
         run_pip(f"install {gradio_package}", "gradio")
 
     if not os.path.isfile(requirements_file):

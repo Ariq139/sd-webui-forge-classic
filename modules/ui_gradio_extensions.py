@@ -1,69 +1,153 @@
+import json
 import os
 
 import gradio as gr
+import gradio.processing_utils
 
 from modules import localization, scripts, shared, util
 from modules.paths import data_path, script_path
 
 
+_assets_head = ""
+_assets_css_paths = []
+_assets_css = ""
+_assets_js = ""
+
+
+def _install_gradio_dropdown_compatibility():
+    """Normalize Gradio 4's empty multiselect value for Gradio 5 validation."""
+
+    original_preprocess = gr.Dropdown.preprocess
+    if getattr(original_preprocess, "_sd_webui_empty_multiselect_compat", False):
+        return
+
+    def preprocess(self, payload):
+        if self.multiselect and payload == "":
+            payload = []
+
+        return original_preprocess(self, payload)
+
+    preprocess._sd_webui_empty_multiselect_compat = True
+    gr.Dropdown.preprocess = preprocess
+
+
+_install_gradio_dropdown_compatibility()
+
+
 def webpath(fn):
-    return f"file={util.truncate_path(fn)}?{os.path.getmtime(fn)}"
+    api_prefix = getattr(gradio.processing_utils, "API_PREFIX", "")
+    return f"{api_prefix}/file={util.truncate_path(fn)}?{os.path.getmtime(fn)}"
 
 
-def javascript_html():
-    # Ensure localization is in `window` before scripts
-    head = f'<script type="text/javascript">{localization.localization_js(shared.opts.localization)}</script>\n'
-
+def javascript_js():
+    # Gradio 5 isolates/async-loads external head scripts. Bundle the project
+    # scripts into one ordered global evaluation through Blocks(js=...) so
+    # extensions see the webui callback functions before registering handlers.
+    sources = []
     script_js = os.path.join(script_path, "script.js")
-    head += f'<script type="text/javascript" src="{webpath(script_js)}"></script>\n'
-
+    sources.append(script_js)
     for script in scripts.list_scripts("javascript", ".js"):
-        head += f'<script type="text/javascript" src="{webpath(script.path)}"></script>\n'
+        sources.append(script.path)
 
     for script in scripts.list_scripts("javascript", ".mjs"):
-        head += f'<script type="module" src="{webpath(script.path)}"></script>\n'
+        sources.append(script.path)
 
-    if shared.cmd_opts.theme:
-        head += f'<script type="text/javascript">set_theme("{shared.cmd_opts.theme}");</script>\n'
+    bundled_sources = []
+    for source_path in sources:
+        try:
+            with open(source_path, "r", encoding="utf8") as source_file:
+                bundled_sources.append({"source": source_file.read(), "module": source_path.endswith(".mjs")})
+        except OSError:
+            bundled_sources.append({"src": webpath(source_path), "module": source_path.endswith(".mjs")})
 
-    return head
+    localization_js = localization.localization_js(shared.opts.localization).replace("</", "<\\/")
+    theme_js = f'set_theme({json.dumps(shared.cmd_opts.theme)});' if shared.cmd_opts.theme else ""
+    classic_sources = [item["source"] for item in bundled_sources if "source" in item and not item["module"]]
+    module_sources = [item for item in bundled_sources if item.get("module")]
+    external_sources = [item for item in bundled_sources if "src" in item]
+    classic_bundle = "\n;\n".join(classic_sources).replace("</", "<\\/")
+    modules_json = json.dumps(module_sources).replace("</", "<\\/")
+    external_json = json.dumps(external_sources).replace("</", "<\\/")
+
+    return f'''function() {{
+    {localization_js};
+    // Evaluate classic project scripts as one program so their shared
+    // callback queues and options state retain the Gradio 4 behavior.
+    window.eval({json.dumps(classic_bundle)});
+    const scripts = {modules_json};
+    for (const item of scripts) {{
+        const script = document.createElement("script");
+        script.type = item.module ? "module" : "text/javascript";
+        if (item.source) script.textContent = item.source;
+        else script.src = item.src;
+        document.head.appendChild(script);
+    }}
+    for (const item of {external_json}) {{
+        const script = document.createElement("script");
+        script.type = item.module ? "module" : "text/javascript";
+        script.src = item.src;
+        document.head.appendChild(script);
+    }}
+    {theme_js}
+}}'''
 
 
-def css_html():
-    head = ""
-
-    def stylesheet(fn):
-        return f'<link rel="stylesheet" property="stylesheet" href="{webpath(fn)}">'
-
-    for cssfile in scripts.list_files_with_name("style.css"):
-        head += stylesheet(cssfile)
-
+def css_paths():
+    paths = list(scripts.list_files_with_name("style.css"))
     user_css = os.path.join(data_path, "user.css")
     if os.path.exists(user_css):
-        head += stylesheet(user_css)
+        paths.append(user_css)
+
+    return paths
+
+
+def css_text():
+    """Return CSS that cannot be represented as a Gradio css path."""
 
     from modules.shared_gradio_themes import resolve_var
 
     light = resolve_var("background_fill_primary")
     dark = resolve_var("background_fill_primary_dark")
-    head += f"<style>html {{ background-color: {light}; }} @media (prefers-color-scheme: dark) {{ html {{background-color:  {dark}; }} }}</style>"
+    return f"html {{ background-color: {light}; }} @media (prefers-color-scheme: dark) {{ html {{background-color: {dark}; }} }}"
 
-    return head
+
+def _path_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        return [value]
+    return list(value)
+
+
+def _blocks_init(self, *args, **kwargs):
+    if _assets_head:
+        existing_head = kwargs.get("head")
+        kwargs["head"] = f"{_assets_head}\n{existing_head or ''}"
+
+    if _assets_css_paths:
+        kwargs["css_paths"] = [*_assets_css_paths, *_path_list(kwargs.get("css_paths"))]
+
+    if _assets_css:
+        existing_css = kwargs.get("css") or ""
+        kwargs["css"] = f"{_assets_css}\n{existing_css}"
+
+    if _assets_js:
+        kwargs["js"] = _assets_js
+
+    return _blocks_init_original(self, *args, **kwargs)
+
+
+_blocks_init_original = gr.Blocks.__init__
+if not getattr(gr.Blocks, "_sd_webui_assets_patched", False):
+    gr.Blocks.__init__ = _blocks_init
+    gr.Blocks._sd_webui_assets_patched = True
+
 
 
 def reload_javascript():
-    js = javascript_html()
-    css = css_html()
+    global _assets_head, _assets_css_paths, _assets_css, _assets_js
 
-    def template_response(*args, **kwargs):
-        res = shared.GradioTemplateResponseOriginal(*args, **kwargs)
-        res.body = res.body.replace(b"</head>", f'{js}<meta name="referrer" content="no-referrer"/></head>'.encode("utf8"))
-        res.body = res.body.replace(b"</body>", f"{css}</body>".encode("utf8"))
-        res.init_headers()
-        return res
-
-    gr.routes.templates.TemplateResponse = template_response
-
-
-if not hasattr(shared, "GradioTemplateResponseOriginal"):
-    shared.GradioTemplateResponseOriginal = gr.routes.templates.TemplateResponse
+    _assets_head = '<meta name="referrer" content="no-referrer"/>'
+    _assets_css_paths = css_paths()
+    _assets_css = css_text()
+    _assets_js = javascript_js()

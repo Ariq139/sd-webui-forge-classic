@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from ast import literal_eval
 from functools import partial
 from typing import Any
@@ -14,6 +15,7 @@ from backend.text_processing.emphasis import uses_emphasis
 from modules import errors, images, processing, script_callbacks, shared, ui_tempdir
 from modules.paths import data_path
 from modules_forge import main_entry
+sys.modules['modules.generation_parameters_copypaste'] = sys.modules[__name__]
 
 re_param_code = r'\s*([\w\s\-\/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)'
 re_param = re.compile(re_param_code)

@@ -14,7 +14,7 @@ function gradioApp() {
  * Get the currently selected top-level UI tab button (e.g. the button that says "Extras").
  */
 function get_uiCurrentTab() {
-    return gradioApp().querySelector("#tabs > .tab-nav > button.selected");
+    return gradioApp().querySelector("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab'].selected");
 }
 
 /**
@@ -118,12 +118,24 @@ function scheduleAfterUiUpdateCallbacks() {
 
 let executedOnLoaded = false;
 
-document.addEventListener("DOMContentLoaded", function () {
+function uiIsReady() {
+    const root = gradioApp();
+    return (
+        root.querySelector("#txt2img_prompt") &&
+        root.querySelector("#txt2img_generate")
+    );
+}
+
+function runUiLoadedCallbacks() {
+    if (!executedOnLoaded && uiIsReady()) {
+        executedOnLoaded = true;
+        executeCallbacks(uiLoadedCallbacks);
+    }
+}
+
+function setupUiMutationObserver() {
     const mutationObserver = new MutationObserver(function (m) {
-        if (!executedOnLoaded && gradioApp().querySelector("#txt2img_prompt")) {
-            executedOnLoaded = true;
-            executeCallbacks(uiLoadedCallbacks);
-        }
+        runUiLoadedCallbacks();
 
         executeCallbacks(uiUpdateCallbacks, m);
         scheduleAfterUiUpdateCallbacks();
@@ -134,7 +146,20 @@ document.addEventListener("DOMContentLoaded", function () {
         }
     });
     mutationObserver.observe(gradioApp(), { childList: true, subtree: true });
-});
+
+    // Gradio 5 invokes Blocks(js=...) after the document has already loaded.
+    // Give the complete bundled script a turn to register its callbacks, then
+    // perform the initial check that DOMContentLoaded used to trigger.
+    setTimeout(function () {
+        runUiLoadedCallbacks();
+    }, 0);
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setupUiMutationObserver);
+} else {
+    setupUiMutationObserver();
+}
 
 // Keyboard Shortcuts:
 // - Ctrl + Enter to start/restart a generation
@@ -213,3 +238,19 @@ function uiElementInSight(el) {
 
     return isOnScreen;
 }
+
+// Gradio 5 evaluates callback code through the browser global scope. Keep the
+// webui helpers available there for extensions and component _js callbacks.
+Object.assign(window, {
+    gradioApp,
+    get_uiCurrentTab,
+    get_uiCurrentTabContent,
+    onUiUpdate,
+    onAfterUiUpdate,
+    onUiLoaded,
+    onUiTabChange,
+    onOptionsChanged,
+    onOptionsAvailable,
+    uiElementIsVisible,
+    uiElementInSight,
+});

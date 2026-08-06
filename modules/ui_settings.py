@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 
@@ -85,7 +86,6 @@ class UiSettings:
     quicksettings_names = None
     text_settings = None
     show_all_pages = None
-    show_one_page = None
     search_input = None
 
     def run_settings(self, *args):
@@ -155,6 +155,7 @@ class UiSettings:
             self.quicksettings_names = {x: i for i, x in enumerate(self.quicksettings_names) if x != "quicksettings"}
 
             self.quicksettings_list = []
+            settings_tab_metadata = []
 
             previous_section = None
             current_tab = None
@@ -172,6 +173,7 @@ class UiSettings:
 
                         gr.Group()
                         current_tab = gr.TabItem(elem_id=f"settings_{elem_id}", label=text)
+                        settings_tab_metadata.append({"id": f"settings_{elem_id}", "label": text})
                         current_tab.__enter__()
                         current_row = gr.Column(elem_id=f"column_settings_{elem_id}", variant="compact")
                         current_row.__enter__()
@@ -221,12 +223,20 @@ class UiSettings:
                     gr.HTML(shared.html("licenses.html"), elem_id="licenses")
 
                 self.show_all_pages = gr.Button(value="Show all pages", elem_id="settings_show_all_pages")
-                self.show_one_page = gr.Button(value="Show only one page", elem_id="settings_show_one_page", visible=False)
-                self.show_one_page.click(lambda: None)
 
                 self.search_input = gr.Textbox(value="", elem_id="settings_search", max_lines=1, placeholder="Search...", show_label=False)
 
                 self.text_settings = gr.Textbox(elem_id="settings_json", value=lambda: opts.dumpjson(), visible=False)
+
+            settings_tab_metadata.extend(
+                [
+                    {"id": "settings_tab_defaults", "label": "Defaults"},
+                    {"id": "settings_tab_sysinfo", "label": "Sysinfo"},
+                    {"id": "settings_tab_actions", "label": "Actions"},
+                    {"id": "settings_tab_licenses", "label": "Licenses"},
+                ]
+            )
+            gr.Textbox(value=json.dumps(settings_tab_metadata), elem_id="settings_nav_data", visible=False)
 
             def call_func_and_return_text(func, text):
                 def handler():

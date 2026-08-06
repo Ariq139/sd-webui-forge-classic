@@ -516,7 +516,7 @@ def create_ui():
                         with gr.Tabs(elem_id="mode_img2img"):
                             img2img_selected_tab = gr.Number(value=0, visible=False)
 
-                            with gr.TabItem("img2img", id="img2img", elem_id="img2img_img2img_tab") as tab_img2img:
+                            with gr.TabItem("img2img", id="img2img_image", elem_id="img2img_img2img_tab") as tab_img2img:
                                 init_img = ForgeCanvas(elem_id="img2img_image", no_scribbles=True)
                                 add_copy_image_controls("img2img", init_img)
 
@@ -533,8 +533,8 @@ def create_ui():
                                 add_copy_image_controls("inpaint_sketch", inpaint_color_sketch)
 
                             with gr.TabItem("Inpaint upload", id="inpaint_upload", elem_id="img2img_inpaint_upload_tab") as tab_inpaint_upload:
-                                init_img_inpaint = gr.Image(label="Image for img2img", show_label=False, source="upload", interactive=True, type="pil", elem_id="img_inpaint_base")
-                                init_mask_inpaint = gr.Image(label="Mask", source="upload", interactive=True, type="pil", image_mode="RGBA", elem_id="img_inpaint_mask")
+                                init_img_inpaint = gr.Image(label="Image for img2img", show_label=False, sources="upload", interactive=True, type="pil", elem_id="img_inpaint_base")
+                                init_mask_inpaint = gr.Image(label="Mask", sources="upload", interactive=True, type="pil", image_mode="RGBA", elem_id="img_inpaint_mask")
 
                             with gr.TabItem("Batch", id="batch", elem_id="img2img_batch_tab") as tab_batch:
                                 with gr.Tabs(elem_id="img2img_batch_source"):
@@ -586,7 +586,7 @@ def create_ui():
                                 with gr.Tabs(elem_id="img2img_tabs_resize"):
                                     with gr.Tab(label="Resize to", id="to", elem_id="img2img_tab_resize_to") as tab_scale_to:
                                         with FormRow():
-                                            with gr.Column(elem_id="img2img_column_size", scale=4):
+                                            with gr.Column(elem_id="img2img_resize_column_size", scale=4):
                                                 width = gr.Slider(minimum=64, maximum=2048, step=_STEP, label="Width", value=1024, elem_id="img2img_width")
                                                 height = gr.Slider(minimum=64, maximum=2048, step=_STEP, label="Height", value=1024, elem_id="img2img_height")
                                             with gr.Column(elem_id="img2img_dimensions_row", scale=1, elem_classes="dimensions-tools"):
@@ -834,7 +834,7 @@ def create_ui():
     with gr.Blocks(analytics_enabled=False) as pnginfo_interface:
         with ResizeHandleRow(equal_height=False):
             with gr.Column(variant="panel"):
-                image = gr.Image(elem_id="pnginfo_image", label="Source", source="upload", interactive=True, type="pil", height="50vh", image_mode="RGBA")
+                image = gr.Image(elem_id="pnginfo_image", label="Source", sources="upload", interactive=True, type="pil", height="50vh", image_mode="RGBA")
 
             with gr.Column(variant="panel"):
                 html = gr.HTML()

@@ -1,51 +1,99 @@
-// various hints and extra info for the settings tab
+// Various hints and extra info for the settings tab.
 
-let settingsHintsSetup = false;
+let settingsHintsObserver = null;
+let settingsHintsTimer = null;
 
-onOptionsChanged(function () {
-    if (settingsHintsSetup) return;
-    settingsHintsSetup = true;
+function settingsHintsLabel(div) {
+    // Gradio 5.29 uses a direct block-info span for single-value controls such
+    // as sliders and single-select dropdowns. Older controls keep the span
+    // inside a label, so retain that fallback for extensions and custom inputs.
+    return (
+        div.querySelector(":scope > .container > span[data-testid='block-info']") ||
+        div.querySelector(":scope > label > span[data-testid='block-info']") ||
+        div.querySelector(":scope > label > span") ||
+        div.querySelector("span[data-testid='block-info']") ||
+        div.querySelector("label span")
+    );
+}
 
-    gradioApp()
-        .querySelectorAll("#settings [id^=setting_]")
-        .forEach(function (div) {
-            let name = div.id.substr(8);
-            let commentBefore = opts._comments_before[name];
-            let commentAfter = opts._comments_after[name];
+function settingsHintsApply() {
+    let root = gradioApp();
+    let settingsJson = root.querySelector("#settings_json textarea");
+    if (!settingsJson) return;
 
-            if (!commentBefore && !commentAfter) return;
+    let options;
+    try {
+        options = JSON.parse(settingsJson.value || "{}");
+    } catch (e) {
+        return;
+    }
 
-            let span = null;
-            if (div.classList.contains("gradio-checkbox")) {
-                span = div.querySelector("label span");
-            } else if (div.classList.contains("gradio-checkboxgroup")) {
-                span = div.querySelector("span").firstChild;
-            } else if (div.classList.contains("gradio-radio")) {
-                span = div.querySelector("span").firstChild;
-            } else {
-                let elem = div.querySelector("label span");
-                if (elem) span = elem.firstChild;
-            }
+    if (!("_comments_before" in options) || !("_comments_after" in options)) return;
 
-            if (!span) return;
+    let commentsBefore = options._comments_before || {};
+    let commentsAfter = options._comments_after || {};
 
-            if (commentBefore) {
-                let comment = document.createElement("DIV");
-                comment.className = "settings-comment";
-                comment.innerHTML = commentBefore;
-                span.parentElement.insertBefore(document.createTextNode("\xa0"), span);
-                span.parentElement.insertBefore(comment, span);
-                span.parentElement.insertBefore(document.createTextNode("\xa0"), span);
-            }
-            if (commentAfter) {
-                comment = document.createElement("DIV");
-                comment.className = "settings-comment";
-                comment.innerHTML = commentAfter;
-                span.parentElement.insertBefore(comment, span.nextSibling);
-                span.parentElement.insertBefore(document.createTextNode("\xa0"), span.nextSibling);
-            }
-        });
-});
+    root.querySelectorAll("#settings [id^=setting_]").forEach(function (div) {
+        if (div.dataset.settingsHintsApplied === "1") return;
+
+        let name = div.id.substr(8);
+        let commentBefore = commentsBefore[name];
+        let commentAfter = commentsAfter[name];
+
+        if (!commentBefore && !commentAfter) {
+            div.dataset.settingsHintsApplied = "1";
+            return;
+        }
+
+        let label = settingsHintsLabel(div);
+        if (!label || !label.parentElement) return;
+
+        if (commentBefore) {
+            let comment = document.createElement("DIV");
+            comment.className = "settings-comment";
+            comment.innerHTML = commentBefore;
+            label.parentElement.insertBefore(document.createTextNode("\xa0"), label);
+            label.parentElement.insertBefore(comment, label);
+            label.parentElement.insertBefore(document.createTextNode("\xa0"), label);
+        }
+
+        if (commentAfter) {
+            let comment = document.createElement("DIV");
+            comment.className = "settings-comment";
+            comment.innerHTML = commentAfter;
+            label.parentElement.insertBefore(comment, label.nextSibling);
+            label.parentElement.insertBefore(document.createTextNode("\xa0"), comment.nextSibling);
+        }
+
+        div.dataset.settingsHintsApplied = "1";
+    });
+}
+
+function settingsHintsSchedule() {
+    clearTimeout(settingsHintsTimer);
+    settingsHintsTimer = setTimeout(settingsHintsApply, 0);
+}
+
+function settingsHintsStart() {
+    if (settingsHintsObserver) {
+        settingsHintsSchedule();
+        return;
+    }
+
+    let root = gradioApp();
+    settingsHintsObserver = new MutationObserver(function () {
+        if (root.querySelector("#settings [id^=setting_], #settings_json textarea")) settingsHintsSchedule();
+    });
+    settingsHintsObserver.observe(root, { childList: true, subtree: true });
+    settingsHintsSchedule();
+}
+
+onUiLoaded(settingsHintsStart);
+onOptionsAvailable(settingsHintsStart);
+onOptionsChanged(settingsHintsSchedule);
+setTimeout(settingsHintsStart, 0);
+setTimeout(settingsHintsStart, 500);
+setTimeout(settingsHintsStart, 1500);
 
 function settingsHintsShowQuicksettings() {
     requestGet("./internal/quicksettings-hint", {}, function (data) {
@@ -68,3 +116,6 @@ function settingsHintsShowQuicksettings() {
         popup(table);
     });
 }
+
+// Gradio 5 resolves component _js callbacks from window.
+window.settingsHintsShowQuicksettings = settingsHintsShowQuicksettings;

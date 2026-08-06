@@ -483,17 +483,17 @@ class Script(scripts.Script):
             with gr.Row():
                 x_type = gr.Dropdown(label="X type", choices=[x.label for x in self.current_axis_options], value=self.current_axis_options[1].label, type="index", elem_id=self.elem_id("x_type"), scale=2)
                 x_values = gr.Textbox(label="X values", lines=1, elem_id=self.elem_id("x_values"), scale=5)
-                x_values_dropdown = gr.Dropdown(label="X values", visible=False, multiselect=True, interactive=True, scale=5)
+                x_values_dropdown = gr.Dropdown(label="X values", value=[], visible=False, multiselect=True, interactive=True, scale=5)
                 fill_x_button = ToolButton(value=fill_values_symbol, elem_id="xyz_grid_fill_x_tool_button", visible=False, scale=1)
             with gr.Row():
                 y_type = gr.Dropdown(label="Y type", choices=[x.label for x in self.current_axis_options], value=self.current_axis_options[0].label, type="index", elem_id=self.elem_id("y_type"), scale=2)
                 y_values = gr.Textbox(label="Y values", lines=1, elem_id=self.elem_id("y_values"), scale=5)
-                y_values_dropdown = gr.Dropdown(label="Y values", visible=False, multiselect=True, interactive=True, scale=5)
+                y_values_dropdown = gr.Dropdown(label="Y values", value=[], visible=False, multiselect=True, interactive=True, scale=5)
                 fill_y_button = ToolButton(value=fill_values_symbol, elem_id="xyz_grid_fill_y_tool_button", visible=False, scale=1)
             with gr.Row():
                 z_type = gr.Dropdown(label="Z type", choices=[x.label for x in self.current_axis_options], value=self.current_axis_options[0].label, type="index", elem_id=self.elem_id("z_type"), scale=2)
                 z_values = gr.Textbox(label="Z values", lines=1, elem_id=self.elem_id("z_values"), scale=5)
-                z_values_dropdown = gr.Dropdown(label="Z values", visible=False, multiselect=True, interactive=True, scale=5)
+                z_values_dropdown = gr.Dropdown(label="Z values", value=[], visible=False, multiselect=True, interactive=True, scale=5)
                 fill_z_button = ToolButton(value=fill_values_symbol, elem_id="xyz_grid_fill_z_tool_button", visible=False, scale=1)
 
         with gr.Row(variant="compact"):
@@ -544,6 +544,7 @@ class Script(scripts.Script):
 
         def select_axis(axis_type, axis_values, axis_values_dropdown, csv_mode):
             axis_type = axis_type or 0  # if axle type is None set to 0
+            axis_values_dropdown = axis_values_dropdown if isinstance(axis_values_dropdown, list) else []
 
             choices = self.current_axis_options[axis_type].choices
             has_choices = choices is not None

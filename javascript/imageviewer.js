@@ -193,7 +193,7 @@ onAfterUiUpdate(function () {
     updateOnBackgroundChange();
 });
 
-document.addEventListener("DOMContentLoaded", function () {
+function createLightboxModal() {
     //const modalFragment = document.createDocumentFragment();
     const modal = document.createElement("div");
     modal.onclick = closeModal;
@@ -273,4 +273,10 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     document.body.appendChild(modal);
-});
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", createLightboxModal);
+} else {
+    createLightboxModal();
+}

@@ -468,6 +468,8 @@ div.toprow-compact-tools {
 #quicksettings>div {
     width: fit-content;
     flex: 0 1 fit-content;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
     padding: 0;
     border: none;
     box-shadow: none;
@@ -565,30 +567,108 @@ div.toprow-compact-tools {
 
 #settings {
     display: block;
+    background: var(--body-background-fill);
+    color: var(--body-text-color);
+}
+
+#settings::after {
+    content: "";
+    display: block;
+    clear: both;
 }
 
 #settings>div {
+    box-sizing: border-box;
+    width: calc(100% - 10em);
     border: none;
     margin-left: 10em;
     padding: 0 var(--spacing-xl);
 }
 
-#settings>div.tab-nav {
+#settings > .tab-wrapper {
     float: left;
     display: block;
+    height: auto !important;
     margin-left: 0;
     width: 10em;
 }
 
-#settings>div.tab-nav button {
+#settings > .tab-wrapper > .tab-container.visually-hidden {
+    position: static !important;
+    display: none !important;
+    width: 100%;
+    height: auto !important;
+    overflow: visible !important;
+    clip: auto !important;
+    clip-path: none !important;
+    white-space: normal !important;
+}
+
+#settings > .tab-wrapper > .tab-container:not(.visually-hidden),
+#settings > .tab-wrapper > .overflow-menu {
+    display: none !important;
+}
+
+#settings > .tab-wrapper > .tab-container.visually-hidden > button {
     display: block;
+    width: 100%;
     border: none;
+    background: transparent;
+    color: var(--body-text-color);
     text-align: left;
     white-space: initial;
     padding: 4px;
 }
 
-#settings>div.tab-nav .settings-category {
+#settings > .tab-wrapper > .tab-container.visually-hidden > #settings_search,
+#settings > .tab-wrapper > .tab-container.visually-hidden > #settings_show_all_pages {
+    display: block;
+    width: 100%;
+    margin: 0 0 0.5em 0;
+}
+
+#settings > .tab-wrapper > .settings-sidebar {
+    display: block;
+    width: 100%;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-nav-button {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: var(--body-text-color);
+    text-align: left;
+    white-space: initial;
+    padding: 4px;
+    cursor: pointer;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-nav-button:hover,
+#settings > .tab-wrapper > .settings-sidebar > .settings-nav-button.selected {
+    background: var(--button-secondary-background-fill);
+    color: var(--button-secondary-text-color);
+}
+
+#settings > .tab-wrapper > .settings-sidebar > #settings_search,
+#settings > .tab-wrapper > .settings-sidebar > #settings_show_all_pages {
+    display: block;
+    width: 100%;
+    margin: 0 0 0.5em 0;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-category {
+    display: block;
+    margin: 1em 0 0.25em 0;
+    font-weight: bold;
+    text-decoration: underline;
+    cursor: default;
+    user-select: none;
+}
+
+#settings > .tab-wrapper > .tab-container.visually-hidden .settings-category {
     display: block;
     margin: 1em 0 0.25em 0;
     font-weight: bold;
@@ -680,6 +760,11 @@ table.popup-table .link {
 
 #settings .settings-div {
     padding: 1em;
+}
+
+/* Gradio 5.29 can leave an orphan tab button in the visible tab list. */
+.tab-wrapper > .tab-container[role="tablist"] > button:not([id]):not([aria-controls]) {
+    display: none !important;
 }
 
 /* live preview */
@@ -1044,7 +1129,7 @@ footer {
     margin-bottom: 1em;
 }
 
-.extra-networks>div.tab-nav {
+.extra-networks > .tab-wrapper > .tab-container[role="tablist"] {
     min-height: 2.7rem;
 }
 
@@ -1057,19 +1142,19 @@ footer {
     margin: 0.3em;
 }
 
-.extra-networks .tab-nav .search,
-.extra-networks .tab-nav .sort {
+.extra-networks .tab-wrapper > .tab-container[role="tablist"] .search,
+.extra-networks .tab-wrapper > .tab-container[role="tablist"] .sort {
     margin: 0.3em;
     align-self: center;
     width: auto;
 }
 
-.extra-networks .tab-nav .search {
+.extra-networks .tab-wrapper > .tab-container[role="tablist"] .search {
     width: 16em;
     max-width: 16em;
 }
 
-.extra-networks .tab-nav .sort {
+.extra-networks .tab-wrapper > .tab-container[role="tablist"] .sort {
     width: 12em;
     max-width: 12em;
 }
@@ -1165,7 +1250,7 @@ footer {
     overflow: hidden;
     cursor: pointer;
 
-    background-image: url("./file=html/card-no-preview.jpg");
+    background-image: url("/gradio_api/file=html/card-no-preview.jpg");
 }
 
 .extra-network-pane .card:hover {
