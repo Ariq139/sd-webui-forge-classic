@@ -47,16 +47,8 @@ setup_logger(logger)
 cpu = torch.device("cpu")
 
 
-# Optional MMGP-inspired controls.
-#
-# Conceptual reference and original implementation:
-# https://github.com/deepbeepmeep/mmgp
-#
-# Forge does not replace its ModelPatcher with MMGP. These controls adapt the
-# compatible ideas (budgets, pinned host memory, asynchronous transfers, and
-# residency preferences) to Forge's existing model lifecycle. They are kept
-# separate so each feature can be enabled independently and disabled without
-# changing the default loading behavior.
+# Optional MMGP-style controls layered onto Forge's existing manager.
+# Reference: https://github.com/deepbeepmeep/mmgp
 MEMORY_FEATURES = {
     "enabled": False,
     "budgets": False,
@@ -612,9 +604,7 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
                     can_unload.append(candidate)
                 shift_model.currently_used = False
 
-    # MMGP-style residency preference: hinted models are considered after
-    # ordinary cache entries. This is not a hard pin; hinted models are still
-    # unloaded as a last resort when the next operation needs the memory.
+    # Residency hints are preferences, not hard pins.
     for x in sorted(can_unload) + sorted(hinted_can_unload):
         i = x[-1]
         memory_to_free = None
@@ -1612,14 +1602,7 @@ def configure_memory_features(
     async_streams: int = 2,
     residency_components: set[str] | list[str] | tuple[str, ...] = (),
 ):
-    """Apply MMGP-inspired settings without replacing Forge's manager.
-
-    The public MMGP implementation is available at:
-    https://github.com/deepbeepmeep/mmgp
-
-    This adapter deliberately keeps Forge's ModelPatcher, quantized tensor
-    types, and model cache as the source of truth.
-    """
+    """Apply optional MMGP-style settings while keeping Forge authoritative."""
     global MEMORY_FEATURES
     global MEMORY_BUDGETS_BYTES
     global MEMORY_RESIDENCY_COMPONENTS

@@ -15,13 +15,33 @@ _assets_js = ""
 
 
 def _install_gradio_dropdown_compatibility():
-    """Normalize Gradio 4's empty multiselect value for Gradio 5 validation."""
+    """Preserve Gradio 4's unset Dropdown values under Gradio 5 validation.
+
+    Gradio 4 allowed an unset single-select Dropdown to submit ``None`` even
+    when its choices list was populated. Gradio 5 validates that value before
+    the callback runs and raises ``Value is not in the list of choices``.
+    Several optional webui controls rely on the old unset state, including
+    hidden Hires.fix controls and settings controls. Keep ``None`` as ``None``
+    so the backend can apply its existing defaults instead of inventing a
+    choice or preventing the event from running.
+    """
 
     original_preprocess = gr.Dropdown.preprocess
     if getattr(original_preprocess, "_sd_webui_empty_multiselect_compat", False):
         return
 
     def preprocess(self, payload):
+        if not self.multiselect and payload in (None, ""):
+            return None
+
+        # Some Gradio 5 browser payloads serialize an unset legacy value as
+        # the literal string "None". Only normalize it when the component
+        # does not offer "None" as a real choice.
+        if not self.multiselect and payload == "None":
+            choice_values = [value for _, value in self.choices]
+            if payload not in choice_values:
+                return None
+
         if self.multiselect and payload == "":
             payload = []
 

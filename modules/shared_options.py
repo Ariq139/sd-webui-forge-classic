@@ -9,6 +9,7 @@ from modules.paths_internal import data_path, default_output_dir
 from modules.shared_cmd_options import cmd_opts
 from modules_forge import presets as forge_presets
 from modules_forge import shared_options as forge_shared_options
+from modules_forge.mmgp_profiles import MEMORY_PROFILE_CHOICES
 
 options_templates = {}
 hide_dirs = shared.hide_dirs
@@ -208,14 +209,11 @@ options_templates.update(
         ("memory-management", "Memory Management", "system"),
         {
             "forge_memory_management_explanation": OptionHTML("""
-These optional controls add MMGP-inspired memory policies on top of Forge's existing model patcher.<br>
-They are disabled by default. Enable the global switch first, then enable individual features below.<br>
-Lower budgets and more offloading can reduce VRAM usage but may increase generation time.<br>
-They do not replace Forge's VRAM modes or flags (<code>--gpu-only</code>, <code>--highvram</code>, <code>--lowvram</code>, <code>--novram</code>, <code>--cpu</code>, <code>--disable-smart-memory</code>, or <code>--reserve-vram</code>).<br>
-When enabled, a per-component budget may add a stricter weight-loading cap and the working-VRAM setting may make existing offloading more conservative; it does not disable the existing low/novram logic.<br>
-The legacy CLI options <code>--cuda-stream</code> and <code>--pin-shared-memory</code> remain independent compatibility options.<br>
-Conceptual reference and original implementation: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
+Optional MMGP-style controls for Forge. They are off by default and work alongside Forge's existing VRAM modes and flags.<br>
+Choose a profile, or choose <b>Custom</b> to tune each control below. Lower budgets can reduce VRAM use but may slow generation.<br>
+Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
             """),
+            "forge_memory_profile": OptionInfo("Custom", "Memory profile", gr.Dropdown, {"choices": MEMORY_PROFILE_CHOICES}).info("applies a starting configuration to the controls below; click Apply settings to save it"),
             "forge_memory_management_enabled": OptionInfo(False, "Enable optional memory-management features").info("master switch; Forge's existing memory manager is always active"),
             "forge_memory_budgets_enabled": OptionInfo(False, "Enable per-component VRAM budgets").info("limits loaded weight memory for the diffusion model, text encoder, VAE, and ControlNet"),
             "forge_memory_pinned_memory_enabled": OptionInfo(False, "Enable pinned CPU memory").info("can speed CPU-to-GPU transfers at the cost of higher RAM usage"),

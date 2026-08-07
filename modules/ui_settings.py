@@ -11,6 +11,7 @@ from modules.shared import opts
 from modules.ui_components import FormRow
 from modules.ui_gradio_extensions import reload_javascript
 from modules_forge import main_entry
+from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS, get_memory_profile
 
 CURRENT_ROW: gr.Row = None
 
@@ -237,6 +238,24 @@ class UiSettings:
                 ]
             )
             gr.Textbox(value=json.dumps(settings_tab_metadata), elem_id="settings_nav_data", visible=False)
+
+            profile_component = self.component_dict.get("forge_memory_profile")
+            profile_outputs = [self.component_dict[key] for key in MEMORY_SETTING_KEYS if key in self.component_dict]
+
+            if profile_component is not None and profile_outputs:
+                def apply_memory_profile(profile):
+                    values = get_memory_profile(profile)
+                    if values is None:
+                        return [gr.skip()] * len(profile_outputs)
+                    return [values[key] for key in MEMORY_SETTING_KEYS if key in self.component_dict]
+
+                profile_component.change(
+                    fn=apply_memory_profile,
+                    inputs=[profile_component],
+                    outputs=profile_outputs,
+                    queue=False,
+                    show_progress=False,
+                )
 
             def call_func_and_return_text(func, text):
                 def handler():

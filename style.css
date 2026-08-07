@@ -1886,6 +1886,11 @@ body.resizing .resize-handle {
     opacity: 0.25 !important;
 }
 
+.prompt textarea {
+    resize: vertical !important;
+    min-height: 5rem;
+}
+
 #txt2img_enable_mahiro,
 #img2img_enable_mahiro {
     min-width: 0 !important;
@@ -1896,6 +1901,114 @@ body.resizing .resize-handle {
 #img2img_prompt_container.prompt-container-scroll div.gradio-textbox.prompt {
     height: 6em;
     overflow-y: auto !important;
+}
+
+@media screen and (max-width: 700px) {
+    .gradio-container {
+        padding-left: 0.5rem !important;
+        padding-right: 0.5rem !important;
+    }
+
+    #quicksettings {
+        flex-wrap: wrap !important;
+        gap: 0.5rem !important;
+    }
+
+    #quicksettings > * {
+        min-width: min(100%, 18rem) !important;
+        flex: 1 1 18rem !important;
+    }
+
+    #txt2img_toprow,
+    #img2img_toprow {
+        flex-direction: column !important;
+    }
+
+    #tabs > .tab-wrapper > .tab-container,
+    .extra-networks > .tab-wrapper > .tab-container,
+    #txt2img_extra_tabs > .tab-wrapper > .tab-container,
+    #img2img_extra_tabs > .tab-wrapper > .tab-container {
+        justify-content: flex-start !important;
+        flex-wrap: nowrap !important;
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+    }
+
+    #tabs > .tab-wrapper > .tab-container > button,
+    .extra-networks > .tab-wrapper > .tab-container > button {
+        flex: 0 0 auto !important;
+        white-space: nowrap;
+    }
+
+    #txt2img_toprow > *,
+    #img2img_toprow > *,
+    #txt2img_prompt_row > *,
+    #img2img_prompt_row > *,
+    #txt2img_neg_prompt_row > *,
+    #img2img_neg_prompt_row > * {
+        min-width: 0 !important;
+        width: 100% !important;
+    }
+
+    #txt2img_actions_column,
+    #img2img_actions_column,
+    #txt2img_generate_box,
+    #img2img_generate_box {
+        width: 100% !important;
+    }
+
+    .resize-handle-row {
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 0.75rem !important;
+    }
+
+    .resize-handle-row > .resize-handle {
+        display: none !important;
+    }
+
+    #txt2img_settings,
+    #img2img_settings,
+    #txt2img_results,
+    #img2img_results {
+        min-width: 0 !important;
+        width: 100% !important;
+    }
+
+    #settings > div {
+        width: 100%;
+        margin-left: 0;
+        padding: 0 0.5rem;
+    }
+
+    #settings > .tab-wrapper {
+        float: none;
+        width: 100%;
+    }
+
+    #settings > .tab-wrapper > .settings-sidebar {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.15rem 0.5rem;
+        max-height: 18rem;
+        overflow-y: auto;
+        padding: 0.25rem;
+    }
+
+    #settings > .tab-wrapper > .settings-sidebar > #settings_search,
+    #settings > .tab-wrapper > .settings-sidebar > #settings_show_all_pages,
+    #settings > .tab-wrapper > .settings-sidebar > .settings-category {
+        grid-column: 1 / -1;
+    }
+
+    #settings > .tab-wrapper > .settings-sidebar > .settings-nav-button {
+        min-height: 2.4rem;
+        padding: 0.5rem;
+    }
+
+    #settings > .tab-wrapper > .settings-sidebar > .settings-category {
+        margin-top: 0.75rem;
+    }
 }
 
 div.xyz_entries {

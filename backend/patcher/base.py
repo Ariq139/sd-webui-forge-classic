@@ -162,8 +162,7 @@ class ModelPatcher:
         self.model_options = {"transformer_options": {}}
         self.load_device = load_device
         self.offload_device = offload_device
-        # Logical component name used by the optional MMGP-inspired policies.
-        # It is metadata only; normal Forge patching is unchanged.
+        # Component metadata for optional memory policies.
         self.memory_component = memory_component
         self.weight_inplace_update = weight_inplace_update
         self.force_cast_weights = False
