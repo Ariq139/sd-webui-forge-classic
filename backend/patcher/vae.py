@@ -125,13 +125,23 @@ class VAE:
         if no_init:
             return
 
+        # The diffusion pipeline tells us its default VAE family, but a
+        # standalone VAE can legitimately come from another compatible
+        # pipeline.  The loader annotates the instantiated component from its
+        # own state-dict signature, following ComfyUI's component-first model.
+        is_wan = bool(getattr(model, "_forge_vae_is_wan", is_wan))
+        is_flux2 = bool(getattr(model, "_forge_vae_is_flux2", is_flux2))
+
         if not is_wan:
             self.upscale_ratio = 8
             self.upscale_index_formula = None
             self.downscale_ratio = 8
             self.downscale_index_formula = None
             self.latent_dim = 2
-            self.latent_channels = 32 if is_mugen else int(model.config.latent_channels)  # 4 | 16
+            configured_latent_channels = getattr(model.config, "latent_channels", None)
+            if configured_latent_channels is None:
+                configured_latent_channels = getattr(model, "z_dim", None)
+            self.latent_channels = 32 if is_mugen else int(configured_latent_channels)  # 4 | 16
             self.memory_used_encode = lambda shape, dtype: (1767 * shape[2] * shape[3]) * memory_management.dtype_size(dtype)
             self.memory_used_decode = lambda shape, dtype: (2178 * shape[2] * shape[3] * 64) * memory_management.dtype_size(dtype)
 
@@ -171,6 +181,11 @@ class VAE:
         n.memory_used_decode = self.memory_used_decode
         n.downscale_ratio = self.downscale_ratio
         n.latent_channels = self.latent_channels
+        n.latent_dim = self.latent_dim
+        n.upscale_ratio = self.upscale_ratio
+        n.upscale_index_formula = self.upscale_index_formula
+        n.downscale_index_formula = self.downscale_index_formula
+        n.output_channels = self.output_channels
         n.first_stage_model = self.first_stage_model
         n.device = self.device
         n.vae_dtype = self.vae_dtype

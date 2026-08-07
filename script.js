@@ -24,6 +24,30 @@ function get_uiCurrentTabContent() {
     return gradioApp().querySelector('#tabs > .tabitem[id^=tab_]:not([style*="display: none"])');
 }
 
+/**
+ * Read a frontend option after Gradio has hydrated the hidden settings field.
+ * Gradio 5 can load the legacy scripts before that field is populated, so
+ * reading only the old `opts` object can leave event-driven UI features with
+ * stale defaults during the first generation.
+ */
+function getUIOption(name, fallback) {
+    try {
+        const settings = gradioApp().querySelector("#settings_json textarea");
+        const values = settings?.value ? JSON.parse(settings.value) : null;
+        if (values && Object.prototype.hasOwnProperty.call(values, name)) {
+            return values[name];
+        }
+    } catch (e) {
+        // The settings field may not exist while the page is hydrating.
+    }
+
+    if (typeof opts !== "undefined" && opts && Object.prototype.hasOwnProperty.call(opts, name)) {
+        return opts[name];
+    }
+
+    return fallback;
+}
+
 const uiUpdateCallbacks = [];
 const uiAfterUpdateCallbacks = [];
 const uiLoadedCallbacks = [];
@@ -251,6 +275,7 @@ Object.assign(window, {
     onUiTabChange,
     onOptionsChanged,
     onOptionsAvailable,
+    getUIOption,
     uiElementIsVisible,
     uiElementInSight,
 });

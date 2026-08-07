@@ -147,6 +147,8 @@ function showRestoreProgressButton(tabname, show) {
     button.style.setProperty("display", show ? "flex" : "none", "important");
 }
 
+let restoreProgressInFlight = { txt2img: false, img2img: false };
+
 function submit() {
     showSubmitButtons("txt2img", false);
 
@@ -158,6 +160,12 @@ function submit() {
         gradioApp().getElementById("txt2img_gallery_container"),
         gradioApp().getElementById("txt2img_gallery"),
         function () {
+            if (document.visibilityState === "hidden") {
+                // Keep the task id so a suspended mobile tab can restore the
+                // result after it becomes visible again.
+                showRestoreProgressButton("txt2img", true);
+                return;
+            }
             showSubmitButtons("txt2img", true);
             localRemove("txt2img_task_id");
             showRestoreProgressButton("txt2img", false);
@@ -186,6 +194,10 @@ function submit_img2img() {
         gradioApp().getElementById("img2img_gallery_container"),
         gradioApp().getElementById("img2img_gallery"),
         function () {
+            if (document.visibilityState === "hidden") {
+                showRestoreProgressButton("img2img", true);
+                return;
+            }
             showSubmitButtons("img2img", true);
             localRemove("img2img_task_id");
             showRestoreProgressButton("img2img", false);
@@ -221,17 +233,23 @@ function restoreProgressTxt2img() {
     const id = localGet("txt2img_task_id");
 
     if (id) {
+        restoreProgressInFlight.txt2img = true;
         showSubmitInterruptingPlaceholder("txt2img");
         requestProgress(
             id,
             gradioApp().getElementById("txt2img_gallery_container"),
             gradioApp().getElementById("txt2img_gallery"),
             function () {
+                restoreProgressInFlight.txt2img = false;
                 showSubmitButtons("txt2img", true);
+                localRemove("txt2img_task_id");
+                showRestoreProgressButton("txt2img", false);
             },
             null,
             0,
         );
+    } else {
+        restoreProgressInFlight.txt2img = false;
     }
 
     return id;
@@ -242,21 +260,51 @@ function restoreProgressImg2img() {
     const id = localGet("img2img_task_id");
 
     if (id) {
+        restoreProgressInFlight.img2img = true;
         showSubmitInterruptingPlaceholder("img2img");
         requestProgress(
             id,
             gradioApp().getElementById("img2img_gallery_container"),
             gradioApp().getElementById("img2img_gallery"),
             function () {
+                restoreProgressInFlight.img2img = false;
                 showSubmitButtons("img2img", true);
+                localRemove("img2img_task_id");
+                showRestoreProgressButton("img2img", false);
             },
             null,
             0,
         );
+    } else {
+        restoreProgressInFlight.img2img = false;
     }
 
     return id;
 }
+
+function restoreProgressAfterVisibility(tabname) {
+    if (document.visibilityState !== "visible") return;
+
+    const id = localGet(tabname + "_task_id");
+    const restoreButton = gradioApp().getElementById(tabname + "_restore_progress");
+    const nativeButton = restoreButton?.matches("button") ? restoreButton : restoreButton?.querySelector("button");
+
+    if (!id || !nativeButton || restoreProgressInFlight[tabname]) return;
+
+    // The original Gradio result stream may have been suspended while the
+    // browser app was in the background. Re-submit the existing task to the
+    // server-side restore callback when the page becomes visible again.
+    restoreProgressInFlight[tabname] = true;
+    nativeButton.click();
+}
+
+function restoreProgressAfterPageResume() {
+    restoreProgressAfterVisibility("txt2img");
+    restoreProgressAfterVisibility("img2img");
+}
+
+document.addEventListener("visibilitychange", restoreProgressAfterPageResume);
+window.addEventListener("pageshow", restoreProgressAfterPageResume);
 
 /**
  * Configure the width and height elements on `tabname` to accept
@@ -300,6 +348,7 @@ function restoreStyleDeselection(tabname) {
 onUiLoaded(function () {
     showRestoreProgressButton("txt2img", localGet("txt2img_task_id"));
     showRestoreProgressButton("img2img", localGet("img2img_task_id"));
+    setTimeout(restoreProgressAfterPageResume, 0);
     setupResolutionPasting("txt2img");
     setupResolutionPasting("img2img");
     restoreStyleDeselection("txt2img");

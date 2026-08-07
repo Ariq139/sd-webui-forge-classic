@@ -39,6 +39,25 @@ forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
 
 
 module_list: dict[str, os.PathLike] = {}
+module_categories: dict[str, str] = {}
+
+
+def module_choices() -> list[tuple[str, str]]:
+    """Return display/value pairs for the VAE and text-encoder selector.
+
+    Gradio dropdowns do not provide optgroup support, so the category is kept
+    in the display label while the value remains the original filename. This
+    preserves the existing multi-select payload consumed by ``modules_change``.
+    """
+    category_order = {"VAE": 0, "Text Encoder": 1}
+
+    return [
+        (f"{category} / {name}", name)
+        for name, category in sorted(
+            ((name, module_categories.get(name, "VAE")) for name in module_list),
+            key=lambda item: (category_order.get(item[1], 99), shared.natural_sort_key(item[0])),
+        )
+    ]
 
 
 def make_checkpoint_manager_ui():
@@ -58,11 +77,11 @@ def make_checkpoint_manager_ui():
 
     ui_checkpoint = gr.Dropdown(label="Checkpoint", value=checkpoint_value, choices=ckpt_list, elem_id="setting_sd_model_checkpoint", elem_classes=["model_selection"])
 
-    ui_vae = gr.Dropdown(label="VAE / Text Encoder", value=module_value, choices=vae_list, multiselect=True, elem_id="setting_sd_modules", elem_classes=["model_selection"])
+    ui_vae = gr.Dropdown(label="VAE / Text Encoder", value=module_value, choices=module_choices(), multiselect=True, elem_id="setting_sd_modules", elem_classes=["model_selection"])
 
     def refresh_model_list():
-        ckpt_list, vae_list = refresh_models()
-        return [gr.update(choices=ckpt_list), gr.update(choices=vae_list)]
+        ckpt_list, _ = refresh_models()
+        return [gr.update(choices=ckpt_list), gr.update(choices=module_choices())]
 
     refresh_button = ui_common.ToolButton(value=ui_common.refresh_symbol, elem_id="forge_refresh_checkpoint", tooltip="Refresh")
     refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
@@ -92,19 +111,26 @@ def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
     file_extensions = ("ckpt", "pt", "pth", "bin", "safetensors", "sft", "gguf")
 
     module_list.clear()
+    module_categories.clear()
 
-    module_paths: set[os.PathLike] = {
-        os.path.abspath(os.path.join(paths.models_path, "VAE")),
-        os.path.abspath(os.path.join(paths.models_path, "text_encoder")),
-        *shared.cmd_opts.vae_dirs,
-        *shared.cmd_opts.text_encoder_dirs,
-    }
+    module_paths = [
+        ("VAE", [os.path.join(paths.models_path, "VAE"), *shared.cmd_opts.vae_dirs]),
+        ("Text Encoder", [os.path.join(paths.models_path, "text_encoder"), *shared.cmd_opts.text_encoder_dirs]),
+    ]
+    visited_paths = set()
 
-    for vae_path in module_paths:
-        vae_files = find_files_with_extensions(vae_path, file_extensions)
-        module_list.update(vae_files)
+    for category, roots in module_paths:
+        for root in roots:
+            root = os.path.abspath(os.fspath(root))
+            if root in visited_paths:
+                continue
+            visited_paths.add(root)
 
-    return sorted(ckpt_list), sorted(module_list.keys())
+            module_files = find_files_with_extensions(root, file_extensions)
+            module_list.update(module_files)
+            module_categories.update({name: category for name in module_files})
+
+    return sorted(ckpt_list, key=shared.natural_sort_key), sorted(module_list.keys(), key=shared.natural_sort_key)
 
 
 def refresh_model_loading_parameters(*, refresh: bool = True):

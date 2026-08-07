@@ -210,7 +210,8 @@ options_templates.update(
         {
             "forge_memory_management_explanation": OptionHTML("""
 Optional MMGP-style controls for Forge. They are off by default and work alongside Forge's existing VRAM modes and flags.<br>
-Choose a profile, or choose <b>Custom</b> to tune each control below. Lower budgets can reduce VRAM use but may slow generation.<br>
+Choose a profile, or choose <b>Custom</b> to tune each control below. The profile dropdown includes MMGP's target minimum hardware values: RAM / VRAM in GB. They are not hard caps; Windows generally needs about 16 GB more system RAM than the Linux figures.<br>
+Lower budgets can reduce VRAM use but may slow generation.<br>
 Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
             """),
             "forge_memory_profile": OptionInfo("Custom", "Memory profile", gr.Dropdown, {"choices": MEMORY_PROFILE_CHOICES}).info("applies a starting configuration to the controls below; click Apply settings to save it"),
@@ -376,8 +377,12 @@ options_templates.update(
     options_section(
         ("extra_networks", "Extra Networks", "sd"),
         {
-            "extra_networks_tree_view_style": OptionInfo("Dirs", "Extra Networks UI Style", gr.Radio, {"choices": ("Tree", "Dirs")}).needs_reload_ui(),
-            "extra_networks_hidden_models": OptionInfo("When searched", "Show the Extra Networks in hidden directories", gr.Radio, {"choices": ("Always", "When searched", "Never")}).info('"When searched" option will only show the item when the search string contains 4 characters or more'),
+            "extra_networks_use_simple_list": OptionInfo(True, "Use a simple list for Extra Networks").info("hide preview thumbnails and show LoRAs, embeddings, and checkpoints as rows").needs_reload_ui(),
+            "extra_networks_group_by_category": OptionInfo(True, "Group Extra Networks by category").info("group LoRAs by inferred base-model family; this affects the card list only, not the filesystem tree").needs_reload_ui(),
+            "extra_networks_prioritize_group": OptionInfo(True, "Prioritize matching category groups").info("put the active UI preset's category, related categories, and Unknown first").needs_reload_ui(),
+            "extra_networks_auto_open_related": OptionInfo(True, "Automatically open related category groups").info("open the active UI preset's related groups and Unknown; close unrelated groups").needs_reload_ui(),
+            "extra_networks_tree_view_style": OptionInfo("Dirs", "Extra Networks UI Style", gr.Radio, {"choices": ("Tree", "Dirs")}).info("Tree shows a hierarchical filesystem browser; Dirs shows directory filter buttons").needs_reload_ui(),
+            "extra_networks_hidden_models": OptionInfo("Always", "Show the Extra Networks in hidden directories", gr.Radio, {"choices": ("Always", "When searched", "Never")}).info('"When searched" option will only show the item when the search string contains 4 characters or more'),
             "extra_networks_default_multiplier": OptionInfo(1.0, "Default Weight for Extra Networks", gr.Slider, {"minimum": 0.0, "maximum": 2.0, "step": 0.05}),
             "extra_networks_card_width": OptionInfo(0, "Card Width for Extra Networks").info("in pixels; 0 = auto"),
             "extra_networks_card_height": OptionInfo(0, "Card Height for Extra Networks").info("in pixels; 0 = auto"),
@@ -389,7 +394,7 @@ options_templates.update(
             "extra_networks_add_text_separator": OptionInfo(" ", "Extra Networks Separator").info("additional text to insert before the Extra Networks syntax"),
             "ui_extra_networks_tab_reorder": OptionInfo("", "Extra Networks Tab Order").info('tab names separated by "," character; empty = default').needs_reload_ui(),
             "extra_tree_div": OptionDiv(),
-            "extra_networks_tree_view_default_enabled": OptionInfo(True, "Show the Extra Networks Tree view by default").needs_reload_ui(),
+            "extra_networks_tree_view_default_enabled": OptionInfo(True, "Show the Extra Networks Tree view by default").info("show the Tree/Dirs directory pane alongside the card list").needs_reload_ui(),
             "extra_networks_tree_view_default_width": OptionInfo(180, "Default Width for the Tree view", gr.Number).needs_reload_ui(),
             "extra_dirs_div": OptionDiv(),
             "extra_networks_show_hidden_directories": OptionInfo(True, "Show Dir buttons of hidden directories").info('directory is hidden if its name starts with "."'),

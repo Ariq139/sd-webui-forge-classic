@@ -52,7 +52,7 @@ onUiLoaded(function () {
 });
 
 function progressTitleEnabled() {
-    return typeof opts === "undefined" || opts.show_progress_in_title !== false;
+    return getUIOption("show_progress_in_title", true) !== false;
 }
 
 function setTitle(progress) {
@@ -89,7 +89,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
     if (gallery && gallery.classList.contains("hidden")) gallery = gallery.parentElement.querySelector(".gradio-video");
 
     let requestWakeLock = async function () {
-        if (!opts.prevent_screen_sleep_during_generation || wakeLock) return;
+        if (!getUIOption("prevent_screen_sleep_during_generation", true) || wakeLock) return;
         try {
             wakeLock = await navigator.wakeLock.request("screen");
         } catch (err) {
@@ -98,7 +98,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
     };
 
     let releaseWakeLock = async function () {
-        if (!opts.prevent_screen_sleep_during_generation || !wakeLock) return;
+        if (!getUIOption("prevent_screen_sleep_during_generation", true) || !wakeLock) return;
         try {
             await wakeLock.release();
             wakeLock = null;
@@ -109,7 +109,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
 
     let divProgress = document.createElement("div");
     divProgress.className = "progressDiv";
-    divProgress.style.display = opts.show_progressbar ? "block" : "none";
+    divProgress.style.display = getUIOption("show_progressbar", true) ? "block" : "none";
     let divInner = document.createElement("div");
     divInner.className = "progress";
 
@@ -182,7 +182,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
 
                 setTimeout(() => {
                     funProgress(id_task, res.id_live_preview);
-                }, opts.live_preview_refresh_period || 500);
+                }, getUIOption("live_preview_refresh_period", 500) || 500);
             },
             function () {
                 removeProgressBar();
@@ -218,7 +218,7 @@ function requestProgress(id_task, progressbarContainer, gallery, atEnd, onProgre
 
                 setTimeout(() => {
                     funLivePreview(id_task, res.id_live_preview);
-                }, opts.live_preview_refresh_period || 500);
+                }, getUIOption("live_preview_refresh_period", 500) || 500);
             },
             function () {
                 removeProgressBar();

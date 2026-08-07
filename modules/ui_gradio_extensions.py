@@ -60,9 +60,16 @@ def webpath(fn):
 
 
 def javascript_js():
-    # Gradio 5 isolates/async-loads external head scripts. Bundle the project
-    # scripts into one ordered global evaluation through Blocks(js=...) so
-    # extensions see the webui callback functions before registering handlers.
+    """Load the legacy scripts in order through Gradio 5's JS hook.
+
+    Gradio 4 inserted ordinary script tags into the page. Gradio 5 renders
+    ``head`` as HTML after the page is mounted, so those tags are inert in this
+    application. The Blocks JS hook does run after hydration, but this browser
+    context intentionally does not expose ``window.eval``. Load each file with
+    a real script element and await its completion so the old global callback
+    queues and extension ordering are retained without either failure mode.
+    """
+
     sources = []
     script_js = os.path.join(script_path, "script.js")
     sources.append(script_js)
@@ -72,41 +79,25 @@ def javascript_js():
     for script in scripts.list_scripts("javascript", ".mjs"):
         sources.append(script.path)
 
-    bundled_sources = []
-    for source_path in sources:
-        try:
-            with open(source_path, "r", encoding="utf8") as source_file:
-                bundled_sources.append({"source": source_file.read(), "module": source_path.endswith(".mjs")})
-        except OSError:
-            bundled_sources.append({"src": webpath(source_path), "module": source_path.endswith(".mjs")})
-
+    source_urls = [
+        {"src": webpath(source_path), "module": source_path.endswith(".mjs")}
+        for source_path in sources
+    ]
     localization_js = localization.localization_js(shared.opts.localization).replace("</", "<\\/")
     theme_js = f'set_theme({json.dumps(shared.cmd_opts.theme)});' if shared.cmd_opts.theme else ""
-    classic_sources = [item["source"] for item in bundled_sources if "source" in item and not item["module"]]
-    module_sources = [item for item in bundled_sources if item.get("module")]
-    external_sources = [item for item in bundled_sources if "src" in item]
-    classic_bundle = "\n;\n".join(classic_sources).replace("</", "<\\/")
-    modules_json = json.dumps(module_sources).replace("</", "<\\/")
-    external_json = json.dumps(external_sources).replace("</", "<\\/")
 
-    return f'''function() {{
+    return f'''async function() {{
     {localization_js};
-    // Evaluate classic project scripts as one program so their shared
-    // callback queues and options state retain the Gradio 4 behavior.
-    window.eval({json.dumps(classic_bundle)});
-    const scripts = {modules_json};
+    const scripts = {json.dumps(source_urls).replace("</", "<\\/")};
     for (const item of scripts) {{
-        const script = document.createElement("script");
-        script.type = item.module ? "module" : "text/javascript";
-        if (item.source) script.textContent = item.source;
-        else script.src = item.src;
-        document.head.appendChild(script);
-    }}
-    for (const item of {external_json}) {{
-        const script = document.createElement("script");
-        script.type = item.module ? "module" : "text/javascript";
-        script.src = item.src;
-        document.head.appendChild(script);
+        await new Promise((resolve, reject) => {{
+            const script = document.createElement("script");
+            script.type = item.module ? "module" : "text/javascript";
+            script.src = item.src;
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+        }});
     }}
     {theme_js}
 }}'''
@@ -128,7 +119,15 @@ def css_text():
 
     light = resolve_var("background_fill_primary")
     dark = resolve_var("background_fill_primary_dark")
-    return f"html {{ background-color: {light}; }} @media (prefers-color-scheme: dark) {{ html {{background-color: {dark}; }} }}"
+    # The browser's overscroll area belongs to `html`, while Gradio applies
+    # the dark theme class to `body`. Set both elements and mirror the body
+    # theme on html so manual dark mode cannot expose a white overscroll area.
+    return (
+        f"html, body {{ background-color: {light} !important; }} "
+        f"body.dark {{ background-color: {dark} !important; }} "
+        f"html.dark, html:has(.dark) {{ background-color: {dark} !important; }} "
+        f"@media (prefers-color-scheme: dark) {{ html, body {{ background-color: {dark} !important; }} }}"
+    )
 
 
 def _path_list(value):

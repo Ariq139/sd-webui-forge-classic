@@ -43,6 +43,12 @@
             onclick="extraNetworksControlTreeViewOnClick(event, '{tabname}', '{extra_networks_tabname}');">
             <i class="extra-network-control--icon extra-network-control--tree-view-icon"></i>
         </div>
+        <div id="{tabname}_{extra_networks_tabname}_extra_group_priority"
+            class="extra-network-control--group-priority {group_priority_btn_extra_class}"{group_priority_control_display}
+            title="Prioritize matching groups"
+            onclick="extraNetworksControlGroupPriorityOnClick(event, '{tabname}', '{extra_networks_tabname}');">
+            <i class="extra-network-control--icon extra-network-control--group-priority-icon"></i>
+        </div>
         <div id="{tabname}_{extra_networks_tabname}_extra_refresh" class="extra-network-control--refresh"
             title="Refresh page"
             onclick="extraNetworksControlRefreshOnClick(event, '{tabname}', '{extra_networks_tabname}');">

@@ -3,11 +3,21 @@ function closeModal() {
     gradioApp().getElementById("lightboxModal").style.display = "none";
 }
 
+let modalLivePreviewEnabled = null;
+
+function isModalLivePreviewEnabled() {
+    if (modalLivePreviewEnabled === null) {
+        modalLivePreviewEnabled = !!getUIOption("js_live_preview_in_modal_lightbox", false);
+    }
+
+    return modalLivePreviewEnabled;
+}
+
 function showModal(event) {
     const source = event.target || event.srcElement;
     const modalImage = gradioApp().getElementById("modalImage");
     const modalToggleLivePreviewBtn = gradioApp().getElementById("modal_toggle_live_preview");
-    modalToggleLivePreviewBtn.innerHTML = opts.js_live_preview_in_modal_lightbox ? "&#x1F5C7;" : "&#x1F5C6;";
+    modalToggleLivePreviewBtn.innerHTML = isModalLivePreviewEnabled() ? "&#x1F5C7;" : "&#x1F5C6;";
     const lb = gradioApp().getElementById("lightboxModal");
     modalImage.src = source.src;
     if (modalImage.style.display === "none") {
@@ -36,7 +46,7 @@ function updateOnBackgroundChange() {
     if (modalImage && modalImage.offsetParent) {
         let currentButton = selected_gallery_button();
         let preview = gradioApp().querySelectorAll(".livePreview > img");
-        if (opts.js_live_preview_in_modal_lightbox && preview.length > 0) {
+        if (isModalLivePreviewEnabled() && preview.length > 0) {
             // show preview image if available
             modalImage.src = preview[preview.length - 1].src;
         } else if (currentButton?.children?.length > 0 && modalImage.src != currentButton.children[0].src) {
@@ -141,9 +151,9 @@ function setupImageForLightbox(e) {
     e.addEventListener(
         "click",
         function (evt) {
-            if (!opts.js_modal_lightbox || evt.button != 0) return;
+            if (!getUIOption("js_modal_lightbox", true) || evt.button != 0) return;
 
-            modalZoomSet(gradioApp().getElementById("modalImage"), opts.js_modal_lightbox_initially_zoomed);
+            modalZoomSet(gradioApp().getElementById("modalImage"), getUIOption("js_modal_lightbox_initially_zoomed", true));
             evt.preventDefault();
             showModal(evt);
         },
@@ -163,8 +173,8 @@ function modalZoomToggle(event) {
 
 function modalLivePreviewToggle(event) {
     const modalToggleLivePreview = gradioApp().getElementById("modal_toggle_live_preview");
-    opts.js_live_preview_in_modal_lightbox = !opts.js_live_preview_in_modal_lightbox;
-    modalToggleLivePreview.innerHTML = opts.js_live_preview_in_modal_lightbox ? "&#x1F5C7;" : "&#x1F5C6;";
+    modalLivePreviewEnabled = !isModalLivePreviewEnabled();
+    modalToggleLivePreview.innerHTML = modalLivePreviewEnabled ? "&#x1F5C7;" : "&#x1F5C6;";
     event.stopPropagation();
 }
 
@@ -185,7 +195,9 @@ function modalTileImageToggle(event) {
 
 onAfterUiUpdate(function () {
     let fullImg_preview = gradioApp().querySelectorAll(
-        ".gradio-gallery > button > button > img, .gradio-gallery > .livePreview",
+        // Gradio 4 used direct nested buttons. Gradio 5.29 wraps the
+        // detailed image in `.gallery-container > button.preview` instead.
+        ".gradio-gallery > button > button > img, .gradio-gallery button.media-button > img[data-testid='detailed-image'], .gradio-gallery > .livePreview",
     );
     if (fullImg_preview != null) {
         fullImg_preview.forEach(setupImageForLightbox);

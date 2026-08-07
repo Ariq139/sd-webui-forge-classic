@@ -51,6 +51,135 @@ setup_logger(logger)
 HF = os.path.join(os.path.dirname(__file__), "huggingface")
 
 
+def _normalize_vae_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Normalize standalone VAE weights before selecting an implementation.
+
+    ComfyUI treats a VAE as an independent component: it strips common
+    checkpoint prefixes, converts Diffusers naming when necessary, and then
+    identifies the architecture from the VAE keys themselves.  Forge used to
+    select the VAE class from the *diffusion model's* pipeline config, which
+    makes a compatible replacement VAE look like the wrong model (notably for
+    Qwen/Wan derivatives).
+    """
+    if not state_dict:
+        return state_dict
+
+    state_dict = dict(state_dict)
+    for prefix in ("vae.", "first_stage_model."):
+        if any(key.startswith(prefix) for key in state_dict):
+            state_dict = state_dict_prefix_replace(state_dict, {prefix: ""}, filter_keys=True)
+            break
+
+    # Diffusers VAE keys are converted before architecture detection, matching
+    # ComfyUI's current standalone VAE loader.
+    if "decoder.up_blocks.0.resnets.0.norm1.weight" in state_dict:
+        from modules_forge.packages.huggingface_guess.diffusers_convert import convert_vae_state_dict
+
+        state_dict = convert_vae_state_dict(state_dict)
+
+    # Flux.2 files use a nested Diffusers prefix for these two modules.
+    if "decoder.post_quant_conv.weight" in state_dict:
+        state_dict = state_dict_prefix_replace(
+            state_dict,
+            {"decoder.post_quant_conv.": "post_quant_conv.", "encoder.quant_conv.": "quant_conv."},
+        )
+
+    return state_dict
+
+
+def _detect_vae_format(state_dict: dict[str, torch.Tensor]) -> str | None:
+    """Return the local VAE architecture represented by a state dict."""
+    keys = state_dict.keys()
+
+    # Wan 2.1 / Qwen Image's causal VAE.  The gamma keys are the stable
+    # discriminator used by ComfyUI and also cover Anima's VAE.
+    if "decoder.middle.0.residual.0.gamma" in keys and "encoder.conv1.weight" in keys:
+        return "wan21"
+
+    # Qwen's 2D derivative has the same residual naming but uses Conv2d and
+    # the quant/post-quant pair instead of the causal 3D VAE's conv1/conv2.
+    if "post_quant_conv.weight" in keys and (
+        "encoder.down_blocks.0.resnets.0.norm1.gamma" in keys
+        or "decoder.mid_block.resnets.0.norm1.gamma" in keys
+    ):
+        return "qwen2d"
+
+    # Flux.2 has a quant/post-quant pair and a 32/128-channel latent variant
+    # distinct from the regular KL VAE.  The normalization step may convert
+    # its Diffusers mid-block names to the older `mid.attn_1` spelling, so the
+    # quant pair is the stable discriminator here.
+    if "post_quant_conv.weight" in keys:
+        return "flux2"
+
+    # Flux.1 uses the classic mid.attn_1 layout without post_quant_conv.
+    if "decoder.mid.attn_1.k.weight" in keys:
+        return "flux"
+
+    if "decoder.conv_in.weight" in keys:
+        return "standard"
+
+    return None
+
+
+def _load_detected_vae(state_dict: dict[str, torch.Tensor], vae_format: str):
+    """Build a VAE from its own keys, independent of the selected pipeline."""
+    if vae_format == "wan21":
+        from backend.nn.wan_vae import WanVAE
+
+        # This mirrors ComfyUI's current Wan 2.1 detection.  Deriving the
+        # dimensions from the tensors avoids forcing a Qwen config onto a Wan
+        # VAE (or the reverse) when the user selects a standalone module.
+        # The decoder head ends at the first (base) channel width for Wan's
+        # reversed decoder, so infer the base width from the encoder input
+        # convolution instead of dividing the decoder head width.
+        base_dim = int(state_dict["encoder.conv1.weight"].shape[0])
+        z_dim = int(state_dict["conv1.weight"].shape[0] // 2)
+        config = {
+            "base_dim": base_dim,
+            "z_dim": z_dim,
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "attn_scales": [],
+            "temporal_downsample": [False, True, True],
+            "image_channels": int(state_dict["encoder.conv1.weight"].shape[1]),
+            "conv_out_channels": int(state_dict["decoder.head.2.weight"].shape[0]),
+            "dropout": 0.0,
+        }
+
+        with no_init_weights():
+            with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
+                model = WanVAE(**config)
+
+        load_state_dict(model, state_dict, log_name="Wan/Qwen VAE")
+        model._forge_vae_is_wan = True
+        model._forge_vae_is_flux2 = False
+        return model
+
+    if vae_format == "qwen2d":
+        from backend.nn.wan_vae_2d import Qwen2DVAE
+
+        config = {
+            "base_dim": int(state_dict["encoder.conv_in.weight"].shape[0]),
+            "z_dim": int(state_dict["post_quant_conv.weight"].shape[0]),
+            "image_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "attn_scales": [],
+            "dropout": 0.0,
+        }
+
+        with no_init_weights():
+            with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
+                model = Qwen2DVAE(**config)
+
+        load_state_dict(model, state_dict, log_name="Qwen 2D VAE")
+        model._forge_vae_is_wan = False
+        model._forge_vae_is_flux2 = False
+        return model
+
+    return None
+
+
 def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
     config_path = os.path.join(repo_path, component_name)
 
@@ -68,6 +197,23 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             return comp
 
         # region VAE
+
+        if component_name == "vae" and isinstance(state_dict, dict):
+            state_dict = _normalize_vae_state_dict(state_dict)
+            vae_format = _detect_vae_format(state_dict)
+            detected_vae = _load_detected_vae(state_dict, vae_format) if vae_format in {"wan21", "qwen2d"} else None
+            if detected_vae is not None:
+                return detected_vae
+
+            # A standalone Flux VAE must use the Flux config even when it is
+            # selected for a different pipeline.  The later Flux.2 branch
+            # keeps its own config and small-decoder handling.
+            if vae_format == "flux":
+                cls_name = "AutoencoderKL"
+                config_path = os.path.join(HF, "black-forest-labs", "FLUX.1-dev", "vae")
+            elif vae_format == "flux2":
+                cls_name = "AutoencoderKLFlux2"
+                config_path = os.path.join(HF, "black-forest-labs", "FLUX.2-klein-9B", "vae")
 
         if cls_name == "PiDAutoVAE":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
@@ -100,6 +246,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     model = IntegratedAutoencoderKL.from_config(config)
 
             load_state_dict(model, state_dict, ignore_start="loss.")
+            model._forge_vae_is_wan = False
+            model._forge_vae_is_flux2 = False
             return model
         if cls_name == "AutoencoderKLFlux2":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
@@ -115,6 +263,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     model = AutoencoderKLFlux2.from_config(config)
 
             load_state_dict(model, state_dict, ignore_start="loss.")
+            model._forge_vae_is_wan = False
+            model._forge_vae_is_flux2 = True
             return model
         if cls_name in ["AutoencoderKLWan", "AutoencoderKLQwenImage"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
@@ -134,6 +284,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     model = WanVAE.from_config(config)
 
             load_state_dict(model, state_dict)
+            model._forge_vae_is_wan = True
+            model._forge_vae_is_flux2 = False
             return model
 
         # region Text Encoder
@@ -525,7 +677,7 @@ def replace_state_dict(sd: dict[str, torch.Tensor], asd: dict[str, torch.Tensor]
         asd = convert_vae_state_dict(asd)
 
     #   sd / sdxl / wan                  # wan
-    if "decoder.conv_in.weight" in asd or "decoder.middle.0.residual.0.gamma" in asd:
+    if "decoder.conv_in.weight" in asd or "decoder.conv1.weight" in asd or "decoder.middle.0.residual.0.gamma" in asd:
         keys_to_delete = [k for k in sd if k.startswith(vae_key_prefix)]
         for k in keys_to_delete:
             del sd[k]

@@ -96,9 +96,33 @@ function setupSettingsControls() {
     return settingsSidebar();
 }
 
+function settingsSyncExtraNetworksCardSettings() {
+    let simpleList = gradioApp().querySelector("#setting_extra_networks_use_simple_list input[type='checkbox']");
+    if (!simpleList) return;
+
+    let visualCardSettings = [
+        "extra_networks_card_width",
+        "extra_networks_card_height",
+        "extra_networks_card_text_scale",
+        "extra_networks_card_show_desc",
+        "extra_networks_card_description_is_html",
+    ];
+    visualCardSettings.forEach(function (key) {
+        let setting = gradioApp().getElementById("setting_" + key);
+        if (setting) setting.style.display = simpleList.checked ? "none" : "";
+    });
+
+    if (simpleList.dataset.extraNetworksCardSettingsBound !== "1") {
+        simpleList.addEventListener("change", settingsSyncExtraNetworksCardSettings);
+        simpleList.dataset.extraNetworksCardSettingsBound = "1";
+    }
+}
+
 function settingsSetupNavigation() {
     let sidebar = settingsSidebar();
     if (!sidebar) return null;
+
+    settingsSyncExtraNetworksCardSettings();
 
     let metadata = settingsMetadata();
     if (!metadata.length || sidebar.dataset.settingsNavBuilt === "1") return sidebar;
@@ -207,6 +231,7 @@ function startSettingsLayoutObserver() {
 
     function initializeSettings() {
         setupSettingsControls();
+        settingsSyncExtraNetworksCardSettings();
         settingsSetupNavigation();
         setupSettingsSearch();
         addSettingsCategories();
@@ -227,11 +252,13 @@ if (document.readyState === "loading") {
 }
 
 onOptionsChanged(function () {
+    settingsSyncExtraNetworksCardSettings();
     settingsSetupNavigation();
     addSettingsCategories();
 });
 
 onOptionsAvailable(function () {
+    settingsSyncExtraNetworksCardSettings();
     settingsSetupNavigation();
     addSettingsCategories();
 });

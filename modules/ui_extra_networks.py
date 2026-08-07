@@ -183,6 +183,7 @@ class ExtraNetworksPage:
         self.extra_networks_tabname = self.name.replace(" ", "_")
         self.allow_prompt = True
         self.allow_negative_prompt = False
+        self.supports_category_grouping = False
         self.metadata = {}
         self.items = {}
         self.lister = util.MassFileLister()
@@ -252,13 +253,14 @@ class ExtraNetworksPage:
             If no template is passed: A dictionary containing the generated item's attributes.
         """
         preview = item.get("preview", None)
-        style_height = f"height: {shared.opts.extra_networks_card_height}px;" if shared.opts.extra_networks_card_height else ""
-        style_width = f"width: {shared.opts.extra_networks_card_width}px;" if shared.opts.extra_networks_card_width else ""
+        simple_list = shared.opts.extra_networks_use_simple_list
+        style_height = f"height: {shared.opts.extra_networks_card_height}px;" if shared.opts.extra_networks_card_height and not simple_list else ""
+        style_width = f"width: {shared.opts.extra_networks_card_width}px;" if shared.opts.extra_networks_card_width and not simple_list else ""
         style_font_size = f"font-size: {shared.opts.extra_networks_card_text_scale*100}%;"
         card_style = style_height + style_width + style_font_size
         background_image = ""
 
-        if preview:
+        if preview and not simple_list:
             _, preview_format = os.path.splitext(preview.rsplit("&mtime=", 1)[0])
             if preview_format.lower() in (".mp4", ".webm"):
                 background_image = f'<video src="{html.escape(preview)}" class="preview" loading="lazy" autoplay loop muted playsinline></video>'
@@ -303,14 +305,13 @@ class ExtraNetworksPage:
             if filename.startswith(absdir):
                 local_path = filename[len(absdir) :]
 
-        # if this is true, the item must not be shown in the default view, and must instead only be
-        # shown when searching for it
-        if shared.opts.extra_networks_hidden_models == "Always":
-            search_only = False
-        else:
-            search_only = "/." in local_path or "\\." in local_path
+        # Keep the directory marker on the card even when the current option
+        # shows hidden items. The browser can then apply a changed setting
+        # without rebuilding every card.
+        hidden_directory = "/." in local_path or "\\." in local_path
+        search_only = hidden_directory and shared.opts.extra_networks_hidden_models == "When searched"
 
-        if search_only and shared.opts.extra_networks_hidden_models == "Never":
+        if hidden_directory and shared.opts.extra_networks_hidden_models == "Never":
             return ""
 
         item_sort_keys = item.get("sort_keys", {})
@@ -334,10 +335,13 @@ class ExtraNetworksPage:
         # Some items here might not be used depending on HTML template used.
         args = {
             "background_image": background_image,
+            "card_classes": " extra-network-simple-card" if simple_list else "",
             "card_clicked": onclick,
             "copy_path_button": btn_copy_path,
             "description": description,
             "edit_button": btn_edit_item,
+            "category": html.escape(str(item.get("category", "")), quote=True),
+            "hidden_directory": " extra-network-hidden-directory" if hidden_directory else "",
             "local_preview": quote_js(item["local_preview"]),
             "metadata_button": btn_metadata,
             "name": html.escape(item["name"]),
@@ -560,13 +564,50 @@ class ExtraNetworksPage:
         Returns:
             HTML formatted string.
         """
-        res = []
+        rendered_items = []
         for item in self.items.values():
-            res.append(self.create_item_html(tabname, item, self.card_tpl))
+            item_html = self.create_item_html(tabname, item, self.card_tpl)
+            if item_html:
+                rendered_items.append((item, item_html))
 
-        if not res:
+        if not rendered_items:
             dirs = "".join([f"<li>{x}</li>" for x in self.allowed_directories_for_previews()])
-            res = [none_message or shared.html("extra-networks-no-cards.html").format(dirs=dirs)]
+            return none_message or shared.html("extra-networks-no-cards.html").format(dirs=dirs)
+
+        # Most Extra Networks pages remain a flat list. Pages that provide a
+        # category on an item get native <details> groups so the browser keeps
+        # each category independently collapsible and open on first display.
+        if not shared.opts.extra_networks_group_by_category or not any(item.get("category") for item, _ in rendered_items):
+            return "".join(item_html for _, item_html in rendered_items)
+
+        grouped = {}
+        for item, item_html in rendered_items:
+            category = str(item.get("category") or "Other")
+            grouped.setdefault(category, []).append(item_html)
+
+        prioritized_order = {name: index for index, name in enumerate(self.get_category_order(prioritize=True))}
+        default_order = {name: index for index, name in enumerate(self.get_category_order(prioritize=False))}
+        auto_open_related = getattr(shared.opts, "extra_networks_auto_open_related", True)
+        open_categories = self.get_category_open_categories() if auto_open_related else None
+        category_order = prioritized_order if shared.opts.extra_networks_prioritize_group else default_order
+        grouped_items = sorted(
+            grouped.items(),
+            key=lambda pair: (category_order.get(pair[0], len(category_order)), pair[0].casefold()),
+        )
+
+        res = []
+        for category, cards in grouped_items:
+            escaped_category = html.escape(category, quote=True)
+            open_attribute = " open" if open_categories is None or category in open_categories else ""
+            res.append(
+                f'<details class="extra-network-category" data-category="{escaped_category}" '
+                f'data-auto-open-related="{"true" if auto_open_related else "false"}" '
+                f'data-category-order="{default_order.get(category, len(default_order))}" '
+                f'data-category-priority-order="{prioritized_order.get(category, len(prioritized_order))}"{open_attribute}>'
+                f'<summary>{escaped_category}</summary>'
+                f'<div class="extra-network-category-cards" data-category="{escaped_category}">'
+                f'{"".join(cards)}</div></details>'
+            )
 
         return "".join(res)
 
@@ -608,7 +649,10 @@ class ExtraNetworksPage:
             "sort_date_created_active": " extra-network-control--enabled" if shared.opts.extra_networks_card_order_field == "Date Created" else "",
             "sort_date_modified_active": " extra-network-control--enabled" if shared.opts.extra_networks_card_order_field == "Date Modified" else "",
             "tree_view_btn_extra_class": "extra-network-control--enabled" if show_tree else "",
+            "group_priority_btn_extra_class": "extra-network-control--enabled" if shared.opts.extra_networks_prioritize_group else "",
+            "group_priority_control_display": "" if self.supports_category_grouping else ' style="display:none"',
             "items_html": self.create_card_view_html(tabname, none_message="Loading..." if empty else None),
+            "cards_class": "extra-network-cards-simple" if shared.opts.extra_networks_use_simple_list else "",
             "extra_networks_tree_view_default_width": shared.opts.extra_networks_tree_view_default_width,
             "tree_view_div_default_display_class": "" if show_tree else "extra-network-dirs-hidden",
         }
@@ -625,6 +669,14 @@ class ExtraNetworksPage:
 
     def list_items(self):
         raise NotImplementedError()
+
+    def get_category_order(self, prioritize=True):
+        """Return the preferred order for optional card categories."""
+        return []
+
+    def get_category_open_categories(self):
+        """Return categories expanded when a grouped pane is first shown."""
+        return None
 
     def allowed_directories_for_previews(self):
         return []
@@ -771,7 +823,10 @@ def create_ui(interface: gr.Blocks, unrelated_tabs, tabname):
             return ui.pages_contents
 
         button_refresh = gr.Button("Refresh", elem_id=f"{tabname}_{page.extra_networks_tabname}_extra_refresh_internal", visible=False)
-        button_refresh.click(fn=refresh, outputs=ui.pages).then(fn=lambda: None, _js="function(){ " + f"applyExtraNetworkFilter('{tabname}_{page.extra_networks_tabname}');" + " }").then(fn=lambda: None, _js="setupAllResizeHandles")
+        button_refresh.click(fn=refresh, outputs=ui.pages).then(
+            fn=lambda: None,
+            _js="function(){ setupExtraNetworks(); " + f"applyExtraNetworkFilter('{tabname}_{page.extra_networks_tabname}');" + " }",
+        ).then(fn=lambda: None, _js="setupAllResizeHandles")
 
     def create_html():
         ui.pages_contents = [pg.create_html(ui.tabname) for pg in ui.stored_extra_pages]
@@ -781,7 +836,10 @@ def create_ui(interface: gr.Blocks, unrelated_tabs, tabname):
             create_html()
         return ui.pages_contents
 
-    interface.load(fn=pages_html, outputs=ui.pages).then(fn=lambda: None, _js="setupAllResizeHandles")
+    interface.load(fn=pages_html, outputs=ui.pages).then(
+        fn=lambda: None,
+        _js="function(){ setupExtraNetworks(); setupAllResizeHandles(); }",
+    )
 
     return ui
 

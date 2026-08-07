@@ -4,6 +4,14 @@
 
 /* general gradio fixes */
 
+html {
+    min-height: 100%;
+}
+
+body {
+    min-height: 100vh;
+}
+
 :root,
 .dark {
     --checkbox-label-gap: 0.25em 0.1em;
@@ -550,7 +558,10 @@ div.toprow-compact-tools {
 
 #setting_sd_modules div.wrap-inner {
     min-width: 20vw;
-    height: 40px !important;
+    height: auto !important;
+    min-height: 40px;
+    align-content: flex-start;
+    overflow: visible !important;
     cursor: pointer;
     padding: 0em 2em 0em 0.5em;
 }
@@ -1131,11 +1142,30 @@ footer {
 
 .extra-networks > .tab-wrapper > .tab-container[role="tablist"] {
     min-height: 2.7rem;
+    min-width: 0;
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .extra-networks-controls-div {
     align-self: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
     margin-left: auto;
+}
+
+.extra-networks > .tab-wrapper > .tab-container[role="tablist"] > [role="tab"] {
+    flex: 0 0 auto !important;
+    min-width: max-content;
+    white-space: nowrap;
+    margin-left: 0 !important;
+}
+
+.extra-networks > .tab-wrapper > .tab-container[role="tablist"] > .extra-networks-controls-div {
+    margin-left: auto !important;
 }
 
 .extra-networks>div>[id*="_extra_"] {
@@ -1476,6 +1506,127 @@ body.resizing .resize-handle {
     border: 1px solid var(--block-border-color);
 }
 
+.extra-network-pane .extra-network-cards-simple {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.35rem;
+}
+
+.extra-network-pane .extra-network-category {
+    display: block;
+    margin: 0.35rem;
+    border: 1px solid var(--block-border-color);
+    border-radius: 0.35rem;
+    overflow: visible;
+}
+
+.extra-network-pane .extra-network-category > summary {
+    padding: 0.45rem 0.7rem;
+    color: var(--body-text-color);
+    background: var(--block-background-fill);
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+}
+
+.extra-network-pane .extra-network-category-cards {
+    min-width: 0;
+}
+
+.extra-network-pane .extra-network-cards-simple > .extra-network-category {
+    margin: 0;
+}
+
+.extra-network-pane .extra-network-cards-simple .extra-network-category-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.35rem;
+}
+
+.extra-network-pane .card.extra-network-simple-card {
+    display: flex;
+    width: 100%;
+    height: auto;
+    min-height: 2.75rem;
+    margin: 0;
+    border: 1px solid var(--block-border-color);
+    box-shadow: none;
+    border-radius: 0.35rem;
+    background-image: none;
+    background-color: var(--block-background-fill);
+    overflow: visible;
+}
+
+.extra-network-pane .card.extra-network-simple-card:hover {
+    box-shadow: 0 0 0 2px rgba(0, 128, 255, 0.35);
+}
+
+.extra-network-pane .card.extra-network-simple-card .preview {
+    display: none;
+}
+
+.extra-network-pane .card.extra-network-simple-card .actions {
+    position: static;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    gap: 0.75rem;
+    padding: 0.45rem 0.75rem;
+    background: transparent;
+    box-shadow: none;
+    text-shadow: none;
+}
+
+.extra-network-pane .card.extra-network-simple-card .actions * {
+    color: var(--body-text-color);
+}
+
+.extra-network-pane .card.extra-network-simple-card .actions .name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    font-size: 1rem;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.extra-network-pane .card.extra-network-simple-card .actions .description {
+    flex: 0 1 45%;
+    max-height: 1.4em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.extra-network-pane .card.extra-network-simple-card .button-row {
+    position: static;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    order: 2;
+    padding: 0 0.5rem 0 0;
+    visibility: hidden;
+}
+
+.extra-network-pane .card.extra-network-simple-card:hover .button-row,
+.extra-network-pane .card.extra-network-simple-card:focus-within .button-row {
+    visibility: visible;
+}
+
+@media (hover: none), (max-width: 640px) {
+    .extra-network-pane .card.extra-network-simple-card .button-row {
+        visibility: visible;
+    }
+
+    .extra-network-pane .card.extra-network-simple-card .actions .description {
+        display: none;
+    }
+}
+
 .extra-network-pane .extra-network-tree .tree-list {
     flex: 1;
     display: flex;
@@ -1772,6 +1923,29 @@ body.resizing .resize-handle {
     background-color: var(--input-placeholder-color);
 }
 
+.extra-network-control .extra-network-control--group-priority {
+    padding: 0.25rem;
+    display: inline-flex;
+    cursor: pointer;
+    justify-self: center;
+    align-self: center;
+}
+
+.extra-network-control .extra-network-control--group-priority-icon {
+    display: inline-flex;
+    width: 1.5rem;
+    height: 1.5rem;
+    align-items: center;
+    justify-content: center;
+    color: var(--input-placeholder-color);
+    font-size: 1.35rem;
+    font-style: normal;
+}
+
+.extra-network-control .extra-network-control--group-priority-icon::before {
+    content: "★";
+}
+
 .extra-network-control .extra-network-control--enabled {
     background-color: rgba(0, 0, 0, 0.1);
     border-radius: 0.25rem;
@@ -1901,6 +2075,33 @@ body.resizing .resize-handle {
 #img2img_prompt_container.prompt-container-scroll div.gradio-textbox.prompt {
     height: 6em;
     overflow-y: auto !important;
+}
+
+/* Some mobile browsers report a wider CSS viewport than the physical
+   screenshot width because of device scaling or page zoom. Keep the model
+   selector safe through the tablet-sized range as well; the rest of the
+   mobile layout still uses the narrower breakpoint below. */
+@media screen and (max-width: 1200px) {
+    #setting_sd_modules div.wrap-inner {
+        height: auto !important;
+        min-height: 40px;
+        align-content: flex-start;
+        overflow: visible !important;
+        padding-top: 0.25em;
+        padding-bottom: 0.25em;
+    }
+
+    #setting_sd_modules div.token {
+        box-sizing: border-box;
+        flex: 0 0 100%;
+        max-width: 100%;
+        margin: 0.25em 0;
+    }
+
+    #setting_sd_modules .secondary-wrap {
+        flex: 0 0 100%;
+        max-width: 100%;
+    }
 }
 
 @media screen and (max-width: 700px) {

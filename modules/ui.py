@@ -267,10 +267,11 @@ def create_ui():
                                 with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=shared.opts.hires_fix_show_sampler):
 
                                     def _refresh_models():
-                                        checkpoints_list = ["Use same checkpoint"]
-                                        modules_list = ["Use same choices"]
-                                        checkpoints, modules = main_entry.refresh_models()
-                                        return [checkpoints_list + checkpoints, modules_list + modules]
+                                        checkpoints, _ = main_entry.refresh_models()
+                                        return [
+                                            ["Use same checkpoint"] + checkpoints,
+                                            ["Use same choices"] + main_entry.module_choices(),
+                                        ]
 
                                     checkpoints_list, modules_list = _refresh_models()
 
