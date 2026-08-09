@@ -1,3 +1,4 @@
+import json
 import os
 from contextlib import closing
 from pathlib import Path
@@ -208,6 +209,33 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
 
     image = images.fix_image(image)
     mask = images.fix_image(mask)
+
+    if opts.forge_preset == "ltx2":
+        if is_batch:
+            raise RuntimeError("LTX-2.3 image-to-video does not support batch mode through the shared img2img flow yet.")
+
+        from modules.ui_ltx2_video import generate_from_preset
+
+        prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles or [])
+        negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(negative_prompt, prompt_styles or [])
+        video_path, status = generate_from_preset(
+            prompt,
+            negative_prompt,
+            image=image,
+            width=width,
+            height=height,
+            frames=batch_size,
+            steps=args[1] if len(args) > 1 and isinstance(args[1], (int, float)) else None,
+            guidance=cfg_scale,
+        )
+        generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=video_path, visible=bool(video_path)),
+            generation_info_js,
+            plaintext_to_html(status),
+            "",
+        )
 
     if "pid" in model_data.forge_loading_parameters["checkpoint_info"].filename.lower() and not (selected_scale_tab == 1 and scale_by == 4.0):
         processing.logger.warning("Resize by 4x is recommended for PiD")

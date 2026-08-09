@@ -130,6 +130,31 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
 
 
 def txt2img_function(id_task: str, request: gr.Request, *args):
+    if opts.forge_preset == "ltx2":
+        from modules.ui_ltx2_video import generate_from_preset
+
+        prompt, negative_prompt = args[1], args[2]
+        prompt_styles = args[3] or []
+        prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles)
+        negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(negative_prompt, prompt_styles)
+        video_path, status = generate_from_preset(
+            prompt,
+            negative_prompt,
+            width=args[9],
+            height=args[8],
+            frames=args[5],
+            guidance=args[6],
+            steps=args[27] if len(args) > 27 and isinstance(args[27], (int, float)) else None,
+        )
+        generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=video_path, visible=bool(video_path)),
+            generation_info_js,
+            plaintext_to_html(status),
+            "",
+        )
+
     p = txt2img_create_processing(id_task, request, *args)
 
     with closing(p):

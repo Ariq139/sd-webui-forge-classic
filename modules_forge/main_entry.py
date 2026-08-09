@@ -40,6 +40,7 @@ forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
 
 module_list: dict[str, os.PathLike] = {}
 module_categories: dict[str, str] = {}
+LTX2_MODEL_DEFAULT = "diffusers/LTX-2.3-Diffusers"
 
 
 def module_choices() -> list[tuple[str, str]]:
@@ -70,28 +71,63 @@ def make_checkpoint_manager_ui():
             shared.opts.set("sd_model_checkpoint", next(iter(sd_models.checkpoints_list.values())).name)
 
     ckpt_list, vae_list = refresh_models()
-    checkpoint_value = shared.opts.sd_model_checkpoint if shared.opts.sd_model_checkpoint in ckpt_list else (ckpt_list[0] if ckpt_list else None)
+    preset = getattr(shared.opts, "forge_preset", "sd")
+    ckpt_list = checkpoint_choices(preset, ckpt_list)
+    checkpoint_value = checkpoint_value_for_preset(preset, ckpt_list)
     module_value = [os.path.basename(x) for x in shared.opts.forge_additional_modules if os.path.basename(x) in vae_list]
 
     ui_forge_preset = gr.Dropdown(label="UI Preset", value=shared.opts.forge_preset, choices=PresetArch.choices(), elem_id="forge_ui_preset")
 
-    ui_checkpoint = gr.Dropdown(label="Checkpoint", value=checkpoint_value, choices=ckpt_list, elem_id="setting_sd_model_checkpoint", elem_classes=["model_selection"])
+    ui_checkpoint = gr.Dropdown(label=checkpoint_label(preset), value=checkpoint_value, choices=ckpt_list, elem_id="setting_sd_model_checkpoint", elem_classes=["model_selection"])
 
-    ui_vae = gr.Dropdown(label="VAE / Text Encoder", value=module_value, choices=module_choices(), multiselect=True, elem_id="setting_sd_modules", elem_classes=["model_selection"])
+    ui_vae = gr.Dropdown(label="VAE / Text Encoder", value=module_value, choices=module_choices(), multiselect=True, visible=preset != PresetArch.ltx2.name, elem_id="setting_sd_modules", elem_classes=["model_selection"])
 
     def refresh_model_list():
         ckpt_list, _ = refresh_models()
-        return [gr.update(choices=ckpt_list), gr.update(choices=module_choices())]
+        current_preset = getattr(shared.opts, "forge_preset", "sd")
+        choices = checkpoint_choices(current_preset, ckpt_list)
+        return [gr.update(value=checkpoint_value_for_preset(current_preset, choices), choices=choices, label=checkpoint_label(current_preset)), gr.update(choices=module_choices())]
 
     refresh_button = ui_common.ToolButton(value=ui_common.refresh_symbol, elem_id="forge_refresh_checkpoint", tooltip="Refresh")
     refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
     Context.root_block.load(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
 
-    ui_forge_unet_dtype = gr.Dropdown(label="Diffusion in Low Bits", value=None, choices=list(forge_unet_storage_dtype_options.keys()), elem_id="forge_ui_dtype")
+    ui_forge_unet_dtype = gr.Dropdown(label="Diffusion in Low Bits", value=None, choices=list(forge_unet_storage_dtype_options.keys()), visible=preset != PresetArch.ltx2.name, elem_id="forge_ui_dtype")
 
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
     ui_forge_unet_dtype.input(dtype_change, inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
+
+
+def checkpoint_label(preset: str) -> str:
+    return "LTX-2.3 Model" if preset == PresetArch.ltx2.name else "Checkpoint"
+
+
+def ltx2_model_value() -> str:
+    configured = getattr(shared.opts, "ltx2_model_path", None)
+    selected = getattr(shared.opts, "forge_checkpoint_ltx2", None)
+    if selected and selected != LTX2_MODEL_DEFAULT:
+        return selected
+    return configured or selected or LTX2_MODEL_DEFAULT
+
+
+def checkpoint_choices(preset: str, choices: list[str]) -> list[str]:
+    if preset != PresetArch.ltx2.name:
+        return choices
+
+    values = []
+    for value in (ltx2_model_value(), LTX2_MODEL_DEFAULT):
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def checkpoint_value_for_preset(preset: str, choices: list[str]) -> str | None:
+    if preset == PresetArch.ltx2.name:
+        value = ltx2_model_value()
+        return value if value in choices else (choices[-1] if choices else LTX2_MODEL_DEFAULT)
+    value = getattr(shared.opts, f"forge_checkpoint_{preset}", None) or shared.opts.sd_model_checkpoint
+    return value if value in choices else (choices[0] if choices else None)
 
 
 def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) -> dict[str, os.PathLike]:
@@ -169,6 +205,18 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
 
 def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> bool:
     """`ckpt_name` accepts valid aliases; returns `True` if checkpoint changed"""
+    if preset == PresetArch.ltx2.name:
+        ckpt_name = (ckpt_name or LTX2_MODEL_DEFAULT).strip()
+        current = ltx2_model_value()
+        if ckpt_name == current:
+            return False
+
+        shared.opts.set("forge_checkpoint_ltx2", ckpt_name)
+        shared.opts.set("ltx2_model_path", ckpt_name)
+        if save:
+            shared.opts.save(shared.config_filename)
+        return True
+
     new_ckpt_info = sd_models.get_closet_checkpoint_match(ckpt_name)
     current_ckpt_info = sd_models.get_closet_checkpoint_match(getattr(shared.opts, "sd_model_checkpoint", ""))
     if new_ckpt_info == current_ckpt_info:
@@ -186,6 +234,9 @@ def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> b
 
 def modules_change(module_values: list, preset: str, save=True, refresh=True) -> bool:
     """`module_values` accepts file paths or just the module names; returns `True` if modules changed"""
+    if preset == PresetArch.ltx2.name:
+        return False
+
     modules = []
     for v in module_values:
         module_name = os.path.basename(v)  # If the input is a filepath, extract the filename
@@ -208,6 +259,9 @@ def modules_change(module_values: list, preset: str, save=True, refresh=True) ->
 
 
 def dtype_change(dtype: str, preset: str, save=True, refresh=True) -> bool:
+    if preset == PresetArch.ltx2.name:
+        return False
+
     shared.opts.set("forge_unet_storage_dtype", dtype)
     if preset is not None:
         shared.opts.set(f"forge_unet_storage_dtype_{preset}", dtype)
@@ -284,10 +338,28 @@ def forge_main_entry():
     ).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
     Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
-    refresh_model_loading_parameters()
+    from modules import ui_ltx2_video
+
+    ui_ltx2_video.bind_preset(ui_forge_preset)
+
+    if getattr(shared.opts, "forge_preset", "sd") != PresetArch.ltx2.name:
+        refresh_model_loading_parameters()
 
 
 def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: str, ui_forge_preset: str):
+    if ui_forge_preset == PresetArch.ltx2.name:
+        try:
+            from modules import sd_models
+
+            sd_models.unload_model_weights()
+        except Exception:
+            logger.debug("No Forge image model needed unloading before LTX-2.3", exc_info=True)
+        checkpoint_change(ui_checkpoint, ui_forge_preset, save=True, refresh=False)
+        return
+
+    from modules import ui_ltx2_video
+
+    ui_ltx2_video.unload()
     dtype_change(ui_forge_unet_dtype, ui_forge_preset, save=False, refresh=False)
     modules_change(ui_vae, ui_forge_preset, save=False, refresh=False)
     checkpoint_change(ui_checkpoint, ui_forge_preset, save=True, refresh=True)
@@ -306,18 +378,31 @@ def on_preset_change(preset: str):
         d_args = {"visible": False}
 
     if (fps := is_video(preset)) > 1:
-        batch_args_t2i = {"minimum": 1, "maximum": fps * 15 + 1, "step": fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+        max_frames = fps * (30 if preset == PresetArch.ltx2.name else 15) + 1
+        min_frames = 9 if preset == PresetArch.ltx2.name else 1
+        batch_args_t2i = {"minimum": min_frames, "maximum": max_frames, "step": fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
     else:
         batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
 
     batch_args_i2i = batch_args_t2i.copy()
     batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
 
+    ltx2 = preset == PresetArch.ltx2.name
+    checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
+
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
-        gr.update(value=getattr(shared.opts, f"forge_checkpoint_{preset}", shared.opts.sd_model_checkpoint)),
-        gr.update(value=[os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])]),
-        gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic")),
+        gr.update(
+            value=checkpoint_value_for_preset(preset, checkpoint_list),
+            choices=checkpoint_list,
+            label=checkpoint_label(preset),
+        ),
+        gr.update(
+            value=[] if ltx2 else [os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])],
+            visible=not ltx2,
+            interactive=not ltx2,
+        ),
+        gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic"), visible=not ltx2, interactive=not ltx2),
         # ui_txt2img_steps, ui_txt2img_hr_steps, ui_img2img_steps
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_step", 20)) > 0 else gr.skip(),
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),

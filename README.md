@@ -21,8 +21,9 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > ### Neo additions created by Codex
 > These additions were created by Codex at the maintainer's request. They are Neo-specific and may change:
 >
-> - **Gradio UI migration:** Migrated to Gradio 5.29, while keeping the UI's functionality and behaviour.
+> - **Gradio UI migration:** restored the UI's functionality and behaviour after the migration.
 > - **Settings navigation:** searchable and clickable settings panels, collapsible category groups, open/close-all controls, restored option descriptions, and safer handling of inactive controls.
+> - **LTX-2.3 Video:** `ltx2` UI preset integration for text-to-video and image-to-video generation, optional audio, CPU offload, VAE tiling, and PrunaVAED decoder support. See the [LTX Video guide](docs/LTX_VIDEO.md).
 > - **Optional memory management:** an MMGP-style manager behind `--mmgp`, named RAM/VRAM profiles, per-component budgets, pinned CPU memory, asynchronous transfers, residency hints, and explicit interaction rules with Forge's VRAM flags.
 > - **Extra Networks:** simple-list mode, optional cards and grouping, preset-aware group priority/open state, automatic search, improved LoRA metadata/category detection, metadata view/edit handling, and safer default LoRA insertion weights.
 > - **Backend improvements:** additional GGUF dequantization coverage and Comfy-inspired VAE/offload handling.
