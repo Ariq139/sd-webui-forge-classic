@@ -48,6 +48,8 @@ fpvae_group = parser.add_mutually_exclusive_group()
 fpvae_group.add_argument("--fp32-vae", action="store_true", help="Store the VAE in full precision fp32")
 fpvae_group.add_argument("--bf16-vae", action="store_true", help="Store the VAE in bf16")
 fpvae_group.add_argument("--fp16-vae", action="store_true", help="Store the VAE in fp16 (might cause black images)")
+fpvae_group.add_argument("--fp8_e4m3fn-vae", action="store_true", help="Store VAE Conv/Linear weights in fp8_e4m3fn (compute stays in the selected VAE dtype)")
+fpvae_group.add_argument("--fp8_e5m2-vae", action="store_true", help="Store VAE Conv/Linear weights in fp8_e5m2 (compute stays in the selected VAE dtype)")
 
 parser.add_argument("--cpu-vae", action="store_true", help="Run the VAE on the CPU")
 
@@ -86,6 +88,7 @@ vram_group.add_argument("--cpu", action="store_true", help="Use the CPU for ever
 
 parser.add_argument("--reserve-vram", type=float, default=None, metavar="GB", help="Set the amount of VRAM you want to reserve for other software (by default some amount is reserved)")
 parser.add_argument("--disable-smart-memory", action="store_true", help="Aggressively offload to RAM instead of keeping models in VRAM when possible")
+parser.add_argument("--mmgp", action="store_true", help="Enable the optional MMGP-style memory manager; overrides --gpu-only/--highvram/--lowvram/--novram")
 parser.add_argument("--force-non-blocking", action="store_true", help="Use non-blocking operations for all applicable tensors")
 
 parser.add_argument("--cuda-malloc", action="store_true", help="improve memory allocation")

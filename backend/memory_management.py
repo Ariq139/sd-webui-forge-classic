@@ -58,9 +58,11 @@ MEMORY_FEATURES = {
 }
 MEMORY_BUDGETS_BYTES: dict[str, int] = {}
 MEMORY_RESIDENCY_COMPONENTS: set[str] = set()
+MEMORY_PINNED_COMPONENTS: set[str] = set()
 MEMORY_WORKING_VRAM_BYTES = 0
 MEMORY_PINNED_MEMORY_PERCENT = 45.0
 MEMORY_ASYNC_STREAMS = 2
+MEMORY_VRAM_SAFETY_PERCENT = 80.0
 
 
 class VRAMState(Enum):
@@ -378,6 +380,12 @@ if cpu_state is not CPUState.GPU:
 if cpu_state is CPUState.MPS:
     vram_state = VRAMState.SHARED
 
+if args.mmgp and cpu_state is CPUState.GPU:
+    # MMGP overrides Forge VRAM mode flags when enabled.
+    vram_state = VRAMState.NORMAL_VRAM
+    set_vram_to = VRAMState.NORMAL_VRAM
+    logger.info("MMGP enabled: overriding Forge VRAM mode flags")
+
 logger.info(f"VRAM State: {vram_state.name}")
 
 DISABLE_SMART_MEMORY = args.disable_smart_memory
@@ -577,7 +585,7 @@ def extra_reserved_memory() -> float:
 
 def minimum_inference_memory() -> float:
     base_memory = (1024 * 1024 * 1024) * 0.8
-    working_memory = MEMORY_WORKING_VRAM_BYTES if feature_enabled("budgets") else 0
+    working_memory = MEMORY_WORKING_VRAM_BYTES if feature_enabled("enabled") else 0
     return max(base_memory, working_memory) + extra_reserved_memory()
 
 
@@ -892,13 +900,13 @@ def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, su
 
 
 def text_encoder_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
 
 
 def text_encoder_device() -> torch.device:
     if args.text_enc_device is not None:
         return torch.device(args.text_enc_device)
-    if args.gpu_only:
+    if args.gpu_only and not mmgp_enabled():
         return get_torch_device()
     if args.cpu_text_enc:
         return cpu
@@ -942,7 +950,7 @@ def text_encoder_dtype(device=None) -> torch.dtype:
 
 
 def intermediate_device() -> torch.device:
-    return get_torch_device() if args.gpu_only else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
 
 
 def vae_device() -> torch.device:
@@ -952,7 +960,7 @@ def vae_device() -> torch.device:
 
 
 def vae_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
 
 
 def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
@@ -967,6 +975,27 @@ def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
         return torch.bfloat16
 
     return torch.float32
+
+
+def vae_storage_dtype(device=None) -> torch.dtype:
+    """Return the optional FP8 VAE storage dtype."""
+    if args.fp8_e4m3fn_vae and torch.float8_e4m3fn in FLOAT8_TYPES:
+        return torch.float8_e4m3fn
+    if args.fp8_e5m2_vae and torch.float8_e5m2 in FLOAT8_TYPES:
+        return torch.float8_e5m2
+
+    try:
+        from modules import shared
+
+        ui_choice = getattr(shared.opts, "forge_vae_storage_precision", "Automatic")
+    except Exception:
+        ui_choice = "Automatic"
+
+    if ui_choice == "FP8 E4M3FN" and torch.float8_e4m3fn in FLOAT8_TYPES:
+        return torch.float8_e4m3fn
+    if ui_choice == "FP8 E5M2" and torch.float8_e5m2 in FLOAT8_TYPES:
+        return torch.float8_e5m2
+    return vae_dtype(device)
 
 
 def get_autocast_device(dev: torch.device) -> str:
@@ -1504,9 +1533,12 @@ def discard_cuda_async_error():
         pass
 
 
-def pin_memory(tensor):
+def pin_memory(tensor, component: str = "auto"):
     global TOTAL_PINNED_MEMORY
     if not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0:
+        return False
+
+    if feature_enabled("pinned_memory") and MEMORY_PINNED_COMPONENTS and component not in MEMORY_PINNED_COMPONENTS:
         return False
 
     if type(tensor).__name__ != PINNING_ALLOWED_TYPES:
@@ -1523,6 +1555,12 @@ def pin_memory(tensor):
 
     size = tensor.numel() * tensor.element_size()
     if (TOTAL_PINNED_MEMORY + size) > MAX_PINNED_MEMORY:
+        return False
+
+    # Skip pinning when host memory is low.
+    ram_headroom = max(2 * 1024 * 1024 * 1024, int(psutil.virtual_memory().total * 0.05))
+    if psutil.virtual_memory().available - size < ram_headroom:
+        logger.debug("Skipping pinned-memory registration because host RAM is under pressure")
         return False
 
     ptr = tensor.data_ptr()
@@ -1570,6 +1608,11 @@ def feature_enabled(feature: str) -> bool:
     return bool(MEMORY_FEATURES.get("enabled", False) and MEMORY_FEATURES.get(feature, False))
 
 
+def mmgp_enabled() -> bool:
+    """Whether MMGP may control model residency."""
+    return bool(getattr(args, "mmgp", False))
+
+
 def async_transfers_enabled() -> bool:
     """Keep the existing CLI stream option working independently of UI settings."""
     return bool(args.cuda_stream is not None or feature_enabled("async_transfers"))
@@ -1582,7 +1625,17 @@ def memory_component_for_model(model) -> str:
 def memory_budget_for_model(model) -> int:
     if not feature_enabled("budgets"):
         return 0
-    return max(0, int(MEMORY_BUDGETS_BYTES.get(memory_component_for_model(model), 0)))
+    budget = max(0, int(MEMORY_BUDGETS_BYTES.get(memory_component_for_model(model), 0)))
+    if budget <= 0:
+        return 0
+
+    # Keep explicit budgets below working-memory headroom.
+    safe_budget = total_vram * (MEMORY_VRAM_SAFETY_PERCENT / 100.0) * 1024 * 1024
+    if MEMORY_WORKING_VRAM_BYTES > 0:
+        safe_budget = min(safe_budget, total_vram * 1024 * 1024 - MEMORY_WORKING_VRAM_BYTES)
+    if safe_budget > 0:
+        budget = min(budget, int(safe_budget))
+    return max(1, budget)
 
 
 def residency_hint_enabled(model) -> bool:
@@ -1599,22 +1652,28 @@ def configure_memory_features(
     model_budgets_mb: dict[str, int | float] | None = None,
     working_vram_mb: int | float = 0,
     pinned_memory_percent: int | float = 45,
+    vram_safety_percent: int | float = 80,
     async_streams: int = 2,
+    pinned_components: set[str] | list[str] | tuple[str, ...] = (),
     residency_components: set[str] | list[str] | tuple[str, ...] = (),
 ):
     """Apply optional MMGP-style settings while keeping Forge authoritative."""
     global MEMORY_FEATURES
     global MEMORY_BUDGETS_BYTES
     global MEMORY_RESIDENCY_COMPONENTS
+    global MEMORY_PINNED_COMPONENTS
     global MEMORY_WORKING_VRAM_BYTES
     global MEMORY_PINNED_MEMORY_PERCENT
     global MEMORY_ASYNC_STREAMS
+    global MEMORY_VRAM_SAFETY_PERCENT
     global NUM_STREAMS
     global PINNING_ENABLED
     global MAX_PINNED_MEMORY
 
+    # Saved settings are inactive without --mmgp.
+    effective_enabled = bool(enabled and mmgp_enabled())
     MEMORY_FEATURES = {
-        "enabled": bool(enabled),
+        "enabled": effective_enabled,
         "budgets": bool(budgets),
         "pinned_memory": bool(pinned_memory),
         "async_transfers": bool(async_transfers),
@@ -1629,6 +1688,7 @@ def configure_memory_features(
         if value > 0:
             MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
     MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ())
+    MEMORY_PINNED_COMPONENTS = set(pinned_components or ())
     try:
         MEMORY_WORKING_VRAM_BYTES = max(0, int(float(working_vram_mb) * 1024 * 1024))
     except (TypeError, ValueError):
@@ -1637,6 +1697,10 @@ def configure_memory_features(
         MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, float(pinned_memory_percent)))
     except (TypeError, ValueError):
         MEMORY_PINNED_MEMORY_PERCENT = 45.0
+    try:
+        MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, float(vram_safety_percent)))
+    except (TypeError, ValueError):
+        MEMORY_VRAM_SAFETY_PERCENT = 80.0
     try:
         MEMORY_ASYNC_STREAMS = min(8, max(1, int(async_streams)))
     except (TypeError, ValueError):

@@ -1,6 +1,9 @@
 import torch
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
-from transformers.modeling_utils import no_init_weights
+try:
+    from transformers.initialization import no_init_weights
+except ImportError:
+    from transformers.modeling_utils import no_init_weights
 
 from backend import memory_management
 from backend.operations import using_forge_operations

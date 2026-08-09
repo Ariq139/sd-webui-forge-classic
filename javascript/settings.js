@@ -8,6 +8,44 @@ let settingsExcludeTabsFromShowAll = {
 let settingsSearchTimer = null;
 let settingsSelectedPanel = null;
 
+function settingsCategoryGroups() {
+    return Array.from(gradioApp().querySelectorAll("#settings > .tab-wrapper > .settings-sidebar > .settings-category-group"));
+}
+
+function settingsUpdateCategoryToggle() {
+    let toggle = gradioApp().getElementById("settings_toggle_categories");
+    let groups = settingsCategoryGroups();
+    if (!toggle || !groups.length) return;
+
+    let allOpen = groups.every((group) => group.classList.contains("open"));
+    toggle.textContent = allOpen ? "Close all" : "Open all";
+    toggle.setAttribute("aria-pressed", allOpen ? "true" : "false");
+}
+
+function settingsSetCategoryOpen(group, open) {
+    if (!group) return;
+
+    group.classList.toggle("open", open);
+    let toggle = group.querySelector(":scope > .settings-category-toggle");
+    if (toggle) {
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        let indicator = toggle.querySelector("[data-settings-category-indicator]");
+        if (indicator) indicator.textContent = open ? "▼" : "▶";
+    }
+
+    settingsUpdateCategoryToggle();
+}
+
+function settingsSetAllCategories(open) {
+    settingsCategoryGroups().forEach((group) => settingsSetCategoryOpen(group, open));
+    settingsUpdateCategoryToggle();
+}
+
+function settingsToggleAllCategories() {
+    let groups = settingsCategoryGroups();
+    settingsSetAllCategories(!groups.length || !groups.every((group) => group.classList.contains("open")));
+}
+
 function settingsPanels() {
     return Array.from(gradioApp().querySelectorAll("#settings > .tabitem[id^=settings_]")
     );
@@ -38,9 +76,27 @@ function settingsSidebar() {
 
     let search = gradioApp().querySelector("#settings_search");
     let showAll = gradioApp().querySelector("#settings_show_all_pages");
+    let categoryToggle = gradioApp().getElementById("settings_toggle_categories");
 
     if (search && search.parentElement !== sidebar) {
         sidebar.insertBefore(search, sidebar.firstChild);
+    }
+
+    if (!categoryToggle) {
+        categoryToggle = document.createElement("button");
+        categoryToggle.type = "button";
+        categoryToggle.id = "settings_toggle_categories";
+        categoryToggle.className = "settings-category-global-toggle secondary";
+        categoryToggle.textContent = "Open all";
+        categoryToggle.setAttribute("aria-pressed", "false");
+        categoryToggle.addEventListener("click", settingsToggleAllCategories);
+    }
+
+    let firstNavigationItem = sidebar.querySelector(":scope > .settings-category-group, :scope > .settings-category, :scope > .settings-nav-button");
+    if (firstNavigationItem && (categoryToggle.parentElement !== sidebar || categoryToggle.nextElementSibling !== firstNavigationItem)) {
+        sidebar.insertBefore(categoryToggle, firstNavigationItem);
+    } else if (categoryToggle.parentElement !== sidebar) {
+        sidebar.appendChild(categoryToggle);
     }
 
     if (showAll && showAll.parentElement !== sidebar) {
@@ -58,6 +114,8 @@ function settingsSelectPanel(panelId, selectedButton) {
     panels.forEach((elem) => {
         elem.style.display = elem === panel ? "flex" : "none";
     });
+
+    settingsSetCategoryOpen(selectedButton?.closest(".settings-category-group"), true);
 
     settingsSelectedPanel = panelId;
     gradioApp().querySelectorAll(".settings-nav-button").forEach((button) => {
@@ -78,6 +136,7 @@ function settingsShowAllTabs() {
 
     settingsSelectedPanel = null;
     gradioApp().querySelectorAll(".settings-nav-button").forEach((button) => button.classList.remove("selected"));
+    settingsSetAllCategories(true);
 }
 
 function settingsShowOneTab() {
@@ -154,7 +213,7 @@ function settingsSetupNavigation() {
 
 function addSettingsCategories() {
     let settingsSidebarElement = settingsSetupNavigation();
-    if (!settingsSidebarElement || settingsSidebarElement.querySelector(".settings-category")) return;
+    if (!settingsSidebarElement || settingsSidebarElement.dataset.settingsCategoriesBuilt === "1") return;
 
     let settingsJson = gradioApp().querySelector("#settings_json textarea");
     let categories = [];
@@ -186,6 +245,41 @@ function addSettingsCategories() {
         span.className = "settings-category";
         settingsSidebarElement.insertBefore(span, sectionElem);
     });
+
+    let groups = [];
+    Array.from(settingsSidebarElement.querySelectorAll(":scope > .settings-category")).forEach(function (category, index) {
+        let group = document.createElement("div");
+        group.className = "settings-category-group";
+        group.dataset.settingsCategory = category.textContent.trim();
+
+        let toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "settings-category-toggle";
+        toggle.textContent = category.textContent.trim();
+        toggle.setAttribute("aria-expanded", "false");
+
+        let indicator = document.createElement("span");
+        indicator.dataset.settingsCategoryIndicator = "1";
+        indicator.textContent = "▶";
+        toggle.appendChild(indicator);
+        toggle.addEventListener("click", () => settingsSetCategoryOpen(group, !group.classList.contains("open")));
+
+        category.replaceWith(group);
+        group.appendChild(toggle);
+
+        let next = group.nextElementSibling;
+        while (next?.classList.contains("settings-nav-button")) {
+            let button = next;
+            next = next.nextElementSibling;
+            group.appendChild(button);
+        }
+
+        groups.push(group);
+        settingsSetCategoryOpen(group, Boolean(group.querySelector(".settings-nav-button.selected")) || index === 0);
+    });
+
+    if (groups.length) settingsSidebarElement.dataset.settingsCategoriesBuilt = "1";
+    settingsUpdateCategoryToggle();
 }
 
 function setupSettingsSearch() {

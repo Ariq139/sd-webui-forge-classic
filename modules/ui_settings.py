@@ -14,6 +14,7 @@ from modules_forge import main_entry
 from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS, get_memory_profile
 
 CURRENT_ROW: gr.Row = None
+MMGP_UI_SETTING_KEYS = {"forge_memory_profile", *MEMORY_SETTING_KEYS}
 
 
 def get_value_for_setting(key):
@@ -34,6 +35,11 @@ def create_setting_component(key, is_quicksettings=False):
     t = type(info.default)
 
     args = info.component_args() if callable(info.component_args) else info.component_args
+    args = dict(args or {})
+
+    # Disable MMGP controls unless --mmgp is active.
+    if key in MMGP_UI_SETTING_KEYS and not shared.cmd_opts.mmgp:
+        args["interactive"] = False
 
     if info.component is not None:
         comp = info.component

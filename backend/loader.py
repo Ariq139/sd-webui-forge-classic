@@ -9,7 +9,10 @@ if TYPE_CHECKING:
 
 import torch
 import yaml
-from transformers.modeling_utils import no_init_weights
+try:
+    from transformers.initialization import no_init_weights
+except ImportError:
+    from transformers.modeling_utils import no_init_weights
 
 import backend.args
 from backend import memory_management, utils

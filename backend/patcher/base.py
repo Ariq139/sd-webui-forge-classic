@@ -426,7 +426,7 @@ class ModelPatcher:
 
     def pin_weight_to_device(self, key):
         weight, _, _ = get_key_weight(self.model, key)
-        if memory_management.pin_memory(weight):
+        if memory_management.pin_memory(weight, self.memory_component):
             self.pinned.add(key)
 
     def unpin_weight(self, key):

@@ -190,6 +190,12 @@ class __Quant(ABC):
         if not x.baked:
             raise ValueError("GGUF Tensor is not baked!")
 
+        if "dequantize_blocks_pytorch" not in cls.__dict__:
+            cls.init_grid()
+            data = x.data.detach().cpu().numpy().view(np.uint8)
+            output = cls.dequantize_rows(data)
+            return torch.from_numpy(output).to(device=x.device, dtype=x.computation_dtype)
+
         blocks = cls.dequantize_blocks_pytorch(x.data, cls.block_size, cls.type_size, x)
         return blocks.view(x.shape)
 
@@ -738,6 +744,16 @@ class Q8_0(__Quant, qtype=GGMLQuantizationType.Q8_0):
         d = d.to(parent.computation_dtype).view(torch.int8)
         qs = qs.to(torch.int8)
         return torch.cat([d, qs], dim=1)
+
+
+class Q8_K(__Quant, qtype=GGMLQuantizationType.Q8_K):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        d, qs, _ = np.hsplit(blocks, [4, 4 + cls.block_size])
+        d = d.view(np.float32)
+        qs = qs.view(np.int8).astype(np.float32)
+        return d.reshape((n_blocks, 1)) * qs
 
 
 class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):

@@ -586,6 +586,32 @@ function extraNetworksControlTreeViewOnClick(event, tabname, extra_networks_tabn
     }
 }
 
+const extraNetworksDefaultCategoryOrder = ["sd", "sdxl", "flux", "klein", "qwen", "lumina", "zit", "wan", "anima", "ernie", "pid", "krea", "unknown"];
+const extraNetworksRelatedCategories = {
+    sd: ["sd"],
+    xl: ["sdxl"],
+    flux: ["flux", "klein"],
+    klein: ["klein", "flux"],
+    qwen: ["qwen"],
+    lumina: ["lumina"],
+    zit: ["zit"],
+    wan: ["wan"],
+    anima: ["anima"],
+    ernie: ["ernie"],
+    pid: ["pid"],
+    krea: ["krea"],
+};
+
+function extraNetworksCurrentPreset() {
+    const presetInput = gradioApp().querySelector("#forge_ui_preset input");
+    return (presetInput?.value || "").toLowerCase();
+}
+
+function extraNetworksCategoryPriorityOrder() {
+    const preferred = [...(extraNetworksRelatedCategories[extraNetworksCurrentPreset()] || []), "unknown"];
+    return [...preferred, ...extraNetworksDefaultCategoryOrder.filter((category) => !preferred.includes(category))];
+}
+
 function extraNetworksSetCategoryPriority(tabname, extra_networks_tabname, enabled) {
     let pane = gradioApp().getElementById(tabname + "_" + extra_networks_tabname + "_pane");
     let cardsContainer = pane?.querySelector(".extra-network-cards");
@@ -593,9 +619,15 @@ function extraNetworksSetCategoryPriority(tabname, extra_networks_tabname, enabl
     if (!cardsContainer) return;
 
     let groups = Array.from(cardsContainer.querySelectorAll(":scope > .extra-network-category"));
+    const priorityOrder = extraNetworksCategoryPriorityOrder();
     groups.sort(function (a, b) {
-        let orderKey = enabled ? "categoryPriorityOrder" : "categoryOrder";
-        let orderDifference = Number(a.dataset[orderKey]) - Number(b.dataset[orderKey]);
+        let categoryA = (a.dataset.category || "").toLowerCase();
+        let categoryB = (b.dataset.category || "").toLowerCase();
+        let orderA = enabled ? priorityOrder.indexOf(categoryA) : Number(a.dataset.categoryOrder);
+        let orderB = enabled ? priorityOrder.indexOf(categoryB) : Number(b.dataset.categoryOrder);
+        if (orderA < 0) orderA = priorityOrder.length;
+        if (orderB < 0) orderB = priorityOrder.length;
+        let orderDifference = orderA - orderB;
         return orderDifference || a.dataset.category.localeCompare(b.dataset.category);
     });
 
@@ -628,23 +660,8 @@ function refreshExtraNetworkCategoryOpenState() {
         return;
     }
 
-    const presetInput = gradioApp().querySelector("#forge_ui_preset input");
-    const preset = (presetInput?.value || "").toLowerCase();
-    const related = {
-        sd: ["sd"],
-        xl: ["sdxl"],
-        flux: ["flux", "klein"],
-        klein: ["flux", "klein"],
-        qwen: ["qwen"],
-        lumina: ["lumina"],
-        zit: ["zit"],
-        wan: ["wan"],
-        anima: ["anima"],
-        ernie: ["ernie"],
-        pid: ["pid"],
-        krea: ["krea"],
-    };
-    const openCategories = new Set(["unknown", ...(related[preset] || [])]);
+    const openCategories = new Set(extraNetworksRelatedCategories[extraNetworksCurrentPreset()] || []);
+    openCategories.add("unknown");
 
     gradioApp().querySelectorAll("details.extra-network-category").forEach((group) => {
         const category = (group.dataset.category || "").toLowerCase();

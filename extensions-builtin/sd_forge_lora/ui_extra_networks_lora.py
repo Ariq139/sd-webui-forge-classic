@@ -1,4 +1,5 @@
 import os.path
+import re
 
 import network
 import networks
@@ -25,46 +26,77 @@ LORA_CATEGORY_LABELS = {
 }
 
 
-def infer_lora_category(metadata, name):
-    """Infer a display category from common LoRA metadata fields."""
-    explicit = metadata.get("sd version")
-    if explicit in network.SD_VERSION and explicit != "Unknown":
-        return LORA_CATEGORY_LABELS.get(explicit, explicit.upper())
+LORA_CATEGORY_MARKERS = {
+    "anima": ("anima",),
+    "klein": ("flux 2", "flux2", "klein"),
+    "qwen": ("qwen",),
+    "lumina": ("lumina",),
+    "zit": ("z image", "zimage", "zit"),
+    "wan": ("wan",),
+    "ernie": ("ernie",),
+    "pid": ("pid",),
+    "krea": ("krea",),
+    "xl": ("sdxl", "sd xl", "stable diffusion xl", "illustrious", "pony"),
+    "flux": ("flux", "flux 1", "flux1"),
+    "sd": ("sd 1 5", "sd1 5", "sd15", "sd v1", "sd v2", "sd1", "sd2", "stable diffusion v1", "stable diffusion v2", "stable diffusion 1"),
+}
 
-    values = [name]
-    for key in ("ss_base_model_version", "modelspec.architecture", "ss_sd_model_name", "modelspec.title", "ss_network_module"):
-        value = metadata.get(key)
-        if value is not None:
-            values.append(str(value))
-    text = " ".join(values).casefold()
+LORA_MODULE_MARKERS = {
+    "anima": ("lora anima",),
+    "klein": ("lora klein", "lora flux 2", "lora flux2"),
+    "qwen": ("lora qwen",),
+    "lumina": ("lora lumina",),
+    "zit": ("lora zit", "lora z image", "lora zimage"),
+    "wan": ("lora wan",),
+    "ernie": ("lora ernie",),
+    "pid": ("lora pid",),
+    "krea": ("lora krea",),
+    "xl": ("lora sdxl", "lora sd xl"),
+    "flux": ("lora flux",),
+}
 
-    # Check specific/newer model families before broad SD/Flux matches.
-    patterns = (
-        ("anima", "anima"),
-        ("flux.2", "klein"),
-        ("flux2", "klein"),
-        ("klein", "klein"),
-        ("qwen", "qwen"),
-        ("lumina", "lumina"),
-        ("z-image", "zit"),
-        ("zit", "zit"),
-        ("wan", "wan"),
-        ("ernie", "ernie"),
-        ("pid", "pid"),
-        ("krea", "krea"),
-        ("sdxl", "xl"),
-        ("stable-diffusion-xl", "xl"),
-        ("illustrious", "xl"),
-        ("pony", "xl"),
-        ("flux", "flux"),
-        ("sd1", "sd"),
-        ("sd15", "sd"),
-        ("sd 1.5", "sd"),
-        ("stable-diffusion-v1", "sd"),
-    )
-    for marker, category in patterns:
-        if marker in text:
+
+def _active_preset():
+    preset = getattr(shared.opts, "forge_preset", "")
+    return str(getattr(preset, "name", preset)).rsplit(".", 1)[-1].casefold()
+
+
+def _normalized_text(values):
+    text = " ".join(str(value) for value in values if value is not None).casefold()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _category_from_markers(text, markers):
+    for category, category_markers in markers.items():
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", text) for marker in category_markers):
             return LORA_CATEGORY_LABELS[category]
+    return None
+
+
+def infer_lora_category(metadata, name):
+    """Infer a display category from metadata."""
+    metadata = metadata or {}
+
+    explicit = str(metadata.get("sd version") or "").strip().casefold()
+    for version in network.SD_VERSION:
+        if explicit == version.casefold() and version != "Unknown":
+            return LORA_CATEGORY_LABELS.get(version, version.upper())
+
+    module_text = _normalized_text([metadata.get("ss_network_module")])
+    if category := _category_from_markers(module_text, LORA_MODULE_MARKERS):
+        return category
+
+    source_values = [
+        metadata.get("ss_base_model_version"),
+        metadata.get("modelspec.architecture"),
+        metadata.get("ss_sd_model_name"),
+        metadata.get("modelspec.title"),
+    ]
+    if category := _category_from_markers(_normalized_text(source_values), LORA_CATEGORY_MARKERS):
+        return category
+
+    if category := _category_from_markers(_normalized_text([name]), LORA_CATEGORY_MARKERS):
+        return category
 
     return LORA_CATEGORY_LABELS["unknown"]
 
@@ -125,7 +157,8 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
         else:
             sd_version = "Unknown"
 
-        item["category"] = infer_lora_category(item["user_metadata"], name)
+        category_metadata = {**(item.get("metadata") or {}), **(item.get("user_metadata") or {})}
+        item["category"] = infer_lora_category(category_metadata, name)
 
         if enable_filter and shared.opts.lora_preset_filter and sd_version not in ("Unknown", shared.opts.forge_preset):
             return None
@@ -161,7 +194,7 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
             "pid": ("PiD",),
             "krea": ("Krea",),
         }
-        preset = str(getattr(shared.opts, "forge_preset", "")).casefold()
+        preset = _active_preset()
         preferred = list(related_categories.get(preset, ()))
         if "Unknown" in all_categories:
             preferred.append("Unknown")
@@ -183,7 +216,7 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
             "pid": {"PiD"},
             "krea": {"Krea"},
         }
-        preset = str(getattr(shared.opts, "forge_preset", "")).casefold()
+        preset = _active_preset()
         return {"Unknown", *related_categories.get(preset, set())}
 
     def create_user_metadata_editor(self, ui, tabname):

@@ -664,28 +664,65 @@ div.toprow-compact-tools {
 }
 
 #settings > .tab-wrapper > .settings-sidebar > #settings_search,
-#settings > .tab-wrapper > .settings-sidebar > #settings_show_all_pages {
+#settings > .tab-wrapper > .settings-sidebar > #settings_show_all_pages,
+#settings > .tab-wrapper > .settings-sidebar > #settings_toggle_categories {
     display: block;
     width: 100%;
     margin: 0 0 0.5em 0;
 }
 
-#settings > .tab-wrapper > .settings-sidebar > .settings-category {
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group {
     display: block;
-    margin: 1em 0 0.25em 0;
+    margin: 0.75em 0 0.25em 0;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-category-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-sizing: border-box;
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: var(--body-text-color);
+    text-align: left;
+    white-space: initial;
+    padding: 4px;
     font-weight: bold;
     text-decoration: underline;
-    cursor: default;
+    cursor: pointer;
     user-select: none;
 }
 
-#settings > .tab-wrapper > .tab-container.visually-hidden .settings-category {
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-category-toggle:hover,
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-category-toggle:focus-visible {
+    background: var(--button-secondary-background-fill);
+    color: var(--button-secondary-text-color);
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group:not(.open) > .settings-nav-button {
+    display: none;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-nav-button {
     display: block;
-    margin: 1em 0 0.25em 0;
-    font-weight: bold;
-    text-decoration: underline;
-    cursor: default;
-    user-select: none;
+    box-sizing: border-box;
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: var(--body-text-color);
+    text-align: left;
+    white-space: initial;
+    padding: 4px;
+    cursor: pointer;
+}
+
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-nav-button:hover,
+#settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-nav-button.selected {
+    background: var(--button-secondary-background-fill);
+    color: var(--button-secondary-text-color);
 }
 
 #settings_result {
@@ -2198,16 +2235,17 @@ body.resizing .resize-handle {
 
     #settings > .tab-wrapper > .settings-sidebar > #settings_search,
     #settings > .tab-wrapper > .settings-sidebar > #settings_show_all_pages,
-    #settings > .tab-wrapper > .settings-sidebar > .settings-category {
+    #settings > .tab-wrapper > .settings-sidebar > #settings_toggle_categories,
+    #settings > .tab-wrapper > .settings-sidebar > .settings-category-group {
         grid-column: 1 / -1;
     }
 
-    #settings > .tab-wrapper > .settings-sidebar > .settings-nav-button {
+    #settings > .tab-wrapper > .settings-sidebar > .settings-category-group > .settings-nav-button {
         min-height: 2.4rem;
         padding: 0.5rem;
     }
 
-    #settings > .tab-wrapper > .settings-sidebar > .settings-category {
+    #settings > .tab-wrapper > .settings-sidebar > .settings-category-group {
         margin-top: 0.75rem;
     }
 }

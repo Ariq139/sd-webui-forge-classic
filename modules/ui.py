@@ -14,7 +14,7 @@ from PIL import Image, PngImagePlugin  # noqa: F401
 import modules.infotext_utils as parameters_copypaste
 import modules.processing_scripts.comments as comments
 import modules.shared as shared
-from modules import extra_networks, gradio_extensions, launch_utils, paths_internal, processing, progress, prompt_parser, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, sysinfo, timer, ui_checkpoint_merger, ui_common, ui_extensions, ui_extra_networks, ui_loadsave, ui_postprocessing, ui_settings, ui_toprow  # noqa: F401
+from modules import extra_networks, gradio_extensions, launch_utils, paths_internal, processing, progress, prompt_parser, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, sysinfo, timer, ui_checkpoint_merger, ui_common, ui_extensions, ui_extra_networks, ui_loadsave, ui_neo_guide, ui_postprocessing, ui_settings, ui_toprow  # noqa: F401
 from modules.call_queue import wrap_gradio_call, wrap_gradio_call_no_job, wrap_gradio_gpu_call, wrap_queued_call  # noqa: F401
 from modules.infotext_utils import PasteField
 from modules.paths import script_path
@@ -865,6 +865,8 @@ def create_ui():
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
     ui_settings_from_file = loadsave.ui_settings.copy()
 
+    # Seed tab names before settings are built.
+    shared.tab_names = ["txt2img", "img2img", "Extras", "PNG Info", "Checkpoint Merger", "Settings", "Extensions", "Instructions"]
     settings.create_ui(loadsave, dummy_component)
 
     interfaces = [
@@ -880,6 +882,9 @@ def create_ui():
 
     extensions_interface = ui_extensions.create_ui()
     interfaces += [(extensions_interface, "Extensions", "extensions")]
+
+    neo_guide_interface = ui_neo_guide.create_ui()
+    interfaces += [(neo_guide_interface, "Instructions", "instructions")]
 
     shared.tab_names = []
     for _interface, label, _ifid in interfaces:

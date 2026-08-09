@@ -17,6 +17,18 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 
 "**Neo**" mainly serves as an continuation for the "`latest`" version of Forge, which was built on [Gradio](https://github.com/gradio-app/gradio) `4.40.0` before lllyasviel became too busy... Additionally, this fork is focused on optimization and usability, with the main goal of being able to run the latest popular models via an easy-to-use GUI.
 
+> [!Note]
+> ### Neo additions created by Codex
+> These additions were created by Codex at the maintainer's request. They are Neo-specific and may change:
+>
+> - **Gradio UI migration:** Migrated to Gradio 5.29, while keeping the UI's functionality and behaviour.
+> - **Settings navigation:** searchable and clickable settings panels, collapsible category groups, open/close-all controls, restored option descriptions, and safer handling of inactive controls.
+> - **Optional memory management:** an MMGP-style manager behind `--mmgp`, named RAM/VRAM profiles, per-component budgets, pinned CPU memory, asynchronous transfers, residency hints, and explicit interaction rules with Forge's VRAM flags.
+> - **Extra Networks:** simple-list mode, optional cards and grouping, preset-aware group priority/open state, automatic search, improved LoRA metadata/category detection, metadata view/edit handling, and safer default LoRA insertion weights.
+> - **Backend improvements:** additional GGUF dequantization coverage and Comfy-inspired VAE/offload handling.
+>
+> For baseline model downloads and parameters, use the upstream [Download Models](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Download-Models) and [Inference References](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Inference-References) pages. For the basic role of text encoders and VAEs, see the [Transformers Qwen3 documentation](https://huggingface.co/docs/transformers/main/en/model_doc/qwen3) and [Diffusers VAE documentation](https://huggingface.co/docs/diffusers/main/en/api/models/autoencoderkl).
+
 > [!Tip]
 > [How to Install](#installation)
 
@@ -328,6 +340,10 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - `--tiled-conv2d`: Replace `Conv2d` ops with tiled variants
     - has greater reduction for **SD1** and **SDXL** VAE; less for **Wan** VAE
     - `64` / `128` / `256` / `512`
+- `--fp8_e4m3fn-vae` / `--fp8_e5m2-vae`: Store VAE weights in FP8
+    - weight-only; computation stays in the selected FP32/BF16/FP16 dtype
+    - reduces VAE weight memory, not compute time
+    - also available in Settings > VAE
 
 <br>
 

@@ -193,7 +193,9 @@ def configure_memory_features():
         },
         working_vram_mb=getattr(opts, "forge_memory_working_vram_mb", 0),
         pinned_memory_percent=getattr(opts, "forge_memory_pinned_memory_percent", 45),
+        vram_safety_percent=getattr(opts, "forge_memory_vram_safety_percent", 80),
         async_streams=getattr(opts, "forge_memory_async_streams", 2),
+        pinned_components=getattr(opts, "forge_memory_pinned_components", []),
         residency_components=[
             component
             for component, option in (
@@ -231,7 +233,9 @@ def configure_opts_onchange():
         "forge_memory_vae_budget_mb",
         "forge_memory_controlnet_budget_mb",
         "forge_memory_pinned_memory_percent",
+        "forge_memory_vram_safety_percent",
         "forge_memory_async_streams",
+        "forge_memory_pinned_components",
         "forge_memory_keep_unet_loaded",
         "forge_memory_keep_text_encoder_loaded",
         "forge_memory_keep_vae_loaded",

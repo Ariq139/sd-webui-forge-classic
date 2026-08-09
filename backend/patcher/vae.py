@@ -9,6 +9,42 @@ from backend import memory_management
 from backend.patcher.base import ModelPatcher
 
 
+def _quantize_fp8_vae_weights(model: torch.nn.Module, storage_dtype: torch.dtype) -> int:
+    """Store VAE Conv/Linear weights in scaled FP8."""
+    if storage_dtype not in memory_management.FLOAT8_TYPES:
+        return 0
+
+    quantized_layers = []
+    fp8_max = torch.finfo(storage_dtype).max
+    supported_layers = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear)
+
+    for layer in model.modules():
+        if not isinstance(layer, supported_layers) or not hasattr(layer, "parameters_manual_cast"):
+            continue
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.ndim < 2:
+            continue
+
+        with torch.no_grad():
+            weight_fp32 = weight.detach().to(dtype=torch.float32)
+            reduce_dims = tuple(range(1, weight_fp32.ndim))
+            scale = weight_fp32.abs().amax(dim=reduce_dims, keepdim=True)
+            scale = torch.where(torch.isfinite(scale) & (scale > 0), scale / fp8_max, torch.ones_like(scale))
+            quantized = torch.clamp(weight_fp32 / scale, min=-fp8_max, max=fp8_max).to(storage_dtype)
+
+        quantized_layers.append((layer, quantized, scale))
+
+    for layer, quantized, scale in quantized_layers:
+        layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
+        if "weight_scale" in layer._buffers:
+            layer.weight_scale = scale
+        else:
+            layer.register_buffer("weight_scale", scale, persistent=True)
+        layer.parameters_manual_cast = True
+
+    return len(quantized_layers)
+
+
 @torch.inference_mode()
 def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_amount=4, out_channels=3, output_device="cpu", downscale=False, index_formulas=None):
     """https://github.com/comfyanonymous/ComfyUI/blob/v0.3.64/comfy/utils.py#L901"""
@@ -169,6 +205,18 @@ class VAE:
 
         self.vae_dtype = dtype or memory_management.vae_dtype()
         self.first_stage_model.to(self.vae_dtype)
+        self.vae_storage_dtype = memory_management.vae_storage_dtype()
+        if self.vae_storage_dtype != self.vae_dtype:
+            try:
+                quantized_count = _quantize_fp8_vae_weights(self.first_stage_model, self.vae_storage_dtype)
+                if quantized_count > 0:
+                    memory_management.logger.info("Stored %s VAE layers in %s; compute dtype remains %s", quantized_count, self.vae_storage_dtype, self.vae_dtype)
+                else:
+                    self.vae_storage_dtype = self.vae_dtype
+                    memory_management.logger.warning("No Forge-managed VAE Conv/Linear layers were found; FP8 VAE storage was not applied")
+            except Exception as e:
+                self.vae_storage_dtype = self.vae_dtype
+                memory_management.logger.warning("FP8 VAE storage was unavailable; using %s instead: %s", self.vae_dtype, e)
         self.output_device = memory_management.intermediate_device()
 
         self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device, memory_component="vae")
@@ -189,6 +237,7 @@ class VAE:
         n.first_stage_model = self.first_stage_model
         n.device = self.device
         n.vae_dtype = self.vae_dtype
+        n.vae_storage_dtype = self.vae_storage_dtype
         n.output_device = self.output_device
         n.is_wan = self.is_wan
         return n

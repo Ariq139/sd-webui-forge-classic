@@ -209,13 +209,15 @@ options_templates.update(
         ("memory-management", "Memory Management", "system"),
         {
             "forge_memory_management_explanation": OptionHTML("""
-Optional MMGP-style controls for Forge. They are off by default and work alongside Forge's existing VRAM modes and flags.<br>
+Optional MMGP-style controls for Forge. They are off by default and remain separate from Forge's normal memory manager.<br>
+Launch with <b>--mmgp</b> to allow these saved settings to affect model residency. Without that flag, the values remain saved but all optional MMGP features stay disabled.<br>
+When enabled, MMGP takes precedence over Forge's <b>--gpu-only</b>, <b>--highvram</b>, <b>--lowvram</b>, and <b>--novram</b> modes. CPU and explicit component-device options remain authoritative.<br>
 Choose a profile, or choose <b>Custom</b> to tune each control below. The profile dropdown includes MMGP's target minimum hardware values: RAM / VRAM in GB. They are not hard caps; Windows generally needs about 16 GB more system RAM than the Linux figures.<br>
 Lower budgets can reduce VRAM use but may slow generation.<br>
 Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
             """),
             "forge_memory_profile": OptionInfo("Custom", "Memory profile", gr.Dropdown, {"choices": MEMORY_PROFILE_CHOICES}).info("applies a starting configuration to the controls below; click Apply settings to save it"),
-            "forge_memory_management_enabled": OptionInfo(False, "Enable optional memory-management features").info("master switch; Forge's existing memory manager is always active"),
+            "forge_memory_management_enabled": OptionInfo(False, "Enable optional memory-management features").info("master switch; also requires --mmgp at launch; Forge's normal manager remains active"),
             "forge_memory_budgets_enabled": OptionInfo(False, "Enable per-component VRAM budgets").info("limits loaded weight memory for the diffusion model, text encoder, VAE, and ControlNet"),
             "forge_memory_pinned_memory_enabled": OptionInfo(False, "Enable pinned CPU memory").info("can speed CPU-to-GPU transfers at the cost of higher RAM usage"),
             "forge_memory_async_transfers_enabled": OptionInfo(False, "Enable asynchronous weight transfers").info("uses additional CUDA/XPU streams to overlap weight movement"),
@@ -226,7 +228,9 @@ Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP b
             "forge_memory_vae_budget_mb": OptionInfo(0, "VAE budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = no per-component limit"),
             "forge_memory_controlnet_budget_mb": OptionInfo(0, "ControlNet budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = no per-component limit"),
             "forge_memory_pinned_memory_percent": OptionInfo(45, "Maximum pinned RAM (%)", gr.Slider, {"minimum": 10, "maximum": 90, "step": 5}).info("Windows defaults to 45%; increase only if the system has sufficient RAM"),
+            "forge_memory_vram_safety_percent": OptionInfo(80, "VRAM safety limit (%)", gr.Slider, {"minimum": 50, "maximum": 95, "step": 5}).info("caps explicit model budgets to this portion of VRAM; mirrors MMGP's default 80% safety coefficient"),
             "forge_memory_async_streams": OptionInfo(2, "Asynchronous transfer streams", gr.Slider, {"minimum": 1, "maximum": 8, "step": 1}).info("more streams may improve overlap but use more memory"),
+            "forge_memory_pinned_components": OptionInfo(["unet", "text_encoder", "vae", "controlnet"], "Components eligible for pinning", ui_components.DropdownMulti, lambda: {"choices": ["unet", "text_encoder", "vae", "controlnet"]}).info("profile 1/2 can pin all components; lower-RAM profiles should usually pin only the diffusion model"),
             "forge_memory_keep_unet_loaded": OptionInfo(False, "Prefer keeping the diffusion model resident"),
             "forge_memory_keep_text_encoder_loaded": OptionInfo(False, "Prefer keeping the text encoder resident"),
             "forge_memory_keep_vae_loaded": OptionInfo(False, "Prefer keeping the VAE resident"),
@@ -301,6 +305,7 @@ image to and from latent space representation. Latent space is what Stable Diffu
 to create the resulting image after the sampling is finished. For img2img, VAE is additionally used to process user's input image before the sampling.
                 """),
             "sd_vae": OptionInfo("Automatic", "SD VAE", gr.Dropdown, {"choices": ("Automatic",), "interactive": False}),
+            "forge_vae_storage_precision": OptionInfo("Automatic", "VAE Weight Storage Precision", gr.Dropdown, {"choices": ("Automatic", "FP8 E4M3FN", "FP8 E5M2")}).info("FP8 reduces VAE weight memory; applies when the VAE loads").needs_restart(),
             "sd_vae_encode_method": OptionInfo("Full", "VAE for Encoding", gr.Radio, {"choices": ("Full", "TAESD")}, infotext="VAE Encoder").info("method to encode image to latent (img2img / Hires. fix / inpaint)"),
             "sd_vae_decode_method": OptionInfo("Full", "VAE for Decoding", gr.Radio, {"choices": ("Full", "TAESD")}, infotext="VAE Decoder").info("method to decode latent to image"),
         },

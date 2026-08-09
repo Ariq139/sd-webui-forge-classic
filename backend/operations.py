@@ -111,7 +111,8 @@ def weights_manual_cast(
     non_blocking = memory_management.device_supports_non_blocking(target_device)
     weight, bias = None, None
 
-    weight_has_function: bool = len(layer.weight_function) > 0 or weight_fn is not None
+    fp8_scale = getattr(layer, "weight_scale", None)
+    weight_has_function: bool = len(layer.weight_function) > 0 or weight_fn is not None or fp8_scale is not None
     bias_has_function: bool = len(layer.bias_function) > 0 or bias_fn is not None
 
     weight_args = dict(device=target_device, dtype=dtype or target_dtype, non_blocking=non_blocking)
@@ -153,6 +154,9 @@ def weights_manual_cast(
     if weight_has_function:
         if isinstance(weight, QuantizedTensor):
             weight = weight.dequantize()
+        if fp8_scale is not None and weight.dtype in memory_management.FLOAT8_TYPES:
+            scale = fp8_scale.to(device=weight.device, dtype=target_dtype or torch.float32)
+            weight = weight.to(dtype=target_dtype or torch.float32) * scale
         if weight_fn is not None:
             weight = weight_fn(weight)
         if not skip_weight_dtype:
