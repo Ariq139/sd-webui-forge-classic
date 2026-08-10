@@ -14,7 +14,7 @@ from PIL import Image, PngImagePlugin  # noqa: F401
 import modules.infotext_utils as parameters_copypaste
 import modules.processing_scripts.comments as comments
 import modules.shared as shared
-from modules import extra_networks, gradio_extensions, launch_utils, paths_internal, processing, progress, prompt_parser, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, sysinfo, timer, ui_checkpoint_merger, ui_common, ui_extensions, ui_extra_networks, ui_loadsave, ui_neo_guide, ui_ltx2_video, ui_postprocessing, ui_settings, ui_toprow  # noqa: F401
+from modules import extra_networks, gradio_extensions, launch_utils, paths_internal, processing, progress, prompt_parser, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, sysinfo, timer, ui_checkpoint_merger, ui_common, ui_extensions, ui_extra_networks, ui_ideogram, ui_loadsave, ui_neo_guide, ui_ltx2_video, ui_postprocessing, ui_settings, ui_toprow  # noqa: F401
 from modules.call_queue import wrap_gradio_call, wrap_gradio_call_no_job, wrap_gradio_gpu_call, wrap_queued_call  # noqa: F401
 from modules.infotext_utils import PasteField
 from modules.paths import script_path
@@ -429,6 +429,7 @@ def create_ui():
                 PasteField(distilled_cfg_scale, "Distilled CFG Scale", api="distilled_cfg_scale"),
                 PasteField(width, "Size-1", api="width"),
                 PasteField(height, "Size-2", api="height"),
+                PasteField(batch_count, "Batch count"),
                 PasteField(batch_size, "Batch size", api="batch_size"),
                 PasteField(toprow.ui_styles.dropdown, lambda d: d["Styles array"] if isinstance(d.get("Styles array"), list) else gr.skip(), api="styles"),
                 PasteField(denoising_strength, "Denoising strength", api="denoising_strength"),
@@ -789,6 +790,7 @@ def create_ui():
                 (image_cfg_scale, "Image CFG scale"),
                 (width, "Size-1"),
                 (height, "Size-2"),
+                (batch_count, "Batch count"),
                 (batch_size, "Batch size"),
                 (toprow.ui_styles.dropdown, lambda d: d["Styles array"] if isinstance(d.get("Styles array"), list) else gr.skip()),
                 (denoising_strength, "Denoising strength"),
@@ -862,12 +864,13 @@ def create_ui():
 
     modelmerger_ui = ui_checkpoint_merger.UiCheckpointMerger()
     ltx2_video_interface = ui_ltx2_video.create_ui()
+    ideogram_interface = ui_ideogram.create_ui()
 
     loadsave = ui_loadsave.UiLoadsave(cmd_opts.ui_config_file)
     ui_settings_from_file = loadsave.ui_settings.copy()
 
     # Seed tab names before settings are built.
-    shared.tab_names = ["txt2img", "img2img", "Extras", "PNG Info", "Checkpoint Merger", "LTX Video", "Settings", "Extensions", "Instructions"]
+    shared.tab_names = ["txt2img", "img2img", "Extras", "PNG Info", "Checkpoint Merger", "LTX Video", "Ideogram 4", "Settings", "Extensions", "Instructions"]
     settings.create_ui(loadsave, dummy_component)
 
     interfaces = [
@@ -877,6 +880,7 @@ def create_ui():
         (pnginfo_interface, "PNG Info", "pnginfo"),
         (modelmerger_ui.blocks, "Checkpoint Merger", "modelmerger"),
         (ltx2_video_interface, "LTX Video", "ltx_video"),
+        (ideogram_interface, "Ideogram 4", "ideogram"),
     ]
 
     interfaces += script_callbacks.ui_tabs_callback()
@@ -904,7 +908,11 @@ def create_ui():
             for interface, label, ifid in sorted_interfaces:
                 if label in shared.opts.hidden_tabs:
                     continue
-                with gr.TabItem(label, id=ifid, elem_id=f"tab_{ifid}"):
+                preset_dependent = ifid in main_entry.PRESET_TAB_IDS
+                tab_visible = main_entry.preset_tab_visible(ifid, shared.opts.forge_preset)
+                with gr.TabItem(label, id=ifid, elem_id=f"tab_{ifid}", visible=tab_visible) as tab:
+                    if preset_dependent:
+                        main_entry.register_native_tab(ifid, tab)
                     interface.render()
 
                 if ifid not in ["extensions", "settings"]:

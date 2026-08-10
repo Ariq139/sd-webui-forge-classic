@@ -55,15 +55,7 @@ HF = os.path.join(os.path.dirname(__file__), "huggingface")
 
 
 def _normalize_vae_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Normalize standalone VAE weights before selecting an implementation.
-
-    ComfyUI treats a VAE as an independent component: it strips common
-    checkpoint prefixes, converts Diffusers naming when necessary, and then
-    identifies the architecture from the VAE keys themselves.  Forge used to
-    select the VAE class from the *diffusion model's* pipeline config, which
-    makes a compatible replacement VAE look like the wrong model (notably for
-    Qwen/Wan derivatives).
-    """
+    """Normalize standalone VAE keys before architecture detection."""
     if not state_dict:
         return state_dict
 
@@ -73,14 +65,13 @@ def _normalize_vae_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, 
             state_dict = state_dict_prefix_replace(state_dict, {prefix: ""}, filter_keys=True)
             break
 
-    # Diffusers VAE keys are converted before architecture detection, matching
-    # ComfyUI's current standalone VAE loader.
+    # Match ComfyUI's standalone Diffusers VAE conversion.
     if "decoder.up_blocks.0.resnets.0.norm1.weight" in state_dict:
         from modules_forge.packages.huggingface_guess.diffusers_convert import convert_vae_state_dict
 
         state_dict = convert_vae_state_dict(state_dict)
 
-    # Flux.2 files use a nested Diffusers prefix for these two modules.
+    # Flatten Flux.2's nested Diffusers prefixes.
     if "decoder.post_quant_conv.weight" in state_dict:
         state_dict = state_dict_prefix_replace(
             state_dict,
@@ -94,23 +85,18 @@ def _detect_vae_format(state_dict: dict[str, torch.Tensor]) -> str | None:
     """Return the local VAE architecture represented by a state dict."""
     keys = state_dict.keys()
 
-    # Wan 2.1 / Qwen Image's causal VAE.  The gamma keys are the stable
-    # discriminator used by ComfyUI and also cover Anima's VAE.
+    # Wan 2.1/Qwen Image causal VAE signature, also used by Anima.
     if "decoder.middle.0.residual.0.gamma" in keys and "encoder.conv1.weight" in keys:
         return "wan21"
 
-    # Qwen's 2D derivative has the same residual naming but uses Conv2d and
-    # the quant/post-quant pair instead of the causal 3D VAE's conv1/conv2.
+    # Qwen's 2D derivative uses Conv2d plus the quant/post-quant pair.
     if "post_quant_conv.weight" in keys and (
         "encoder.down_blocks.0.resnets.0.norm1.gamma" in keys
         or "decoder.mid_block.resnets.0.norm1.gamma" in keys
     ):
         return "qwen2d"
 
-    # Flux.2 has a quant/post-quant pair and a 32/128-channel latent variant
-    # distinct from the regular KL VAE.  The normalization step may convert
-    # its Diffusers mid-block names to the older `mid.attn_1` spelling, so the
-    # quant pair is the stable discriminator here.
+    # Flux.2 uses a distinct quant/post-quant VAE signature.
     if "post_quant_conv.weight" in keys:
         return "flux2"
 
@@ -129,12 +115,7 @@ def _load_detected_vae(state_dict: dict[str, torch.Tensor], vae_format: str):
     if vae_format == "wan21":
         from backend.nn.wan_vae import WanVAE
 
-        # This mirrors ComfyUI's current Wan 2.1 detection.  Deriving the
-        # dimensions from the tensors avoids forcing a Qwen config onto a Wan
-        # VAE (or the reverse) when the user selects a standalone module.
-        # The decoder head ends at the first (base) channel width for Wan's
-        # reversed decoder, so infer the base width from the encoder input
-        # convolution instead of dividing the decoder head width.
+        # Infer the Wan config from tensor shapes, as ComfyUI does.
         base_dim = int(state_dict["encoder.conv1.weight"].shape[0])
         z_dim = int(state_dict["conv1.weight"].shape[0] // 2)
         config = {
@@ -208,9 +189,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if detected_vae is not None:
                 return detected_vae
 
-            # A standalone Flux VAE must use the Flux config even when it is
-            # selected for a different pipeline.  The later Flux.2 branch
-            # keeps its own config and small-decoder handling.
+            # Standalone Flux VAEs use their own config, independent of pipeline.
             if vae_format == "flux":
                 cls_name = "AutoencoderKL"
                 config_path = os.path.join(HF, "black-forest-labs", "FLUX.1-dev", "vae")

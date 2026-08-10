@@ -47,8 +47,7 @@ function settingsToggleAllCategories() {
 }
 
 function settingsPanels() {
-    return Array.from(gradioApp().querySelectorAll("#settings > .tabitem[id^=settings_]")
-    );
+    return Array.from(gradioApp().querySelectorAll("#settings > .tabitem[id^=settings_]"));
 }
 
 function settingsMetadata() {

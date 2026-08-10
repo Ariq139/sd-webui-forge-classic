@@ -2,9 +2,7 @@
     let isSetupForMobile = false;
 
     function isMobile() {
-        // Match the responsive CSS breakpoint first. The old offsetLeft-only
-        // test is unreliable after Gradio 5 reflows the ResizeHandleRow: a
-        // stacked results column can still have a non-zero offsetLeft.
+        // Check the CSS breakpoint before the layout fallback.
         if (window.matchMedia("(max-width: 700px)").matches) return true;
 
         for (const tab of ["txt2img", "img2img"]) {
@@ -31,8 +29,7 @@
             const target = gradioApp().getElementById(currentlyMobile ? tab + "_results" : tab + "_actions_column");
             if (!button || !target) continue;
 
-            // Keep Generate directly above the gallery on narrow screens and
-            // restore it to the prompt action column on desktop.
+            // Place Generate with the gallery on mobile and actions on desktop.
             if (button.parentElement !== target || button !== target.firstElementChild) {
                 target.insertBefore(button, target.firstElementChild);
             }

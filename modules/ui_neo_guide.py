@@ -7,7 +7,7 @@ import gradio as gr
 from modules.paths_internal import script_path
 
 
-GUIDE_PATH = Path(script_path) / "docs" / "EDIT_MODELS.md"
+GUIDE_PATH = Path(script_path) / "docs" / "INSTRUCTIONS.md"
 
 
 def _read_guide() -> str:
@@ -16,8 +16,8 @@ def _read_guide() -> str:
     except OSError:
         return (
             "# Instructions\n\n"
-            "The Neo edit-model guide could not be loaded. "
-            "See the repository `docs/EDIT_MODELS.md` file."
+            "The Neo instructions could not be loaded. "
+            "See the repository `docs/INSTRUCTIONS.md` file."
         )
 
 

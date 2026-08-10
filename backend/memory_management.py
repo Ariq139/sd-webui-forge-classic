@@ -63,6 +63,7 @@ MEMORY_WORKING_VRAM_BYTES = 0
 MEMORY_PINNED_MEMORY_PERCENT = 45.0
 MEMORY_ASYNC_STREAMS = 2
 MEMORY_VRAM_SAFETY_PERCENT = 80.0
+MEMORY_RUNTIME_SIGNATURE = None
 
 
 class VRAMState(Enum):
@@ -721,12 +722,8 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        # Forge's --lowvram/--novram calculation remains the source of truth for
-        # the VRAM mode. An optional component budget is an additional weight
-        # loading cap; it can make an existing offload decision more conservative,
-        # but it does not replace the VRAM state or disable low/novram behavior.
-        # It does not cap activation/workspace memory, which is protected
-        # separately by minimum_inference_memory().
+        # Forge's VRAM flags remain authoritative; budgets only cap loaded weights.
+        # Activation/workspace memory remains protected separately.
         component_budget = memory_budget_for_model(model)
         if component_budget > 0 and not is_device_cpu(torch_dev):
             if lowvram_model_memory == 0 or lowvram_model_memory > component_budget:
@@ -1464,9 +1461,7 @@ def get_offload_stream(device: torch.device):
     stream_counter = stream_counters.get(device, 0)
 
     if device in STREAMS and len(STREAMS[device]) != NUM_STREAMS:
-        # A settings change can happen while a generation is finishing. Keep
-        # old stream objects alive until this call rather than clearing them
-        # asynchronously from another thread.
+        # Keep old streams alive until this call finishes.
         del STREAMS[device]
         stream_counters.pop(device, None)
 
@@ -1642,6 +1637,13 @@ def residency_hint_enabled(model) -> bool:
     return feature_enabled("residency_hints") and memory_component_for_model(model) in MEMORY_RESIDENCY_COMPONENTS
 
 
+def _setting_number(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def configure_memory_features(
     *,
     enabled: bool = False,
@@ -1666,6 +1668,7 @@ def configure_memory_features(
     global MEMORY_PINNED_MEMORY_PERCENT
     global MEMORY_ASYNC_STREAMS
     global MEMORY_VRAM_SAFETY_PERCENT
+    global MEMORY_RUNTIME_SIGNATURE
     global NUM_STREAMS
     global PINNING_ENABLED
     global MAX_PINNED_MEMORY
@@ -1681,30 +1684,15 @@ def configure_memory_features(
     }
     MEMORY_BUDGETS_BYTES = {}
     for component, value in (model_budgets_mb or {}).items():
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            value = 0
+        value = _setting_number(value, 0)
         if value > 0:
             MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
     MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ())
     MEMORY_PINNED_COMPONENTS = set(pinned_components or ())
-    try:
-        MEMORY_WORKING_VRAM_BYTES = max(0, int(float(working_vram_mb) * 1024 * 1024))
-    except (TypeError, ValueError):
-        MEMORY_WORKING_VRAM_BYTES = 0
-    try:
-        MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, float(pinned_memory_percent)))
-    except (TypeError, ValueError):
-        MEMORY_PINNED_MEMORY_PERCENT = 45.0
-    try:
-        MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, float(vram_safety_percent)))
-    except (TypeError, ValueError):
-        MEMORY_VRAM_SAFETY_PERCENT = 80.0
-    try:
-        MEMORY_ASYNC_STREAMS = min(8, max(1, int(async_streams)))
-    except (TypeError, ValueError):
-        MEMORY_ASYNC_STREAMS = 2
+    MEMORY_WORKING_VRAM_BYTES = max(0, int(_setting_number(working_vram_mb, 0) * 1024 * 1024))
+    MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, _setting_number(pinned_memory_percent, 45)))
+    MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, _setting_number(vram_safety_percent, 80)))
+    MEMORY_ASYNC_STREAMS = min(8, max(1, int(_setting_number(async_streams, 2))))
 
     requested_streams = MEMORY_ASYNC_STREAMS if feature_enabled("async_transfers") else 0
     if args.cuda_stream is not None:
@@ -1720,8 +1708,28 @@ def configure_memory_features(
     elif not args.pin_shared_memory:
         MAX_PINNED_MEMORY = -1
 
-    # Settings changes can invoke this function once per changed option. Keep
-    # the diagnostic available without flooding normal startup output.
+    runtime_signature = (
+        effective_enabled,
+        feature_enabled("budgets"),
+        tuple(sorted(MEMORY_BUDGETS_BYTES.items())) if feature_enabled("budgets") else (),
+        MEMORY_WORKING_VRAM_BYTES if feature_enabled("enabled") else 0,
+        feature_enabled("pinned_memory"),
+        feature_enabled("async_transfers"),
+        feature_enabled("residency_hints"),
+        tuple(sorted(MEMORY_PINNED_COMPONENTS)) if feature_enabled("pinned_memory") else (),
+        tuple(sorted(MEMORY_RESIDENCY_COMPONENTS)) if feature_enabled("residency_hints") else (),
+        MEMORY_PINNED_MEMORY_PERCENT if feature_enabled("pinned_memory") else 0,
+        MEMORY_VRAM_SAFETY_PERCENT if feature_enabled("enabled") else 0,
+        NUM_STREAMS,
+        PINNING_ENABLED,
+    )
+    if MEMORY_RUNTIME_SIGNATURE is not None and runtime_signature != MEMORY_RUNTIME_SIGNATURE:
+        logger.info("Memory-management mode changed; unloading models before applying the new mode")
+        unload_all_models()
+        soft_empty_cache()
+    MEMORY_RUNTIME_SIGNATURE = runtime_signature
+
+    # Settings changes can call this repeatedly, so keep this at debug level.
     logger.debug(
         "Optional memory features: enabled=%s budgets=%s pinned=%s async=%s residency=%s streams=%s",
         MEMORY_FEATURES["enabled"],

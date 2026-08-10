@@ -161,10 +161,7 @@ class VAE:
         if no_init:
             return
 
-        # The diffusion pipeline tells us its default VAE family, but a
-        # standalone VAE can legitimately come from another compatible
-        # pipeline.  The loader annotates the instantiated component from its
-        # own state-dict signature, following ComfyUI's component-first model.
+        # Prefer the family detected from a standalone VAE's own state dict.
         is_wan = bool(getattr(model, "_forge_vae_is_wan", is_wan))
         is_flux2 = bool(getattr(model, "_forge_vae_is_flux2", is_flux2))
 

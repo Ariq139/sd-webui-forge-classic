@@ -161,8 +161,7 @@ function submit() {
         gradioApp().getElementById("txt2img_gallery"),
         function () {
             if (document.visibilityState === "hidden") {
-                // Keep the task id so a suspended mobile tab can restore the
-                // result after it becomes visible again.
+                // Keep the task id so a suspended mobile tab can restore it.
                 showRestoreProgressButton("txt2img", true);
                 return;
             }
@@ -291,9 +290,7 @@ function restoreProgressAfterVisibility(tabname) {
 
     if (!id || !nativeButton || restoreProgressInFlight[tabname]) return;
 
-    // The original Gradio result stream may have been suspended while the
-    // browser app was in the background. Re-submit the existing task to the
-    // server-side restore callback when the page becomes visible again.
+    // Re-submit the task if the browser suspended Gradio's result stream.
     restoreProgressInFlight[tabname] = true;
     nativeButton.click();
 }

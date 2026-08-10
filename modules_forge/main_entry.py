@@ -6,7 +6,6 @@ import torch
 from gradio.context import Context
 from rich import print_json
 
-from backend import memory_management
 from backend.args import dynamic_args
 from backend.logging import setup_logger
 from modules import (
@@ -19,6 +18,7 @@ from modules import (
     ui_common,
 )
 from modules_forge.presets import PresetArch, is_video, use_distill, use_shift
+from modules_forge.native_models import compatible_model_directories, is_compatible_model
 
 logger = logging.getLogger("ui_models")
 setup_logger(logger)
@@ -27,6 +27,7 @@ ui_forge_preset: gr.Radio
 ui_checkpoint: gr.Dropdown
 ui_vae: gr.Dropdown
 ui_forge_unet_dtype: gr.Radio
+native_tabs: dict[str, gr.TabItem] = {}
 
 forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "Automatic": (None, False),
@@ -41,15 +42,37 @@ forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
 module_list: dict[str, os.PathLike] = {}
 module_categories: dict[str, str] = {}
 LTX2_MODEL_DEFAULT = "diffusers/LTX-2.3-Diffusers"
+IDEOGRAM_MODEL_DEFAULT = "ideogram-ai/ideogram-v4"
+NATIVE_PIPELINE_PRESETS = {PresetArch.ltx2.name, PresetArch.ideogram.name}
+NATIVE_TAB_PRESETS = {"ltx_video": PresetArch.ltx2.name, "ideogram": PresetArch.ideogram.name}
+PRESET_TAB_IDS = {*NATIVE_TAB_PRESETS, "img2img"}
+
+
+def register_native_tab(tab_id: str, tab: gr.TabItem):
+    native_tabs[tab_id] = tab
+
+
+def preset_tab_visible(tab_id: str, preset: str) -> bool:
+    if tab_id == "img2img":
+        return preset != PresetArch.ideogram.name
+    expected_preset = NATIVE_TAB_PRESETS.get(tab_id)
+    return expected_preset is None or expected_preset == preset
+
+
+def native_model_marker(preset: str) -> str:
+    return "LTX2" if preset == PresetArch.ltx2.name else "Ideogram4"
+
+
+def native_model_directories(preset: str) -> list[str]:
+    return compatible_model_directories(native_model_marker(preset))
+
+
+def native_model_is_compatible(value: str, preset: str) -> bool:
+    return is_compatible_model(value, native_model_marker(preset))
 
 
 def module_choices() -> list[tuple[str, str]]:
-    """Return display/value pairs for the VAE and text-encoder selector.
-
-    Gradio dropdowns do not provide optgroup support, so the category is kept
-    in the display label while the value remains the original filename. This
-    preserves the existing multi-select payload consumed by ``modules_change``.
-    """
+    """Return sorted display/value pairs for the module selector."""
     category_order = {"VAE": 0, "Text Encoder": 1}
 
     return [
@@ -75,24 +98,64 @@ def make_checkpoint_manager_ui():
     ckpt_list = checkpoint_choices(preset, ckpt_list)
     checkpoint_value = checkpoint_value_for_preset(preset, ckpt_list)
     module_value = [os.path.basename(x) for x in shared.opts.forge_additional_modules if os.path.basename(x) in vae_list]
+    module_label = "VAE / Text Encoder"
+    module_choices_value = module_choices()
+    module_multiselect = True
+    module_visible = preset not in NATIVE_PIPELINE_PRESETS
 
-    ui_forge_preset = gr.Dropdown(label="UI Preset", value=shared.opts.forge_preset, choices=PresetArch.choices(), elem_id="forge_ui_preset")
+    if preset == PresetArch.ltx2.name:
+        from modules import ui_ltx2_video
 
-    ui_checkpoint = gr.Dropdown(label=checkpoint_label(preset), value=checkpoint_value, choices=ckpt_list, elem_id="setting_sd_model_checkpoint", elem_classes=["model_selection"])
+        module_label = "VAE / Decoder"
+        module_choices_value = ui_ltx2_video._prunavaed_choices()
+        module_value = ui_ltx2_video._prunavaed_value()
+        module_multiselect = False
 
-    ui_vae = gr.Dropdown(label="VAE / Text Encoder", value=module_value, choices=module_choices(), multiselect=True, visible=preset != PresetArch.ltx2.name, elem_id="setting_sd_modules", elem_classes=["model_selection"])
+    ui_forge_preset = gr.Dropdown(
+        label="UI Preset",
+        value=shared.opts.forge_preset,
+        choices=PresetArch.choices(),
+        elem_id="forge_ui_preset",
+    )
+
+    ui_checkpoint = gr.Dropdown(
+        label=checkpoint_label(preset),
+        value=checkpoint_value,
+        choices=ckpt_list,
+        elem_id="setting_sd_model_checkpoint",
+        elem_classes=["model_selection"],
+    )
+
+    ui_vae = gr.Dropdown(
+        label=module_label,
+        value=module_value,
+        choices=module_choices_value,
+        multiselect=module_multiselect,
+        visible=module_visible,
+        elem_id="setting_sd_modules",
+        elem_classes=["model_selection"],
+    )
 
     def refresh_model_list():
         ckpt_list, _ = refresh_models()
         current_preset = getattr(shared.opts, "forge_preset", "sd")
         choices = checkpoint_choices(current_preset, ckpt_list)
-        return [gr.update(value=checkpoint_value_for_preset(current_preset, choices), choices=choices, label=checkpoint_label(current_preset)), gr.update(choices=module_choices())]
+        return [
+            gr.update(value=checkpoint_value_for_preset(current_preset, choices), choices=choices, label=checkpoint_label(current_preset)),
+            module_dropdown_update(current_preset),
+        ]
 
     refresh_button = ui_common.ToolButton(value=ui_common.refresh_symbol, elem_id="forge_refresh_checkpoint", tooltip="Refresh")
     refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
     Context.root_block.load(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
 
-    ui_forge_unet_dtype = gr.Dropdown(label="Diffusion in Low Bits", value=None, choices=list(forge_unet_storage_dtype_options.keys()), visible=preset != PresetArch.ltx2.name, elem_id="forge_ui_dtype")
+    ui_forge_unet_dtype = gr.Dropdown(
+        label="Diffusion in Low Bits",
+        value=None,
+        choices=list(forge_unet_storage_dtype_options.keys()),
+        visible=preset not in NATIVE_PIPELINE_PRESETS,
+        elem_id="forge_ui_dtype",
+    )
 
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
@@ -100,32 +163,66 @@ def make_checkpoint_manager_ui():
 
 
 def checkpoint_label(preset: str) -> str:
-    return "LTX-2.3 Model" if preset == PresetArch.ltx2.name else "Checkpoint"
+    return "Checkpoint"
+
+
+def module_dropdown_update(preset: str):
+    if preset == PresetArch.ltx2.name:
+        from modules import ui_ltx2_video
+
+        return gr.update(
+            value=ui_ltx2_video._prunavaed_value(),
+            choices=ui_ltx2_video._prunavaed_choices(),
+            label="VAE / Decoder",
+            multiselect=False,
+            visible=True,
+        )
+
+    value = [] if preset in NATIVE_PIPELINE_PRESETS else [
+        os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])
+    ]
+    return gr.update(
+        value=value,
+        choices=module_choices(),
+        label="VAE / Text Encoder",
+        multiselect=True,
+        visible=preset not in NATIVE_PIPELINE_PRESETS,
+    )
 
 
 def ltx2_model_value() -> str:
-    configured = getattr(shared.opts, "ltx2_model_path", None)
-    selected = getattr(shared.opts, "forge_checkpoint_ltx2", None)
-    if selected and selected != LTX2_MODEL_DEFAULT:
-        return selected
-    return configured or selected or LTX2_MODEL_DEFAULT
+    return native_model_value(PresetArch.ltx2.name)
+
+
+def ideogram_model_value() -> str:
+    return native_model_value(PresetArch.ideogram.name)
+
+
+def native_model_value(preset: str) -> str:
+    default = LTX2_MODEL_DEFAULT if preset == PresetArch.ltx2.name else IDEOGRAM_MODEL_DEFAULT
+    for key in (f"forge_checkpoint_{preset}", f"{preset}_model_path"):
+        value = str(getattr(shared.opts, key, "") or "").strip()
+        if value and value != default and native_model_is_compatible(value, preset):
+            return value
+    return ""
 
 
 def checkpoint_choices(preset: str, choices: list[str]) -> list[str]:
-    if preset != PresetArch.ltx2.name:
+    if preset not in NATIVE_PIPELINE_PRESETS:
         return choices
 
+    model_value = ltx2_model_value() if preset == PresetArch.ltx2.name else ideogram_model_value()
     values = []
-    for value in (ltx2_model_value(), LTX2_MODEL_DEFAULT):
+    for value in (model_value, *native_model_directories(preset)):
         if value and value not in values:
             values.append(value)
     return values
 
 
 def checkpoint_value_for_preset(preset: str, choices: list[str]) -> str | None:
-    if preset == PresetArch.ltx2.name:
-        value = ltx2_model_value()
-        return value if value in choices else (choices[-1] if choices else LTX2_MODEL_DEFAULT)
+    if preset in NATIVE_PIPELINE_PRESETS:
+        value = ltx2_model_value() if preset == PresetArch.ltx2.name else ideogram_model_value()
+        return value if value in choices else (choices[0] if choices else None)
     value = getattr(shared.opts, f"forge_checkpoint_{preset}", None) or shared.opts.sd_model_checkpoint
     return value if value in choices else (choices[0] if choices else None)
 
@@ -204,18 +301,28 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
 
 
 def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> bool:
-    """`ckpt_name` accepts valid aliases; returns `True` if checkpoint changed"""
-    if preset == PresetArch.ltx2.name:
-        ckpt_name = (ckpt_name or LTX2_MODEL_DEFAULT).strip()
-        current = ltx2_model_value()
+    """Save a checkpoint selection and return whether it changed."""
+    if preset in NATIVE_PIPELINE_PRESETS:
+        value_getter = ltx2_model_value if preset == PresetArch.ltx2.name else ideogram_model_value
+        ckpt_name = str(ckpt_name or "").strip()
+        current = value_getter()
         if ckpt_name == current:
             return False
 
-        shared.opts.set("forge_checkpoint_ltx2", ckpt_name)
-        shared.opts.set("ltx2_model_path", ckpt_name)
+        shared.opts.set(f"forge_checkpoint_{preset}", ckpt_name)
+        shared.opts.set(f"{preset}_model_path", ckpt_name)
         if save:
             shared.opts.save(shared.config_filename)
         return True
+
+    ckpt_name = str(ckpt_name or "").strip()
+    if not ckpt_name:
+        shared_items.refresh_checkpoints()
+        choices = shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
+        ckpt_name = checkpoint_value_for_preset(preset, choices) or ""
+    if not ckpt_name:
+        logger.error("No checkpoint is available for preset %s", preset)
+        return False
 
     new_ckpt_info = sd_models.get_closet_checkpoint_match(ckpt_name)
     current_ckpt_info = sd_models.get_closet_checkpoint_match(getattr(shared.opts, "sd_model_checkpoint", ""))
@@ -233,8 +340,16 @@ def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> b
 
 
 def modules_change(module_values: list, preset: str, save=True, refresh=True) -> bool:
-    """`module_values` accepts file paths or just the module names; returns `True` if modules changed"""
+    """Save module selections and return whether they changed."""
     if preset == PresetArch.ltx2.name:
+        from modules import ui_ltx2_video
+
+        value = module_values[0] if isinstance(module_values, list) and module_values else module_values
+        value = value if value in ui_ltx2_video._prunavaed_choices() else ""
+        ui_ltx2_video._save_option("ltx2_prunavaed_path", value)
+        return True
+
+    if preset in NATIVE_PIPELINE_PRESETS:
         return False
 
     modules = []
@@ -259,7 +374,7 @@ def modules_change(module_values: list, preset: str, save=True, refresh=True) ->
 
 
 def dtype_change(dtype: str, preset: str, save=True, refresh=True) -> bool:
-    if preset == PresetArch.ltx2.name:
+    if preset in NATIVE_PIPELINE_PRESETS:
         return False
 
     shared.opts.set("forge_unet_storage_dtype", dtype)
@@ -270,6 +385,34 @@ def dtype_change(dtype: str, preset: str, save=True, refresh=True) -> bool:
         shared.opts.save(shared.config_filename)
     refresh_model_loading_parameters(refresh=refresh)
     return True
+
+
+def restore_standard_preset(preset: str):
+    """Restore saved normal-model state instead of stale native-page inputs."""
+    shared_items.refresh_checkpoints()
+    choices = checkpoint_choices(
+        preset,
+        shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short),
+    )
+    checkpoint = str(getattr(shared.opts, f"forge_checkpoint_{preset}", "") or "").strip()
+    if checkpoint not in choices:
+        checkpoint = str(getattr(shared.opts, "sd_model_checkpoint", "") or "").strip()
+    if checkpoint not in choices:
+        checkpoint = choices[0] if choices else ""
+
+    modules = getattr(shared.opts, f"forge_additional_modules_{preset}", [])
+    modules = list(modules) if isinstance(modules, (list, tuple)) else []
+    dtype = getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic")
+
+    shared.opts.set("forge_additional_modules", modules)
+    shared.opts.set(f"forge_additional_modules_{preset}", modules)
+    shared.opts.set("forge_unet_storage_dtype", dtype)
+    shared.opts.set(f"forge_unet_storage_dtype_{preset}", dtype)
+    if checkpoint:
+        shared.opts.set("sd_model_checkpoint", checkpoint)
+        shared.opts.set(f"forge_checkpoint_{preset}", checkpoint)
+    shared.opts.save(shared.config_filename)
+    refresh_model_loading_parameters(refresh=bool(checkpoint))
 
 
 def get_a1111_ui_component(tab: str, label: str) -> gr.components.Component:
@@ -283,6 +426,11 @@ def forge_main_entry():
     ui_txt2img_steps = get_a1111_ui_component("txt2img", "Steps")
     ui_txt2img_hr_steps = get_a1111_ui_component("txt2img", "Hires steps")
     ui_img2img_steps = get_a1111_ui_component("img2img", "Steps")
+    ui_txt2img_enable_hr = get_a1111_ui_component("txt2img", "enable_hr")
+    ui_txt2img_negative_prompt = get_a1111_ui_component("txt2img", "negative_prompt")
+    ui_img2img_negative_prompt = get_a1111_ui_component("img2img", "Negative prompt")
+    ui_img2img_denoising_strength = get_a1111_ui_component("img2img", "Denoising strength")
+    ui_img2img_image_cfg = get_a1111_ui_component("img2img", "Image CFG scale")
 
     ui_txt2img_sampler = get_a1111_ui_component("txt2img", "sampler_name")
     ui_img2img_sampler = get_a1111_ui_component("img2img", "sampler_name")
@@ -304,6 +452,8 @@ def forge_main_entry():
 
     ui_txt2img_batch_size = get_a1111_ui_component("txt2img", "Batch size")
     ui_img2img_batch_size = get_a1111_ui_component("img2img", "Batch size")
+    ui_txt2img_batch_count = get_a1111_ui_component("txt2img", "Batch count")
+    ui_img2img_batch_count = get_a1111_ui_component("img2img", "Batch count")
 
     output_targets = [
         ui_checkpoint,
@@ -312,6 +462,11 @@ def forge_main_entry():
         ui_txt2img_steps,
         ui_txt2img_hr_steps,
         ui_img2img_steps,
+        ui_txt2img_enable_hr,
+        ui_txt2img_negative_prompt,
+        ui_img2img_negative_prompt,
+        ui_img2img_denoising_strength,
+        ui_img2img_image_cfg,
         ui_txt2img_sampler,
         ui_img2img_sampler,
         ui_txt2img_scheduler,
@@ -328,6 +483,8 @@ def forge_main_entry():
         ui_img2img_distilled_cfg,
         ui_txt2img_batch_size,
         ui_img2img_batch_size,
+        ui_txt2img_batch_count,
+        ui_img2img_batch_count,
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).success(
@@ -338,31 +495,47 @@ def forge_main_entry():
     ).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
     Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
+    for tab_id in PRESET_TAB_IDS:
+        tab = native_tabs.get(tab_id)
+        if tab is None:
+            continue
+        ui_forge_preset.change(
+            fn=lambda preset, tab_id=tab_id: gr.update(visible=preset_tab_visible(tab_id, preset)),
+            inputs=[ui_forge_preset],
+            outputs=[tab],
+            queue=False,
+            show_progress=False,
+        )
+
     from modules import ui_ltx2_video
+    from modules import ui_ideogram
 
-    ui_ltx2_video.bind_preset(ui_forge_preset)
+    ui_ltx2_video.bind_preset(ui_forge_preset, ui_checkpoint, ui_vae)
+    ui_ideogram.bind_preset(ui_forge_preset, ui_checkpoint)
 
-    if getattr(shared.opts, "forge_preset", "sd") != PresetArch.ltx2.name:
+    if getattr(shared.opts, "forge_preset", "sd") not in NATIVE_PIPELINE_PRESETS:
         refresh_model_loading_parameters()
 
 
 def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: str, ui_forge_preset: str):
-    if ui_forge_preset == PresetArch.ltx2.name:
+    from modules import ui_ideogram, ui_ltx2_video
+
+    ui_ltx2_video.unload()
+    ui_ideogram.unload()
+
+    if ui_forge_preset in NATIVE_PIPELINE_PRESETS:
         try:
             from modules import sd_models
 
             sd_models.unload_model_weights()
         except Exception:
-            logger.debug("No Forge image model needed unloading before LTX-2.3", exc_info=True)
-        checkpoint_change(ui_checkpoint, ui_forge_preset, save=True, refresh=False)
+            logger.debug("No Forge image model needed unloading before native pipeline", exc_info=True)
+        native_checkpoint = native_model_value(ui_forge_preset) or str(ui_checkpoint or "").strip()
+        if native_checkpoint:
+            checkpoint_change(native_checkpoint, ui_forge_preset, save=True, refresh=False)
         return
 
-    from modules import ui_ltx2_video
-
-    ui_ltx2_video.unload()
-    dtype_change(ui_forge_unet_dtype, ui_forge_preset, save=False, refresh=False)
-    modules_change(ui_vae, ui_forge_preset, save=False, refresh=False)
-    checkpoint_change(ui_checkpoint, ui_forge_preset, save=True, refresh=True)
+    restore_standard_preset(ui_forge_preset)
 
 
 def on_preset_change(preset: str):
@@ -387,7 +560,8 @@ def on_preset_change(preset: str):
     batch_args_i2i = batch_args_t2i.copy()
     batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
 
-    ltx2 = preset == PresetArch.ltx2.name
+    native_pipeline = preset in NATIVE_PIPELINE_PRESETS
+    ideogram = preset == PresetArch.ideogram.name
     checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
 
     return [
@@ -397,35 +571,39 @@ def on_preset_change(preset: str):
             choices=checkpoint_list,
             label=checkpoint_label(preset),
         ),
-        gr.update(
-            value=[] if ltx2 else [os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])],
-            visible=not ltx2,
-            interactive=not ltx2,
-        ),
-        gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic"), visible=not ltx2, interactive=not ltx2),
+        module_dropdown_update(preset),
+        gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic"), visible=not native_pipeline, interactive=not native_pipeline),
         # ui_txt2img_steps, ui_txt2img_hr_steps, ui_img2img_steps
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_step", 20)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_i2i_step", 20)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_step", 20)) > 0 else gr.skip(),
+        gr.update(visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(visible=not ideogram, interactive=not ideogram),
+        gr.update(visible=not ideogram, interactive=not ideogram),
+        gr.update(visible=not native_pipeline),
+        gr.update(visible=not native_pipeline),
         # ui_txt2img_sampler, ui_img2img_sampler, ui_txt2img_scheduler, ui_img2img_scheduler
-        gr.update(value=getattr(shared.opts, f"{preset}_t2i_sampler", "Euler")),
-        gr.update(value=getattr(shared.opts, f"{preset}_i2i_sampler", "Euler")),
-        gr.update(value=getattr(shared.opts, f"{preset}_t2i_scheduler", "Simple")),
-        gr.update(value=getattr(shared.opts, f"{preset}_i2i_scheduler", "Simple")),
+        gr.update(value=getattr(shared.opts, f"{preset}_t2i_sampler", "Euler"), visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(value=getattr(shared.opts, f"{preset}_i2i_sampler", "Euler"), visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(value=getattr(shared.opts, f"{preset}_t2i_scheduler", "Simple"), visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(value=getattr(shared.opts, f"{preset}_i2i_scheduler", "Simple"), visible=not native_pipeline, interactive=not native_pipeline),
         # ui_txt2img_width, ui_img2img_width, ui_txt2img_height, ui_img2img_height
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_width", 1024)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_i2i_width", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_width", 1024)) > 0 else gr.skip(),
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_height", 1024)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_i2i_height", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_height", 1024)) > 0 else gr.skip(),
         # ui_txt2img_cfg, ui_txt2img_hr_cfg, ui_img2img_cfg
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_cfg", 1.0)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_i2i_cfg", 1.0)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)) > 0 else gr.skip(),
+        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_cfg", 1.0)) > 0 else gr.skip(),
         # ui_txt2img_distilled_cfg, ui_img2img_distilled_cfg, ui_txt2img_hr_distilled_cfg
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_dcfg", 3.0), **d_args),
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_hr_dcfg", 3.0), **d_args),
         gr.update(value=getattr(shared.opts, f"{preset}_i2i_dcfg", 3.0), **d_args),
         # ui_txt2img_batch_size, ui_img2img_batch_size
         gr.update(**batch_args_t2i),
-        gr.update(**batch_args_i2i),
+        gr.update(**batch_args_i2i, visible=not ideogram, interactive=not ideogram),
+        # LTX produces one video per request; Ideogram supports the txt2img batch count.
+        gr.update(visible=preset != PresetArch.ltx2.name, interactive=preset != PresetArch.ltx2.name),
+        gr.update(visible=not native_pipeline, interactive=not native_pipeline),
     ]

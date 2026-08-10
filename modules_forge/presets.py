@@ -15,6 +15,7 @@ class PresetArch(Enum):
     pid = 11  # PiD
     krea = 12  # Krea2
     ltx2 = 13  # LTX-2.3 video
+    ideogram = 14  # Ideogram 4
 
     @staticmethod
     def choices() -> list[str]:
@@ -35,6 +36,7 @@ SAMPLERS = {
     PresetArch.pid: "LCM",
     PresetArch.krea: "Euler",
     PresetArch.ltx2: "Euler",
+    PresetArch.ideogram: "Euler",
 }
 
 SCHEDULERS = {
@@ -51,6 +53,7 @@ SCHEDULERS = {
     PresetArch.pid: "Simple",
     PresetArch.krea: "Simple",
     PresetArch.ltx2: "Simple",
+    PresetArch.ideogram: "Simple",
 }
 
 STEPS = {
@@ -67,6 +70,7 @@ STEPS = {
     PresetArch.pid: 4,
     PresetArch.krea: 8,
     PresetArch.ltx2: 30,
+    PresetArch.ideogram: 48,
 }
 
 CFG = {
@@ -83,6 +87,7 @@ CFG = {
     PresetArch.pid: 1.0,
     PresetArch.krea: 1.0,
     PresetArch.ltx2: 3.0,
+    PresetArch.ideogram: 7.0,
 }
 
 DISTILL = {
@@ -123,11 +128,18 @@ def register(options_templates: dict):
 
     from modules.options import OptionInfo, OptionRow, options_section
     from modules.shared_items import list_samplers, list_schedulers
+    from modules_forge.native_pipeline_speed import ATTENTION_BACKEND_CHOICES, OFFLOAD_CHOICES
 
     for arch in PresetArch:
         name = arch.name
 
-        checkpoint_default = "diffusers/LTX-2.3-Diffusers" if arch is PresetArch.ltx2 else None
+        checkpoint_default = (
+            "diffusers/LTX-2.3-Diffusers"
+            if arch is PresetArch.ltx2
+            else "ideogram-ai/ideogram-v4"
+            if arch is PresetArch.ideogram
+            else None
+        )
 
         options_templates.update(
             options_section(
@@ -247,12 +259,12 @@ def register(options_templates: dict):
                 (f"ui_{name}", name.upper(), "presets"),
                 {
                     f"{name}_t2i_dim1": OptionRow(),
-                    f"{name}_t2i_width": OptionInfo(768 if arch is PresetArch.ltx2 else 0, "txt2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
-                    f"{name}_i2i_width": OptionInfo(768 if arch is PresetArch.ltx2 else 0, "img2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_t2i_width": OptionInfo(768 if arch is PresetArch.ltx2 else 1024 if arch is PresetArch.ideogram else 0, "txt2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_i2i_width": OptionInfo(768 if arch is PresetArch.ltx2 else 1024 if arch is PresetArch.ideogram else 0, "img2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
                     f"{name}_t2i_dim0": OptionRow(),
                     f"{name}_i2i_dim1": OptionRow(),
-                    f"{name}_t2i_height": OptionInfo(512 if arch is PresetArch.ltx2 else 0, "txt2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
-                    f"{name}_i2i_height": OptionInfo(512 if arch is PresetArch.ltx2 else 0, "img2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_t2i_height": OptionInfo(512 if arch is PresetArch.ltx2 else 1024 if arch is PresetArch.ideogram else 0, "txt2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_i2i_height": OptionInfo(512 if arch is PresetArch.ltx2 else 1024 if arch is PresetArch.ideogram else 0, "img2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
                     f"{name}_i2i_dim0": OptionRow(),
                 },
             )
@@ -266,10 +278,14 @@ def register(options_templates: dict):
                     ("ui_ltx2", "LTX-2.3", "presets"),
                     {
                         "ltx2_model_path": OptionInfo("diffusers/LTX-2.3-Diffusers", "Model path or Hugging Face ID", Textbox),
-                        "ltx2_prunavaed_path": OptionInfo("", "PrunaVAED path or Hugging Face ID", Textbox),
-                        "ltx2_offload": OptionInfo("model", "CPU offload", Radio, {"choices": ["none", "model", "sequential"]}),
+                        "ltx2_prunavaed_path": OptionInfo("", "VAE / Decoder", Textbox),
+                        "ltx2_offload": OptionInfo("model", "CPU offload", Radio, {"choices": OFFLOAD_CHOICES}),
+                        "ltx2_attention_backend": OptionInfo("automatic", "Attention backend", Dropdown, {"choices": ATTENTION_BACKEND_CHOICES}).info("Automatic prefers Sage, then Flash, then native SDPA"),
                         "ltx2_precision": OptionInfo("automatic", "Precision", Radio, {"choices": ["automatic", "bfloat16", "float16"]}),
-                        "ltx2_tile_vae": OptionInfo(True, "Tile VAE", Checkbox),
+                        "ltx2_auto_vae_tiling": OptionInfo(True, "Automatic VAE tiling", Checkbox).info("enable tiling only when the estimated decode may not fit in VRAM"),
+                        "ltx2_tile_vae": OptionInfo(True, "Force VAE tiling", Checkbox).info("used when automatic VAE tiling is disabled"),
+                        "ltx2_prompt_cache": OptionInfo(True, "Cache prompt embeddings", Checkbox).info("cache the last four encoded prompts"),
+                        "ltx2_compile": OptionInfo(False, "Compile denoiser", Checkbox).info("experimental; requires CUDA and CPU offload set to none"),
                         "ltx2_fps": OptionInfo(24, "FPS", Number, {"minimum": 1, "maximum": 60, "step": 1}),
                         "ltx2_stg": OptionInfo(1.0, "Video STG", Number, {"minimum": 0, "maximum": 10, "step": 0.1}),
                         "ltx2_modality": OptionInfo(3.0, "Video modality", Number, {"minimum": 0, "maximum": 10, "step": 0.1}),
@@ -280,6 +296,28 @@ def register(options_templates: dict):
                         "ltx2_guidance_blocks": OptionInfo("28", "Spatio-temporal guidance blocks", Textbox),
                         "ltx2_seed": OptionInfo(-1, "Seed", Number, {"minimum": -1, "maximum": 2**31 - 1, "step": 1}),
                         "ltx2_include_audio": OptionInfo(True, "Include generated audio", Checkbox),
+                    },
+                )
+            )
+
+        if arch is PresetArch.ideogram:
+            options_templates.update(
+                options_section(
+                    ("ui_ideogram", "Ideogram 4", "presets"),
+                    {
+                        "ideogram_model_path": OptionInfo("ideogram-ai/ideogram-v4", "Model path or Hugging Face ID", Textbox),
+                        "ideogram_offload": OptionInfo("model", "CPU offload", Radio, {"choices": OFFLOAD_CHOICES}),
+                        "ideogram_attention_backend": OptionInfo("automatic", "Attention backend", Dropdown, {"choices": ATTENTION_BACKEND_CHOICES}).info("Automatic prefers Sage, then Flash, then native SDPA"),
+                        "ideogram_precision": OptionInfo("automatic", "Precision", Radio, {"choices": ["automatic", "bfloat16", "float16"]}),
+                        "ideogram_auto_vae_tiling": OptionInfo(True, "Automatic VAE tiling", Checkbox).info("enable tiling only when the estimated decode may not fit in VRAM"),
+                        "ideogram_tile_vae": OptionInfo(True, "Force VAE tiling", Checkbox).info("used when automatic VAE tiling is disabled"),
+                        "ideogram_prompt_cache": OptionInfo(True, "Cache prompt embeddings", Checkbox).info("cache the last four encoded prompts"),
+                        "ideogram_compile": OptionInfo(False, "Compile denoiser", Checkbox).info("experimental; requires CUDA and CPU offload set to none"),
+                        "ideogram_mu": OptionInfo(0.0, "Flow schedule mu", Number, {"minimum": -10, "maximum": 10, "step": 0.1}),
+                        "ideogram_std": OptionInfo(1.5, "Flow schedule std", Number, {"minimum": 0.01, "maximum": 10, "step": 0.1}),
+                        "ideogram_prompt_upsampling": OptionInfo(False, "Prompt upsampling", Checkbox),
+                        "ideogram_prompt_temperature": OptionInfo(1.0, "Prompt upsampling temperature", Number, {"minimum": 0.1, "maximum": 2, "step": 0.1}),
+                        "ideogram_seed": OptionInfo(-1, "Seed", Number, {"minimum": -1, "maximum": 2**31 - 1, "step": 1}),
                     },
                 )
             )

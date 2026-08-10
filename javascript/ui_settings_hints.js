@@ -4,9 +4,7 @@ let settingsHintsObserver = null;
 let settingsHintsTimer = null;
 
 function settingsHintsLabel(div) {
-    // Gradio 5.29 uses a direct block-info span for single-value controls such
-    // as sliders and single-select dropdowns. Older controls keep the span
-    // inside a label, so retain that fallback for extensions and custom inputs.
+    // Gradio 5.29 moved block-info outside labels; keep the older fallback.
     return (
         div.querySelector(":scope > .container > span[data-testid='block-info']") ||
         div.querySelector(":scope > label > span[data-testid='block-info']") ||

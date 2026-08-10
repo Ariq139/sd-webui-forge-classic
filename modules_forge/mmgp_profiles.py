@@ -22,11 +22,8 @@ MEMORY_SETTING_KEYS = (
     "forge_memory_keep_controlnet_loaded",
 )
 
-# These are the minimum hardware targets documented by MMGP for each profile.
-# They describe the class of machine the profile is intended for; they are not
-# hard caps and are shown in the settings dropdown to make profile selection
-# less guess-based. Windows generally needs about 16 GB more system RAM than
-# the Linux figures below because of different memory-management overhead.
+# MMGP's minimum hardware targets; these are labels, not hard caps.
+# Windows generally needs about 16 GB more system RAM than Linux.
 MEMORY_PROFILE_REQUIREMENTS = {
     "HighRAM_HighVRAM": (48, 24),
     "HighRAM_LowVRAM": (48, 12),
@@ -45,15 +42,13 @@ def memory_profile_label(name):
     return f"{name} ({ram_gb} GB RAM / {vram_gb} GB VRAM)"
 
 
-# Gradio accepts (label, value) choices. Keep the stored value equal to the
-# stable profile key so existing settings files and the profile callback stay
-# compatible while the UI displays the hardware requirements.
+# Display hardware requirements while storing the stable profile key.
 MEMORY_PROFILE_CHOICES = (
     "Custom",
     *((memory_profile_label(name), name) for name in MEMORY_PROFILE_REQUIREMENTS),
 )
 
-# These are Forge-compatible translations of MMGP's five hardware profiles.
+# Forge-compatible translations of MMGP's five profiles.
 MEMORY_PROFILES = {
     "HighRAM_HighVRAM": {
         "forge_memory_management_enabled": True,

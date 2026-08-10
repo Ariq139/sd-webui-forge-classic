@@ -249,10 +249,8 @@ class ControlBase:
             for i in range(len(control_output)):
                 if i == (len(control_output) - 1):
                     key = "middle"
-                    index = 0
                 else:
                     key = "output"
-                    index = i
                 x = control_output[i]
                 if x is not None:
                     if self.global_average_pooling:

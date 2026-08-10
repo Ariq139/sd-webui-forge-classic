@@ -55,6 +55,21 @@ LORA_MODULE_MARKERS = {
     "flux": ("lora flux",),
 }
 
+LORA_RELATED_CATEGORIES = {
+    "sd": ("SD",),
+    "xl": ("SDXL",),
+    "flux": ("Flux", "Klein"),
+    "klein": ("Klein", "Flux"),
+    "qwen": ("Qwen",),
+    "lumina": ("Lumina",),
+    "zit": ("ZIT",),
+    "wan": ("Wan",),
+    "anima": ("Anima",),
+    "ernie": ("Ernie",),
+    "pid": ("PiD",),
+    "krea": ("Krea",),
+}
+
 
 def _active_preset():
     preset = getattr(shared.opts, "forge_preset", "")
@@ -176,48 +191,23 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
         return [shared.cmd_opts.lora_dir, *shared.cmd_opts.lora_dirs]
 
     def get_category_order(self, prioritize=True):
-        all_categories = [LORA_CATEGORY_LABELS[key] for key in ("sd", "xl", "flux", "klein", "qwen", "lumina", "zit", "wan", "anima", "ernie", "pid", "krea", "unknown")]
+        all_categories = [
+            LORA_CATEGORY_LABELS[key]
+            for key in ("sd", "xl", "flux", "klein", "qwen", "lumina", "zit", "wan", "anima", "ernie", "pid", "krea", "unknown")
+        ]
         if not prioritize:
             return all_categories
 
-        related_categories = {
-            "sd": ("SD",),
-            "xl": ("SDXL",),
-            "flux": ("Flux", "Klein"),
-            "klein": ("Klein", "Flux"),
-            "qwen": ("Qwen",),
-            "lumina": ("Lumina",),
-            "zit": ("ZIT",),
-            "wan": ("Wan",),
-            "anima": ("Anima",),
-            "ernie": ("Ernie",),
-            "pid": ("PiD",),
-            "krea": ("Krea",),
-        }
         preset = _active_preset()
-        preferred = list(related_categories.get(preset, ()))
+        preferred = list(LORA_RELATED_CATEGORIES.get(preset, ()))
         if "Unknown" in all_categories:
             preferred.append("Unknown")
         return preferred + [category for category in all_categories if category not in preferred]
 
     def get_category_open_categories(self):
         """Expand only model-family groups related to the active UI preset."""
-        related_categories = {
-            "sd": {"SD"},
-            "xl": {"SDXL"},
-            "flux": {"Flux", "Klein"},
-            "klein": {"Flux", "Klein"},
-            "qwen": {"Qwen"},
-            "lumina": {"Lumina"},
-            "zit": {"ZIT"},
-            "wan": {"Wan"},
-            "anima": {"Anima"},
-            "ernie": {"Ernie"},
-            "pid": {"PiD"},
-            "krea": {"Krea"},
-        }
         preset = _active_preset()
-        return {"Unknown", *related_categories.get(preset, set())}
+        return {"Unknown", *LORA_RELATED_CATEGORIES.get(preset, ())}
 
     def create_user_metadata_editor(self, ui, tabname):
         return LoraUserMetadataEditor(ui, tabname, self)

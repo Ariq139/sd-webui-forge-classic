@@ -15,15 +15,12 @@ class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
         shared.refresh_checkpoints()
 
     def create_item(self, name, index=None, enable_filter=True):
-        # `checkpoints_list` is keyed by the checkpoint title, while
-        # `checkpoint_aliases` is rebuilt during model discovery.  Use the
-        # canonical list first so the page remains populated even if aliases
-        # have not been rebuilt yet or a caller supplies a title directly.
+        # Prefer the canonical list; aliases may not be rebuilt yet.
         checkpoint: sd_models.CheckpointInfo = sd_models.checkpoints_list.get(name) or sd_models.checkpoint_aliases.get(name)
         if checkpoint is None:
             return
 
-        path, ext = os.path.splitext(checkpoint.filename)
+        path, _ = os.path.splitext(checkpoint.filename)
         search_terms = [self.search_terms_from_path(checkpoint.filename)]
         if checkpoint.sha256:
             search_terms.append(checkpoint.sha256)
@@ -41,7 +38,7 @@ class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
         }
 
     def list_items(self):
-        # instantiate a list to protect against concurrent modification
+        # Snapshot the mapping before iterating.
         checkpoints = list(sd_models.checkpoints_list.values())
         for index, checkpoint in enumerate(checkpoints):
             item = self.create_item(checkpoint.title, index)

@@ -195,8 +195,7 @@ function modalTileImageToggle(event) {
 
 onAfterUiUpdate(function () {
     let fullImg_preview = gradioApp().querySelectorAll(
-        // Gradio 4 used direct nested buttons. Gradio 5.29 wraps the
-        // detailed image in `.gallery-container > button.preview` instead.
+        // Gradio 5.29 wraps the detailed image in a gallery preview button.
         ".gradio-gallery > button > button > img, .gradio-gallery button.media-button > img[data-testid='detailed-image'], .gradio-gallery > .livePreview",
     );
     if (fullImg_preview != null) {

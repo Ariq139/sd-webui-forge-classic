@@ -305,9 +305,7 @@ class ExtraNetworksPage:
             if filename.startswith(absdir):
                 local_path = filename[len(absdir) :]
 
-        # Keep the directory marker on the card even when the current option
-        # shows hidden items. The browser can then apply a changed setting
-        # without rebuilding every card.
+        # Keep the marker so the browser can apply hidden-directory changes.
         hidden_directory = "/." in local_path or "\\." in local_path
         search_only = hidden_directory and shared.opts.extra_networks_hidden_models == "When searched"
 
@@ -574,9 +572,7 @@ class ExtraNetworksPage:
             dirs = "".join([f"<li>{x}</li>" for x in self.allowed_directories_for_previews()])
             return none_message or shared.html("extra-networks-no-cards.html").format(dirs=dirs)
 
-        # Most Extra Networks pages remain a flat list. Pages that provide a
-        # category on an item get native <details> groups so the browser keeps
-        # each category independently collapsible and open on first display.
+        # Use native collapsible groups when items provide categories.
         if not shared.opts.extra_networks_group_by_category or not any(item.get("category") for item, _ in rendered_items):
             return "".join(item_html for _, item_html in rendered_items)
 

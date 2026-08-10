@@ -176,6 +176,9 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
 
     override_settings = create_override_settings_dict(override_settings_texts)
 
+    if opts.forge_preset == "ideogram":
+        raise RuntimeError("Ideogram 4 is text-to-image only in Forge. Use the txt2img page or the Ideogram 4 page.")
+
     is_batch = mode == 5
 
     height, width = int(height), int(width)
@@ -211,8 +214,8 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     mask = images.fix_image(mask)
 
     if opts.forge_preset == "ltx2":
-        if is_batch:
-            raise RuntimeError("LTX-2.3 image-to-video does not support batch mode through the shared img2img flow yet.")
+        if is_batch or int(n_iter or 1) > 1:
+            raise RuntimeError("LTX-2.3 image-to-video supports one video per request through the shared img2img flow; set Batch Count to 1.")
 
         from modules.ui_ltx2_video import generate_from_preset
 
@@ -225,7 +228,7 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
             width=width,
             height=height,
             frames=batch_size,
-            steps=args[1] if len(args) > 1 and isinstance(args[1], (int, float)) else None,
+            steps=args[0] if args and isinstance(args[0], (int, float)) else None,
             guidance=cfg_scale,
         )
         generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})

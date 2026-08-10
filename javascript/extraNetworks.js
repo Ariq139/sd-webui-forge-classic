@@ -37,9 +37,7 @@ function setupExtraNetworksForTab(tabname) {
         return;
     }
 
-    // Gradio 4 used `.tab-container` here. Gradio 5 keeps the ARIA role but
-    // changed the wrapper classes, so use the role as the stable selector and
-    // keep the old selector as a fallback for custom themes/extensions.
+    // The role selector survives Gradio 4/5 wrapper changes.
     let tabnav = extraTabs.querySelector(":scope > .tab-wrapper > [role='tablist']");
     if (!tabnav) {
         tabnav = extraTabs.querySelector("[role='tablist']");
@@ -55,9 +53,7 @@ function setupExtraNetworksForTab(tabname) {
         tabnav.appendChild(controlsDiv);
     }
 
-    // The pane is generated inside each Gradio Tab. Selecting the pane by
-    // class/id works across Gradio 4 and 5; relying on direct children of the
-    // tab wrapper misses pages in Gradio 5 and leaves every control inert.
+    // Resolve panes by class/id because Gradio nests them differently by version.
     extraTabs.querySelectorAll(".extra-network-pane[id$='_pane']").forEach(function (pane) {
         // tabname_full = {tabname}_{extra_networks_tabname}
         let tabname_full = pane.id.slice(0, -"_pane".length);
@@ -72,9 +68,7 @@ function setupExtraNetworksForTab(tabname) {
         }
 
         let applyFilter = function (force) {
-            // Gradio replaces the HTML component contents after the initial
-            // load and after Refresh. Resolve the current nodes each time so
-            // the callbacks do not keep references to the old page.
+            // Refresh can replace these nodes, so resolve them on each filter.
             let currentSearch = gradioApp().getElementById(tabname_full + "_extra_search");
             let cardsContainer = gradioApp().getElementById(tabname_full + "_cards");
             if (!currentSearch || !cardsContainer) return;
@@ -238,9 +232,7 @@ function extraNetworksNormalizeTabNav(tabname) {
     let tabnav = extraTabs?.querySelector(":scope > .tab-wrapper > [role='tablist']") || extraTabs?.querySelector("[role='tablist']");
     let controls = tabnav?.querySelector(":scope > .extra-networks-controls-div");
     if (tabnav && controls) {
-        // Gradio can reinsert the selected tab before this custom controls
-        // container after a responsive layout change. Keep all page tabs
-        // together and the search/sort controls at the far right.
+        // Keep custom controls after the page tabs after responsive reflow.
         tabnav.appendChild(controls);
     }
 }
@@ -651,12 +643,10 @@ function extraNetworksControlGroupPriorityOnClick(event, tabname, extra_networks
 }
 
 function refreshExtraNetworkCategoryOpenState() {
-    // The server sets the initial state. This pass also covers the hidden
-    // txt2img/img2img panes after Gradio replaces their HTML on preset change.
+    // Reapply the server state after a preset replaces hidden panes.
     const firstCategory = gradioApp().querySelector("details.extra-network-category");
     if (firstCategory && firstCategory.dataset.autoOpenRelated === "false") {
-        // The user disabled preset-driven expansion/collapse. Preserve the
-        // groups' current state instead of overriding it from JavaScript.
+        // Preserve the current state when auto-open is disabled.
         return;
     }
 
@@ -707,9 +697,7 @@ function extraNetworksControlRefreshOnClick(event, tabname, extra_networks_tabna
         tabname + "_" + extra_networks_tabname + "_extra_refresh_internal",
     );
     if (btn_refresh_internal) {
-        // `.click()` produces the normal bubbling click event expected by
-        // Gradio 5. A non-bubbling synthetic Event can be ignored by its
-        // delegated event handler.
+        // Use a real bubbling click so Gradio's delegated handler sees it.
         btn_refresh_internal.click();
     }
 }
@@ -718,15 +706,12 @@ let globalPopup = null;
 let globalPopupInner = null;
 
 function extraNetworksFindElementById(id) {
-    // The metadata editor starts inside Gradio's shadow root, then moves to
-    // document.body when the popup opens. Search both roots on every open so
-    // closing and reopening the editor does not make it appear to vanish.
+    // Gradio may move the editor between its root and document.body.
     return document.getElementById(id) || gradioApp().getElementById(id);
 }
 
 function extraNetworksFindElement(selector) {
-    // The same two-root lookup is needed for the editor's textarea and hidden
-    // trigger button after Gradio has rendered the popup once.
+    // The textarea and trigger can move with the editor too.
     return document.querySelector(selector) || gradioApp().querySelector(selector);
 }
 
@@ -889,7 +874,7 @@ function extraNetworksRequestMetadata(event, extraPage) {
     let card = event.currentTarget.closest(".card");
     let cardName = card ? card.getAttribute("data-name") : null;
     if (cardName == null) {
-        // Metadata actions in tree view are nested one level deeper.
+        // Tree-view metadata actions have one extra wrapper.
         card = event.currentTarget.closest("[data-name]");
         cardName = card ? card.getAttribute("data-name") : null;
     }
@@ -921,13 +906,7 @@ function extraNetworksEditUserMetadata(event, tabname, extraPage) {
     let id = tabname + "_" + extraPage + "_edit_user_metadata";
 
     let editor = extraPageUserMetadataEditors[id] || {};
-    // Re-resolve all components for every opening. The first open can cause
-    // Gradio to replace the hidden editor subtree, invalidating cached nodes.
-    // The metadata viewer replaces the editor inside the shared popup. That
-    // leaves the editor detached from both document roots, so a fresh DOM
-    // lookup would erase the only usable references after view -> close ->
-    // edit. Prefer a current DOM node, but retain the cached Gradio nodes
-    // while they are temporarily detached from the popup.
+    // Re-resolve after Gradio replaces the editor, but retain detached nodes.
     editor.page = extraNetworksFindElementById(id) || editor.page;
     editor.nameTextarea = extraNetworksFindElement("#" + id + "_name textarea") || editor.nameTextarea;
     editor.button = extraNetworksFindElement("#" + id + "_button") || editor.button;
@@ -947,9 +926,7 @@ function extraNetworksEditUserMetadata(event, tabname, extraPage) {
     editor.nameTextarea.value = cardName;
     updateInput(editor.nameTextarea);
 
-    // Keep the editor attached to the visible popup before raising the
-    // hidden Gradio event. This also makes reopening for a different card
-    // use the same live component instead of clicking it while detached.
+    // Attach the live editor before raising its hidden Gradio event.
     popup(editor.page);
     editor.button.click();
 

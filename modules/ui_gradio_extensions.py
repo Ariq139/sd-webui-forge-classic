@@ -15,16 +15,7 @@ _assets_js = ""
 
 
 def _install_gradio_dropdown_compatibility():
-    """Preserve Gradio 4's unset Dropdown values under Gradio 5 validation.
-
-    Gradio 4 allowed an unset single-select Dropdown to submit ``None`` even
-    when its choices list was populated. Gradio 5 validates that value before
-    the callback runs and raises ``Value is not in the list of choices``.
-    Several optional webui controls rely on the old unset state, including
-    hidden Hires.fix controls and settings controls. Keep ``None`` as ``None``
-    so the backend can apply its existing defaults instead of inventing a
-    choice or preventing the event from running.
-    """
+    """Keep Gradio 4's unset Dropdown values valid under Gradio 5."""
 
     original_preprocess = gr.Dropdown.preprocess
     if getattr(original_preprocess, "_sd_webui_empty_multiselect_compat", False):
@@ -60,15 +51,7 @@ def webpath(fn):
 
 
 def javascript_js():
-    """Load the legacy scripts in order through Gradio 5's JS hook.
-
-    Gradio 4 inserted ordinary script tags into the page. Gradio 5 renders
-    ``head`` as HTML after the page is mounted, so those tags are inert in this
-    application. The Blocks JS hook does run after hydration, but this browser
-    context intentionally does not expose ``window.eval``. Load each file with
-    a real script element and await its completion so the old global callback
-    queues and extension ordering are retained without either failure mode.
-    """
+    """Load legacy scripts in order after Gradio 5 hydrates the page."""
 
     sources = []
     script_js = os.path.join(script_path, "script.js")
@@ -84,11 +67,12 @@ def javascript_js():
         for source_path in sources
     ]
     localization_js = localization.localization_js(shared.opts.localization).replace("</", "<\\/")
+    scripts_json = json.dumps(source_urls).replace("</", "<\\/")
     theme_js = f'set_theme({json.dumps(shared.cmd_opts.theme)});' if shared.cmd_opts.theme else ""
 
     return f'''async function() {{
     {localization_js};
-    const scripts = {json.dumps(source_urls).replace("</", "<\\/")};
+    const scripts = {scripts_json};
     for (const item of scripts) {{
         await new Promise((resolve, reject) => {{
             const script = document.createElement("script");
@@ -119,9 +103,7 @@ def css_text():
 
     light = resolve_var("background_fill_primary")
     dark = resolve_var("background_fill_primary_dark")
-    # The browser's overscroll area belongs to `html`, while Gradio applies
-    # the dark theme class to `body`. Set both elements and mirror the body
-    # theme on html so manual dark mode cannot expose a white overscroll area.
+    # Style html as well as body so dark mode covers overscroll.
     return (
         f"html, body {{ background-color: {light} !important; }} "
         f"body.dark {{ background-color: {dark} !important; }} "

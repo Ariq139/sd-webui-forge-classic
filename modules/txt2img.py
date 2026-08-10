@@ -63,6 +63,9 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
 
 
 def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
+    if opts.forge_preset in {"ltx2", "ideogram"}:
+        return gallery, generation_info, "This preset does not support the Forge Hires fix/upscale action.", ""
+
     assert len(gallery) > 0, "No image to upscale"
 
     if gallery_index < 0 or gallery_index >= len(gallery):
@@ -133,6 +136,10 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
     if opts.forge_preset == "ltx2":
         from modules.ui_ltx2_video import generate_from_preset
 
+        if int(args[4] or 1) > 1:
+            status = "LTX-2.3 shared txt2img supports one video per request; set Batch Count to 1."
+            return gr.update(value=None, visible=False), gr.update(value=None, visible=False), json.dumps({"infotexts": [status]}), plaintext_to_html(status), ""
+
         prompt, negative_prompt = args[1], args[2]
         prompt_styles = args[3] or []
         prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles)
@@ -150,6 +157,29 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
         return (
             gr.update(value=None, visible=False),
             gr.update(value=video_path, visible=bool(video_path)),
+            generation_info_js,
+            plaintext_to_html(status),
+            "",
+        )
+
+    if opts.forge_preset == "ideogram":
+        from modules.ui_ideogram import generate_from_preset
+
+        prompt = args[1]
+        prompt_styles = args[3] or []
+        prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles)
+        images, status = generate_from_preset(
+            prompt,
+            width=args[9],
+            height=args[8],
+            num_images=int(args[4] or 1) * int(args[5] or 1),
+            steps=args[27] if len(args) > 27 and isinstance(args[27], (int, float)) else None,
+            guidance=args[6],
+        )
+        generation_info_js = json.dumps({"infotexts": [status] * max(len(images), 1), "prompt": prompt})
+        return (
+            gr.update(value=images, visible=bool(images)),
+            gr.update(value=None, visible=False),
             generation_info_js,
             plaintext_to_html(status),
             "",

@@ -217,31 +217,12 @@ def clear_references():
 
 def configure_opts_onchange():
     from modules import shared, ui_tempdir
+    from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS
 
     shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
     shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
     shared.opts.onchange("setting_allocated_vram", reserve_memory)
-    memory_feature_keys = (
-        "forge_memory_management_enabled",
-        "forge_memory_budgets_enabled",
-        "forge_memory_pinned_memory_enabled",
-        "forge_memory_async_transfers_enabled",
-        "forge_memory_residency_hints_enabled",
-        "forge_memory_working_vram_mb",
-        "forge_memory_unet_budget_mb",
-        "forge_memory_text_encoder_budget_mb",
-        "forge_memory_vae_budget_mb",
-        "forge_memory_controlnet_budget_mb",
-        "forge_memory_pinned_memory_percent",
-        "forge_memory_vram_safety_percent",
-        "forge_memory_async_streams",
-        "forge_memory_pinned_components",
-        "forge_memory_keep_unet_loaded",
-        "forge_memory_keep_text_encoder_loaded",
-        "forge_memory_keep_vae_loaded",
-        "forge_memory_keep_controlnet_loaded",
-    )
-    for key in memory_feature_keys:
+    for key in MEMORY_SETTING_KEYS:
         shared.opts.onchange(key, configure_memory_features, call=False)
     configure_memory_features()
     shared.opts.onchange("klein_no_reference", clear_references)

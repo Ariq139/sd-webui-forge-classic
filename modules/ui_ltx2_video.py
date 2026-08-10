@@ -8,7 +8,16 @@ import gradio as gr
 import torch
 
 from backend import memory_management
-from modules import shared
+from modules import paths, shared
+from modules_forge.native_models import is_compatible_model, resolve_model_path
+from modules_forge.native_pipeline_speed import (
+    ATTENTION_BACKEND_CHOICES,
+    OFFLOAD_CHOICES,
+    configure_pipeline,
+    configure_prompt_cache,
+    configure_vae_tiling,
+    resolve_vae_tiling_mode,
+)
 
 
 logger = logging.getLogger("ltx2_video")
@@ -17,7 +26,11 @@ _pipeline_key = None
 _pipeline_lock = threading.RLock()
 _ltx_components = []
 _preset_bound = False
-LTX2_MODEL_DEFAULT = "diffusers/LTX-2.3-Diffusers"
+_DECODER_ROOTS = (
+    os.path.join(paths.models_path, "VAE"),
+    os.path.join(paths.models_path, "diffusers"),
+)
+_DECODER_EXTENSIONS = {".safetensors", ".sft", ".ckpt"}
 
 
 class _LTXInterrupted(Exception):
@@ -28,15 +41,78 @@ def _option(name: str, default):
     return getattr(shared.opts, name, default)
 
 
+def _auto_vae_tiling_value() -> bool:
+    data = getattr(shared.opts, "data", {})
+    if "ltx2_auto_vae_tiling" not in data and "ltx2_tile_vae" in data:
+        return False
+    return bool(_option("ltx2_auto_vae_tiling", True))
+
+
 def _model_path():
-    configured = _option("ltx2_model_path", LTX2_MODEL_DEFAULT)
-    selected = _option("forge_checkpoint_ltx2", None)
-    if selected and selected != LTX2_MODEL_DEFAULT:
-        return selected
-    return configured or selected or LTX2_MODEL_DEFAULT
+    for value in (_option("forge_checkpoint_ltx2", ""), _option("ltx2_model_path", "")):
+        if is_compatible_model(value, "LTX2"):
+            return value
+    return ""
+
+
+def _resolve_prunavaed_path(value: str) -> str:
+    value = str(value or "").strip()
+    if not value or os.path.exists(value):
+        return os.path.abspath(value) if value and os.path.exists(value) else value
+    for root in (*_DECODER_ROOTS, paths.models_path):
+        candidate = os.path.join(root, value)
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return value
+
+
+def _prunavaed_choices() -> list[str]:
+    values = []
+    for root in _DECODER_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        for entry in os.scandir(root):
+            entry_name = entry.name.lower()
+            if "pruna" not in entry_name and "ltx" not in entry_name:
+                continue
+            has_config = any(
+                os.path.isfile(os.path.join(entry.path, config_name))
+                for config_name in ("config.json", "model_index.json")
+            )
+            if entry.is_dir() and has_config:
+                values.append(entry.name)
+            elif entry.is_file() and os.path.splitext(entry.name)[1].lower() in _DECODER_EXTENSIONS:
+                values.append(entry.name)
+
+    configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
+    if configured and os.path.exists(configured):
+        configured_path = os.path.abspath(configured)
+        for root in _DECODER_ROOTS:
+            if os.path.dirname(configured_path).lower() == os.path.abspath(root).lower():
+                configured = os.path.basename(configured_path)
+                break
+        if configured not in values:
+            values.append(configured)
+    return sorted(set(values), key=shared.natural_sort_key)
+
+
+def _prunavaed_value() -> str | None:
+    configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
+    choices = _prunavaed_choices()
+    if configured in choices:
+        return configured
+    configured_path = _resolve_prunavaed_path(configured)
+    if os.path.exists(configured_path):
+        configured_path = os.path.abspath(configured_path)
+        for choice in choices:
+            if os.path.abspath(_resolve_prunavaed_path(choice)) == configured_path:
+                return choice
+    return None
 
 
 def _save_option(name: str, value):
+    if value is None:
+        value = ""
     shared.opts.set(name, value)
     if name == "ltx2_model_path":
         shared.opts.set("forge_checkpoint_ltx2", value)
@@ -47,12 +123,17 @@ def _sync_preset_controls(preset: str):
     if preset != "ltx2":
         return [gr.skip() for _ in _ltx_components]
 
+    auto_vae_tiling = _auto_vae_tiling_value()
     return [
         _model_path(),
-        _option("ltx2_prunavaed_path", ""),
+        _prunavaed_value(),
         _option("ltx2_offload", "model"),
+        _option("ltx2_attention_backend", "automatic"),
         _option("ltx2_precision", "automatic"),
-        _option("ltx2_tile_vae", True),
+        gr.update(value=auto_vae_tiling),
+        gr.update(value=_option("ltx2_tile_vae", True), interactive=not auto_vae_tiling),
+        _option("ltx2_prompt_cache", True),
+        _option("ltx2_compile", False),
         _option("ltx2_t2i_width", 768),
         _option("ltx2_t2i_height", 512),
         _option("ltx2_t2i_batch_size", 121),
@@ -71,7 +152,19 @@ def _sync_preset_controls(preset: str):
     ]
 
 
-def bind_preset(preset_component):
+def _sync_model_to_page(preset: str, model_path: str):
+    return (model_path or "") if preset == "ltx2" else gr.skip()
+
+
+def _sync_model_to_quicksettings(preset: str, model_path: str):
+    return model_path if preset == "ltx2" else gr.skip()
+
+
+def _sync_decoder_to_page(preset: str, decoder: str):
+    return decoder if preset == "ltx2" else gr.skip()
+
+
+def bind_preset(preset_component, checkpoint_component=None, decoder_component=None):
     global _preset_bound
 
     if _preset_bound or not _ltx_components:
@@ -84,6 +177,29 @@ def bind_preset(preset_component):
         queue=False,
         show_progress=False,
     )
+    if checkpoint_component is not None:
+        checkpoint_component.change(
+            fn=_sync_model_to_page,
+            inputs=[preset_component, checkpoint_component],
+            outputs=[_ltx_components[0]],
+            queue=False,
+            show_progress=False,
+        )
+        _ltx_components[0].change(
+            fn=_sync_model_to_quicksettings,
+            inputs=[preset_component, _ltx_components[0]],
+            outputs=[checkpoint_component],
+            queue=False,
+            show_progress=False,
+        )
+    if decoder_component is not None:
+        decoder_component.change(
+            fn=_sync_decoder_to_page,
+            inputs=[preset_component, decoder_component],
+            outputs=[_ltx_components[1]],
+            queue=False,
+            show_progress=False,
+        )
     _preset_bound = True
 
 
@@ -107,6 +223,10 @@ def _device() -> torch.device:
 def _load_prunavaed(path: str, dtype: torch.dtype):
     from diffusers import AutoencoderKLLTX2Video
 
+    path = _resolve_prunavaed_path(path)
+    if os.path.isfile(path) and hasattr(AutoencoderKLLTX2Video, "from_single_file"):
+        return AutoencoderKLLTX2Video.from_single_file(path, torch_dtype=dtype)
+
     last_error = None
     for subfolder in ("vae", None):
         try:
@@ -120,30 +240,16 @@ def _load_prunavaed(path: str, dtype: torch.dtype):
     raise RuntimeError(f"Could not load PrunaVAED from {path}: {last_error}")
 
 
-def _configure_pipeline(pipe, device: torch.device, offload: str, tile_vae: bool):
-    if tile_vae and hasattr(pipe.vae, "enable_tiling"):
-        pipe.vae.enable_tiling()
-
-    if device.type != "cuda":
-        pipe.to(device)
-    elif offload == "sequential":
-        pipe.enable_sequential_cpu_offload(device=device)
-    elif offload == "model":
-        pipe.enable_model_cpu_offload(device=device)
-    else:
-        pipe.to(device)
-
-
-def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload: str, tile_vae: bool, image_mode: bool):
+def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload: str, attention_backend: str, compile_enabled: bool, prompt_cache: bool, image_mode: bool):
     global _pipeline, _pipeline_key
 
     from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
 
-    model_path = str(model_path or "").strip()
-    prunavaed_path = str(prunavaed_path or "").strip()
+    model_path = resolve_model_path(model_path)
+    prunavaed_path = _resolve_prunavaed_path(prunavaed_path)
     device = _device()
     dtype = _default_dtype(precision)
-    key = (model_path, prunavaed_path, str(dtype), str(device), offload, bool(tile_vae), bool(image_mode))
+    key = (model_path, prunavaed_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), bool(image_mode))
 
     with _pipeline_lock:
         if _pipeline is not None and _pipeline_key == key:
@@ -163,7 +269,8 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
 
         pipeline_class = LTX2ImageToVideoPipeline if image_mode else LTX2Pipeline
         _pipeline = pipeline_class.from_pretrained(model_path, **pipeline_kwargs)
-        _configure_pipeline(_pipeline, device, offload, tile_vae)
+        configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
+        configure_prompt_cache(_pipeline, prompt_cache, logger)
         _pipeline_key = key
         return _pipeline
 
@@ -216,8 +323,12 @@ def generate(
     model_path: str,
     prunavaed_path: str,
     offload: str,
+    attention_backend: str,
     precision: str,
+    auto_vae_tiling: bool,
     tile_vae: bool,
+    prompt_cache: bool,
+    compile_enabled: bool,
     prompt: str,
     negative_prompt: str,
     image,
@@ -239,7 +350,7 @@ def generate(
     progress=gr.Progress(track_tqdm=True),
 ):
     if not model_path or not model_path.strip():
-        return None, "Enter an LTX-2.3 Diffusers model path or Hugging Face repository ID."
+        return None, "Select a compatible LTX-2.3 Diffusers model from the global checkpoint dropdown."
     if not prompt or not prompt.strip():
         return None, "Enter a prompt."
 
@@ -250,7 +361,15 @@ def generate(
         if frames < 9:
             return None, "LTX-2.3 requires at least 9 frames."
 
-        pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, tile_vae, image is not None)
+        pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None)
+        configure_vae_tiling(
+            pipe.vae,
+            resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),
+            _device(),
+            width,
+            height,
+            frames,
+        )
 
         shared.state.sampling_steps = steps
         shared.state.sampling_step = 0
@@ -332,10 +451,14 @@ def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width
     """Run LTX with the values stored by the shared ``ltx2`` preset."""
     return generate(
         _model_path(),
-        _option("ltx2_prunavaed_path", ""),
+        _prunavaed_value() or "",
         _option("ltx2_offload", "model"),
+        _option("ltx2_attention_backend", "automatic"),
         _option("ltx2_precision", "automatic"),
+        _auto_vae_tiling_value(),
         _option("ltx2_tile_vae", True),
+        _option("ltx2_prompt_cache", True),
+        _option("ltx2_compile", False),
         prompt,
         negative_prompt,
         image,
@@ -366,59 +489,72 @@ def create_ui():
         gr.Markdown(
             "## LTX-2.3 Video\n"
             "Use a Diffusers-format LTX-2.3 model for text-to-video or image-to-video. "
-            "PrunaVAED is an optional LTX-2.3 decoder replacement."
+            "The optional VAE / Decoder selector is in the global quicksettings row. "
+            "LTX's video VAE, audio stack, and text encoder come from the selected model."
         )
 
-        with gr.Row():
-            model_path = gr.Textbox(value=_model_path(), label="LTX-2.3 model path or Hugging Face ID", scale=3)
-            prunavaed_path = gr.Textbox(value=_option("ltx2_prunavaed_path", ""), label="PrunaVAED path or Hugging Face ID (optional)", scale=2)
+        # The global quicksettings row owns the model and decoder selections.
+        model_path = gr.Textbox(value=_model_path(), visible=False)
+        prunavaed_path = gr.Textbox(value=_prunavaed_value() or "", visible=False)
 
         with gr.Row():
-            offload = gr.Radio(["none", "model", "sequential"], value=_option("ltx2_offload", "model"), label="CPU offload")
+            offload = gr.Radio(OFFLOAD_CHOICES, value=_option("ltx2_offload", "model"), label="CPU offload")
+            attention_backend = gr.Dropdown(ATTENTION_BACKEND_CHOICES, value=_option("ltx2_attention_backend", "automatic"), label="Attention backend")
             precision = gr.Radio(["automatic", "bfloat16", "float16"], value=_option("ltx2_precision", "automatic"), label="Precision")
-            tile_vae = gr.Checkbox(value=_option("ltx2_tile_vae", True), label="Tile VAE")
-            interrupt_button = gr.Button("Interrupt", variant="stop")
-            unload_button = gr.Button("Unload LTX-2.3", variant="secondary")
+            auto_vae_tiling = gr.Checkbox(value=_auto_vae_tiling_value(), label="Automatic VAE tiling")
+            tile_vae = gr.Checkbox(value=_option("ltx2_tile_vae", True), label="Force VAE tiling", interactive=not _auto_vae_tiling_value())
+            prompt_cache = gr.Checkbox(value=_option("ltx2_prompt_cache", True), label="Prompt cache")
+            compile_enabled = gr.Checkbox(value=_option("ltx2_compile", False), label="Compile denoiser")
 
         with gr.Row():
-            with gr.Column():
+            with gr.Column(scale=3):
                 prompt = gr.Textbox(label="Prompt", lines=5)
                 negative_prompt = gr.Textbox(label="Negative prompt", lines=3)
                 image = gr.Image(label="Image condition (optional)", type="pil")
-            with gr.Column():
-                video_output = gr.Video(label="Output", autoplay=True, include_audio=True)
+            with gr.Column(scale=1, min_width=180):
+                generate_button = gr.Button("Generate", variant="primary")
+                with gr.Row():
+                    interrupt_button = gr.Button("Interrupt", variant="stop")
+                    unload_button = gr.Button("Unload", variant="secondary")
                 status = gr.Markdown()
 
         with gr.Row():
-            width = gr.Number(value=_option("ltx2_t2i_width", 768), minimum=64, maximum=2048, step=32, label="Width")
-            height = gr.Number(value=_option("ltx2_t2i_height", 512), minimum=64, maximum=2048, step=32, label="Height")
-            frames = gr.Number(value=_option("ltx2_t2i_batch_size", 121), minimum=9, maximum=241, step=8, label="Frames")
-            fps = gr.Number(value=_option("ltx2_fps", 24), minimum=1, maximum=60, step=1, label="FPS")
+            with gr.Column(scale=2):
+                with gr.Row():
+                    width = gr.Number(value=_option("ltx2_t2i_width", 768), minimum=64, maximum=2048, step=32, label="Width")
+                    height = gr.Number(value=_option("ltx2_t2i_height", 512), minimum=64, maximum=2048, step=32, label="Height")
+                    frames = gr.Number(value=_option("ltx2_t2i_batch_size", 121), minimum=9, maximum=241, step=8, label="Frames")
+                    fps = gr.Number(value=_option("ltx2_fps", 24), minimum=1, maximum=60, step=1, label="FPS")
+                with gr.Row():
+                    steps = gr.Number(value=_option("ltx2_t2i_step", 30), minimum=1, maximum=100, step=1, label="Sampling steps")
+                    guidance = gr.Number(value=_option("ltx2_t2i_cfg", 3.0), minimum=0, maximum=20, step=0.1, label="CFG scale")
+                    seed = gr.Number(value=_option("ltx2_seed", -1), minimum=-1, maximum=2**31 - 1, step=1, label="Seed")
 
-        with gr.Row():
-            steps = gr.Number(value=_option("ltx2_t2i_step", 30), minimum=1, maximum=100, step=1, label="Steps")
-            guidance = gr.Number(value=_option("ltx2_t2i_cfg", 3.0), minimum=0, maximum=20, step=0.1, label="Video CFG")
-            stg = gr.Number(value=_option("ltx2_stg", 1.0), minimum=0, maximum=10, step=0.1, label="Video STG")
-            modality = gr.Number(value=_option("ltx2_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Video modality")
-
-        with gr.Row():
-            audio_guidance = gr.Number(value=_option("ltx2_audio_guidance", 7.0), minimum=0, maximum=20, step=0.1, label="Audio CFG")
-            audio_stg = gr.Number(value=_option("ltx2_audio_stg", 1.0), minimum=0, maximum=10, step=0.1, label="Audio STG")
-            audio_modality = gr.Number(value=_option("ltx2_audio_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Audio modality")
-            guidance_rescale = gr.Number(value=_option("ltx2_guidance_rescale", 0.7), minimum=0, maximum=1, step=0.05, label="Guidance rescale")
-
-        with gr.Row():
-            guidance_blocks = gr.Textbox(value=_option("ltx2_guidance_blocks", "28"), label="Spatio-temporal guidance blocks")
-            seed = gr.Number(value=_option("ltx2_seed", -1), minimum=-1, maximum=2**31 - 1, step=1, label="Seed")
-            include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio")
-            generate_button = gr.Button("Generate video", variant="primary")
+                with gr.Accordion("LTX-2.3 options", open=False):
+                    with gr.Row():
+                        stg = gr.Number(value=_option("ltx2_stg", 1.0), minimum=0, maximum=10, step=0.1, label="Video STG")
+                        modality = gr.Number(value=_option("ltx2_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Video modality")
+                        guidance_rescale = gr.Number(value=_option("ltx2_guidance_rescale", 0.7), minimum=0, maximum=1, step=0.05, label="Guidance rescale")
+                    with gr.Row():
+                        audio_guidance = gr.Number(value=_option("ltx2_audio_guidance", 7.0), minimum=0, maximum=20, step=0.1, label="Audio CFG")
+                        audio_stg = gr.Number(value=_option("ltx2_audio_stg", 1.0), minimum=0, maximum=10, step=0.1, label="Audio STG")
+                        audio_modality = gr.Number(value=_option("ltx2_audio_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Audio modality")
+                    with gr.Row():
+                        guidance_blocks = gr.Textbox(value=_option("ltx2_guidance_blocks", "28"), label="Spatio-temporal guidance blocks")
+                        include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio")
+            with gr.Column(scale=2):
+                video_output = gr.Video(label="Output", autoplay=True, include_audio=True)
 
         _ltx_components = [
             model_path,
             prunavaed_path,
             offload,
+            attention_backend,
             precision,
+            auto_vae_tiling,
             tile_vae,
+            prompt_cache,
+            compile_enabled,
             width,
             height,
             frames,
@@ -438,10 +574,13 @@ def create_ui():
 
         settings_to_save = {
             model_path: "ltx2_model_path",
-            prunavaed_path: "ltx2_prunavaed_path",
             offload: "ltx2_offload",
+            attention_backend: "ltx2_attention_backend",
             precision: "ltx2_precision",
+            auto_vae_tiling: "ltx2_auto_vae_tiling",
             tile_vae: "ltx2_tile_vae",
+            prompt_cache: "ltx2_prompt_cache",
+            compile_enabled: "ltx2_compile",
             width: "ltx2_t2i_width",
             height: "ltx2_t2i_height",
             frames: "ltx2_t2i_batch_size",
@@ -465,8 +604,12 @@ def create_ui():
             model_path,
             prunavaed_path,
             offload,
+            attention_backend,
             precision,
+            auto_vae_tiling,
             tile_vae,
+            prompt_cache,
+            compile_enabled,
             prompt,
             negative_prompt,
             image,
@@ -489,6 +632,13 @@ def create_ui():
         generate_ltx = wrap_gradio_gpu_call(generate, extra_outputs=[None])
         generate_button.click(generate_ltx, inputs=inputs, outputs=[video_output, status])
         prompt.submit(generate_ltx, inputs=inputs, outputs=[video_output, status])
+        auto_vae_tiling.change(
+            fn=lambda enabled: gr.update(interactive=not enabled),
+            inputs=[auto_vae_tiling],
+            outputs=[tile_vae],
+            queue=False,
+            show_progress=False,
+        )
         interrupt_button.click(interrupt_generation, outputs=[])
         unload_button.click(unload, outputs=[])
 
