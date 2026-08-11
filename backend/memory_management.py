@@ -47,7 +47,7 @@ setup_logger(logger)
 cpu = torch.device("cpu")
 
 
-# Optional MMGP-style controls layered onto Forge's existing manager.
+# Optional controls for the alternate MMGP manager.
 # Reference: https://github.com/deepbeepmeep/mmgp
 MEMORY_FEATURES = {
     "enabled": False,
@@ -381,11 +381,8 @@ if cpu_state is not CPUState.GPU:
 if cpu_state is CPUState.MPS:
     vram_state = VRAMState.SHARED
 
-if args.mmgp and cpu_state is CPUState.GPU:
-    # MMGP overrides Forge VRAM mode flags when enabled.
-    vram_state = VRAMState.NORMAL_VRAM
-    set_vram_to = VRAMState.NORMAL_VRAM
-    logger.info("MMGP enabled: overriding Forge VRAM mode flags")
+FORGE_VRAM_STATE = vram_state
+FORGE_SET_VRAM_TO = set_vram_to
 
 logger.info(f"VRAM State: {vram_state.name}")
 
@@ -640,6 +637,16 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
 
 
 def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False):
+    if mmgp_enabled() and feature_enabled("enabled"):
+        try:
+            from backend.mmgp_alternate import get_manager_for_models
+
+            alternate_manager = get_manager_for_models(models)
+            if alternate_manager is not None and alternate_manager.load(models):
+                return
+        except Exception:
+            logger.exception("Reference MMGP setup failed; falling back to Forge memory management")
+
     execution_start_time = time.perf_counter()
     cleanup_models_gc(target=models)
 
@@ -1421,6 +1428,18 @@ def unload_model(model: "ModelPatcher") -> bool:
 
 
 def unload_all_models():
+    try:
+        from backend.mmgp_alternate import release as release_alternate_mmgp
+
+        release_alternate_mmgp()
+    except ImportError:
+        pass
+    try:
+        from backend.mmgp_native import release_all as release_native_mmgp
+
+        release_native_mmgp()
+    except ImportError:
+        pass
     free_memory(1e30, get_torch_device())
 
 
@@ -1604,7 +1623,12 @@ def feature_enabled(feature: str) -> bool:
 
 
 def mmgp_enabled() -> bool:
-    """Whether MMGP may control model residency."""
+    """Whether the optional MMGP path is active at runtime."""
+    return bool(getattr(args, "mmgp", False) and feature_enabled("enabled"))
+
+
+def mmgp_flag_present() -> bool:
+    """Whether the user requested the optional MMGP path at launch."""
     return bool(getattr(args, "mmgp", False))
 
 
@@ -1658,8 +1682,11 @@ def configure_memory_features(
     async_streams: int = 2,
     pinned_components: set[str] | list[str] | tuple[str, ...] = (),
     residency_components: set[str] | list[str] | tuple[str, ...] = (),
+    compile_enabled: bool = False,
+    partial_pinning: bool = False,
+    quantization_type: str = "qint8",
 ):
-    """Apply optional MMGP-style settings while keeping Forge authoritative."""
+    """Apply optional MMGP settings; Forge remains the fallback manager."""
     global MEMORY_FEATURES
     global MEMORY_BUDGETS_BYTES
     global MEMORY_RESIDENCY_COMPONENTS
@@ -1672,9 +1699,11 @@ def configure_memory_features(
     global NUM_STREAMS
     global PINNING_ENABLED
     global MAX_PINNED_MEMORY
+    global vram_state
+    global set_vram_to
 
     # Saved settings are inactive without --mmgp.
-    effective_enabled = bool(enabled and mmgp_enabled())
+    effective_enabled = bool(enabled and mmgp_flag_present())
     MEMORY_FEATURES = {
         "enabled": effective_enabled,
         "budgets": bool(budgets),
@@ -1682,6 +1711,13 @@ def configure_memory_features(
         "async_transfers": bool(async_transfers),
         "residency_hints": bool(residency_hints),
     }
+    if effective_enabled and cpu_state is CPUState.GPU:
+        vram_state = VRAMState.NORMAL_VRAM
+        set_vram_to = VRAMState.NORMAL_VRAM
+        logger.debug("MMGP enabled: overriding Forge VRAM mode flags")
+    else:
+        vram_state = FORGE_VRAM_STATE
+        set_vram_to = FORGE_SET_VRAM_TO
     MEMORY_BUDGETS_BYTES = {}
     for component, value in (model_budgets_mb or {}).items():
         value = _setting_number(value, 0)
@@ -1722,6 +1758,9 @@ def configure_memory_features(
         MEMORY_VRAM_SAFETY_PERCENT if feature_enabled("enabled") else 0,
         NUM_STREAMS,
         PINNING_ENABLED,
+        bool(compile_enabled) if effective_enabled else False,
+        bool(partial_pinning) if effective_enabled else False,
+        str(quantization_type) if effective_enabled else "",
     )
     if MEMORY_RUNTIME_SIGNATURE is not None and runtime_signature != MEMORY_RUNTIME_SIGNATURE:
         logger.info("Memory-management mode changed; unloading models before applying the new mode")

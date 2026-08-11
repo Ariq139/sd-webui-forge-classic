@@ -209,15 +209,23 @@ options_templates.update(
         ("memory-management", "Memory Management", "system"),
         {
             "forge_memory_management_explanation": OptionHTML("""
-Optional MMGP-style controls for Forge. They are off by default and remain separate from Forge's normal memory manager.<br>
+Optional reference MMGP controls for Forge. They are off by default and remain separate from Forge's normal memory manager.<br>
 Launch with <b>--mmgp</b> to allow these saved settings to affect model residency. Without that flag, the values remain saved but all optional MMGP features stay disabled.<br>
-When enabled, MMGP takes precedence over Forge's <b>--gpu-only</b>, <b>--highvram</b>, <b>--lowvram</b>, and <b>--novram</b> modes. CPU and explicit component-device options remain authoritative.<br>
+When enabled, the alternate manager takes precedence over Forge's <b>--gpu-only</b>, <b>--highvram</b>, <b>--lowvram</b>, and <b>--novram</b> modes. CPU and explicit component-device options remain authoritative.<br>
 Choose a profile, or choose <b>Custom</b> to tune each control below. The profile dropdown includes MMGP's target minimum hardware values: RAM / VRAM in GB. They are not hard caps; Windows generally needs about 16 GB more system RAM than the Linux figures.<br>
-Lower budgets can reduce VRAM use but may slow generation.<br>
+The alternate path uses MMGP low-RAM component loading where the native Diffusers layout is compatible, then controls residency, pinned RAM, budgets, asynchronous transfers, optional quantization, and optional compilation. Unsupported or special Forge formats fall back to their normal loader.<br>
 Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
             """),
+            "forge_oom_retry_enabled": OptionInfo(True, "Automatically retry once after out-of-memory").info("clears Forge, MMGP, and native pipeline allocations before retrying; persistent OOMs still return an error"),
+            "forge_memory_dynamic_lora_enabled": OptionInfo(True, "Use dynamic LoRA loading with MMGP").info("keeps compatible LoRA weights off the model until their layer is used; may reduce VRAM use but can slow generation"),
+            "forge_memory_persistent_cache_enabled": OptionInfo(False, "Use persistent MMGP component cache").info("stores compatible native Diffusers components under the configured cache directory after a successful load; disabled by default"),
+            "forge_memory_cache_directory": OptionInfo("models/MMGP-cache", "MMGP cache directory", gr.Textbox).info("relative paths are resolved from the Forge installation directory"),
             "forge_memory_profile": OptionInfo("Custom", "Memory profile", gr.Dropdown, {"choices": MEMORY_PROFILE_CHOICES}).info("applies a starting configuration to the controls below; click Apply settings to save it"),
-            "forge_memory_management_enabled": OptionInfo(False, "Enable optional memory-management features").info("master switch; also requires --mmgp at launch; Forge's normal manager remains active"),
+            "forge_memory_management_enabled": OptionInfo(False, "Enable alternate MMGP memory management").info("master switch; also requires --mmgp at launch"),
+            "forge_memory_alternate_quantization": OptionInfo(False, "Quantize the transformer in the alternate manager").info("uses MMGP's on-the-fly 8-bit quantization; leave disabled for models already quantized by Forge"),
+            "forge_memory_quantization_type": OptionInfo("qint8", "MMGP quantization type", gr.Dropdown, {"choices": ["qint8", "qint4", "qfloat8"]}).info("used only when alternate quantization is enabled; qint8 is the safest default"),
+            "forge_memory_compile_enabled": OptionInfo(False, "Enable MMGP PyTorch compilation").info("requires a compatible Triton/compiler setup; native pipeline compile is also gated by this"),
+            "forge_memory_partial_pinning_enabled": OptionInfo(False, "Allow partial RAM pinning").info("lets MMGP pin only the most useful model blocks when full pinning would exceed the reserved RAM limit"),
             "forge_memory_budgets_enabled": OptionInfo(False, "Enable per-component VRAM budgets").info("limits loaded weight memory for the diffusion model, text encoder, VAE, and ControlNet"),
             "forge_memory_pinned_memory_enabled": OptionInfo(False, "Enable pinned CPU memory").info("can speed CPU-to-GPU transfers at the cost of higher RAM usage"),
             "forge_memory_async_transfers_enabled": OptionInfo(False, "Enable asynchronous weight transfers").info("uses additional CUDA/XPU streams to overlap weight movement"),

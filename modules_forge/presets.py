@@ -275,7 +275,7 @@ def register(options_templates: dict):
 
             options_templates.update(
                 options_section(
-                    ("ui_ltx2", "LTX-2.3", "presets"),
+                    ("ui_ltx2", "LTX2", "presets"),
                     {
                         "ltx2_model_path": OptionInfo("diffusers/LTX-2.3-Diffusers", "Model path or Hugging Face ID", Textbox),
                         "ltx2_prunavaed_path": OptionInfo("", "VAE / Decoder", Textbox),
@@ -303,7 +303,7 @@ def register(options_templates: dict):
         if arch is PresetArch.ideogram:
             options_templates.update(
                 options_section(
-                    ("ui_ideogram", "Ideogram 4", "presets"),
+                    ("ui_ideogram", "IDEOGRAM", "presets"),
                     {
                         "ideogram_model_path": OptionInfo("ideogram-ai/ideogram-v4", "Model path or Hugging Face ID", Textbox),
                         "ideogram_offload": OptionInfo("model", "CPU offload", Radio, {"choices": OFFLOAD_CHOICES}),

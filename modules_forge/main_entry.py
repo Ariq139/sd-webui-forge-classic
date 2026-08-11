@@ -84,6 +84,12 @@ def module_choices() -> list[tuple[str, str]]:
     ]
 
 
+def valid_module_values(values, choices: list[tuple[str, str]]) -> list[str]:
+    """Keep saved module selections valid after a refresh or preset switch."""
+    valid = {value for _, value in choices}
+    return [os.path.basename(value) for value in values or [] if os.path.basename(value) in valid]
+
+
 def make_checkpoint_manager_ui():
     global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype
 
@@ -97,9 +103,9 @@ def make_checkpoint_manager_ui():
     preset = getattr(shared.opts, "forge_preset", "sd")
     ckpt_list = checkpoint_choices(preset, ckpt_list)
     checkpoint_value = checkpoint_value_for_preset(preset, ckpt_list)
-    module_value = [os.path.basename(x) for x in shared.opts.forge_additional_modules if os.path.basename(x) in vae_list]
-    module_label = "VAE / Text Encoder"
     module_choices_value = module_choices()
+    module_value = valid_module_values(shared.opts.forge_additional_modules, module_choices_value)
+    module_label = "VAE / Text Encoder"
     module_multiselect = True
     module_visible = preset not in NATIVE_PIPELINE_PRESETS
 
@@ -124,6 +130,7 @@ def make_checkpoint_manager_ui():
         choices=ckpt_list,
         elem_id="setting_sd_model_checkpoint",
         elem_classes=["model_selection"],
+        interactive=bool(ckpt_list),
     )
 
     ui_vae = gr.Dropdown(
@@ -134,6 +141,7 @@ def make_checkpoint_manager_ui():
         visible=module_visible,
         elem_id="setting_sd_modules",
         elem_classes=["model_selection"],
+        interactive=bool(module_choices_value),
     )
 
     def refresh_model_list():
@@ -141,7 +149,7 @@ def make_checkpoint_manager_ui():
         current_preset = getattr(shared.opts, "forge_preset", "sd")
         choices = checkpoint_choices(current_preset, ckpt_list)
         return [
-            gr.update(value=checkpoint_value_for_preset(current_preset, choices), choices=choices, label=checkpoint_label(current_preset)),
+            gr.update(value=checkpoint_value_for_preset(current_preset, choices), choices=choices, label=checkpoint_label(current_preset), interactive=bool(choices)),
             module_dropdown_update(current_preset),
         ]
 
@@ -176,17 +184,20 @@ def module_dropdown_update(preset: str):
             label="VAE / Decoder",
             multiselect=False,
             visible=True,
+            interactive=bool(ui_ltx2_video._prunavaed_choices()),
         )
 
-    value = [] if preset in NATIVE_PIPELINE_PRESETS else [
-        os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])
-    ]
+    choices = module_choices()
+    value = [] if preset in NATIVE_PIPELINE_PRESETS else valid_module_values(
+        getattr(shared.opts, f"forge_additional_modules_{preset}", []), choices
+    )
     return gr.update(
         value=value,
-        choices=module_choices(),
+        choices=choices,
         label="VAE / Text Encoder",
         multiselect=True,
         visible=preset not in NATIVE_PIPELINE_PRESETS,
+        interactive=bool(choices) and preset not in NATIVE_PIPELINE_PRESETS,
     )
 
 
@@ -220,10 +231,14 @@ def checkpoint_choices(preset: str, choices: list[str]) -> list[str]:
 
 
 def checkpoint_value_for_preset(preset: str, choices: list[str]) -> str | None:
+    choices = [str(choice) for choice in choices if choice not in (None, "")]
     if preset in NATIVE_PIPELINE_PRESETS:
         value = ltx2_model_value() if preset == PresetArch.ltx2.name else ideogram_model_value()
         return value if value in choices else (choices[0] if choices else None)
     value = getattr(shared.opts, f"forge_checkpoint_{preset}", None) or shared.opts.sd_model_checkpoint
+    value = str(value or "").strip()
+    if value.lower() in {"none", "null"}:
+        value = ""
     return value if value in choices else (choices[0] if choices else None)
 
 
@@ -292,8 +307,11 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
         logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
 
-    dynamic_args.online_lora = lora_fp16
-    logger.info(f"Patch LoRAs on-the-fly: {lora_fp16}")
+    from backend.memory_management import mmgp_enabled
+
+    mmgp_dynamic_lora = bool(getattr(shared.opts, "forge_memory_dynamic_lora_enabled", True) and mmgp_enabled())
+    dynamic_args.online_lora = lora_fp16 or mmgp_dynamic_lora
+    logger.info(f"Patch LoRAs on-the-fly: {dynamic_args.online_lora} (fp16={lora_fp16}, mmgp_dynamic={mmgp_dynamic_lora})")
     if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
         logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
 
@@ -316,6 +334,8 @@ def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> b
         return True
 
     ckpt_name = str(ckpt_name or "").strip()
+    if ckpt_name.lower() in {"none", "null"}:
+        ckpt_name = ""
     if not ckpt_name:
         shared_items.refresh_checkpoints()
         choices = shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
@@ -353,7 +373,9 @@ def modules_change(module_values: list, preset: str, save=True, refresh=True) ->
         return False
 
     modules = []
-    for v in module_values:
+    if isinstance(module_values, str):
+        module_values = [module_values]
+    for v in module_values or []:
         module_name = os.path.basename(v)  # If the input is a filepath, extract the filename
         if module_name in module_list:
             modules.append(module_list[module_name])
@@ -402,6 +424,7 @@ def restore_standard_preset(preset: str):
 
     modules = getattr(shared.opts, f"forge_additional_modules_{preset}", [])
     modules = list(modules) if isinstance(modules, (list, tuple)) else []
+    modules = [module_list[os.path.basename(module)] for module in modules if os.path.basename(module) in module_list]
     dtype = getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic")
 
     shared.opts.set("forge_additional_modules", modules)
@@ -428,6 +451,7 @@ def forge_main_entry():
     ui_img2img_steps = get_a1111_ui_component("img2img", "Steps")
     ui_txt2img_enable_hr = get_a1111_ui_component("txt2img", "enable_hr")
     ui_txt2img_negative_prompt = get_a1111_ui_component("txt2img", "negative_prompt")
+    ui_txt2img_hr_negative_prompt = get_a1111_ui_component("txt2img", "Hires negative prompt")
     ui_img2img_negative_prompt = get_a1111_ui_component("img2img", "Negative prompt")
     ui_img2img_denoising_strength = get_a1111_ui_component("img2img", "Denoising strength")
     ui_img2img_image_cfg = get_a1111_ui_component("img2img", "Image CFG scale")
@@ -464,6 +488,7 @@ def forge_main_entry():
         ui_img2img_steps,
         ui_txt2img_enable_hr,
         ui_txt2img_negative_prompt,
+        ui_txt2img_hr_negative_prompt,
         ui_img2img_negative_prompt,
         ui_img2img_denoising_strength,
         ui_img2img_image_cfg,
@@ -563,6 +588,15 @@ def on_preset_change(preset: str):
     native_pipeline = preset in NATIVE_PIPELINE_PRESETS
     ideogram = preset == PresetArch.ideogram.name
     checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
+    t2i_cfg = getattr(shared.opts, f"{preset}_t2i_cfg", 1.0)
+    i2i_cfg = getattr(shared.opts, f"{preset}_i2i_cfg", 1.0)
+    hr_cfg = getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)
+
+    def cfg_enabled(value):
+        try:
+            return float(value) > 1.0
+        except (TypeError, ValueError):
+            return False
 
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
@@ -570,6 +604,7 @@ def on_preset_change(preset: str):
             value=checkpoint_value_for_preset(preset, checkpoint_list),
             choices=checkpoint_list,
             label=checkpoint_label(preset),
+            interactive=bool(checkpoint_list),
         ),
         module_dropdown_update(preset),
         gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic"), visible=not native_pipeline, interactive=not native_pipeline),
@@ -578,8 +613,9 @@ def on_preset_change(preset: str):
         gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),
         gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_step", 20)) > 0 else gr.skip(),
         gr.update(visible=not native_pipeline, interactive=not native_pipeline),
-        gr.update(visible=not ideogram, interactive=not ideogram),
-        gr.update(visible=not ideogram, interactive=not ideogram),
+        gr.update(visible=not ideogram, interactive=not ideogram and cfg_enabled(t2i_cfg)),
+        gr.update(interactive=cfg_enabled(hr_cfg)),
+        gr.update(visible=not ideogram, interactive=not ideogram and cfg_enabled(i2i_cfg)),
         gr.update(visible=not native_pipeline),
         gr.update(visible=not native_pipeline),
         # ui_txt2img_sampler, ui_img2img_sampler, ui_txt2img_scheduler, ui_img2img_scheduler
@@ -593,9 +629,9 @@ def on_preset_change(preset: str):
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_height", 1024)) > 0 else gr.skip(),
         gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_height", 1024)) > 0 else gr.skip(),
         # ui_txt2img_cfg, ui_txt2img_hr_cfg, ui_img2img_cfg
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_cfg", 1.0)) > 0 else gr.skip(),
+        gr.update(value=t2i_cfg) if t2i_cfg > 0 else gr.skip(),
         gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)) > 0 else gr.skip(),
-        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_cfg", 1.0)) > 0 else gr.skip(),
+        gr.update(value=i2i_cfg, visible=not ideogram, interactive=not ideogram) if i2i_cfg > 0 else gr.skip(),
         # ui_txt2img_distilled_cfg, ui_img2img_distilled_cfg, ui_txt2img_hr_distilled_cfg
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_dcfg", 3.0), **d_args),
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_hr_dcfg", 3.0), **d_args),

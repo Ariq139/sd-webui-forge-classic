@@ -179,6 +179,16 @@ def configure_memory_features():
     from backend.memory_management import configure_memory_features as apply_memory_features
     from modules.shared import opts
 
+    # Import MMGP before any model is loaded so its low-RAM safetensors hooks
+    # are available, but keep the normal Forge path untouched unless both
+    # --mmgp and the UI master switch are active.
+    from backend.memory_management import mmgp_flag_present
+    if mmgp_flag_present() and getattr(opts, "forge_memory_management_enabled", False):
+        try:
+            from mmgp import offload  # noqa: F401
+        except Exception:
+            pass
+
     apply_memory_features(
         enabled=getattr(opts, "forge_memory_management_enabled", False),
         budgets=getattr(opts, "forge_memory_budgets_enabled", False),
@@ -206,6 +216,9 @@ def configure_memory_features():
             )
             if getattr(opts, option, False)
         ],
+        compile_enabled=getattr(opts, "forge_memory_compile_enabled", False),
+        partial_pinning=getattr(opts, "forge_memory_partial_pinning_enabled", False),
+        quantization_type=getattr(opts, "forge_memory_quantization_type", "qint8"),
     )
 
 
@@ -224,6 +237,10 @@ def configure_opts_onchange():
     shared.opts.onchange("setting_allocated_vram", reserve_memory)
     for key in MEMORY_SETTING_KEYS:
         shared.opts.onchange(key, configure_memory_features, call=False)
+    from modules_forge.main_entry import refresh_model_loading_parameters
+
+    shared.opts.onchange("forge_memory_management_enabled", refresh_model_loading_parameters, call=False)
+    shared.opts.onchange("forge_memory_dynamic_lora_enabled", refresh_model_loading_parameters, call=False)
     configure_memory_features()
     shared.opts.onchange("klein_no_reference", clear_references)
     shared.opts.onchange("anima_do_reference", clear_references)

@@ -40,6 +40,25 @@ def _quantized_apply(module: torch.nn.Module, fn, recurse=True):
     return module
 
 
+def _infer_quant_format(weight: torch.Tensor, state_dict: dict[str, torch.Tensor], prefix: str) -> str | None:
+    """Recover the format used by older/incomplete Comfy quant metadata."""
+    scale = state_dict.get(f"{prefix}weight_scale")
+    scale_2 = state_dict.get(f"{prefix}weight_scale_2")
+    if scale_2 is not None:
+        return "nvfp4"
+    if weight.dtype == torch.int8 and scale is not None:
+        return "int8_tensorwise"
+    if weight.dtype == torch.float8_e4m3fn:
+        return "float8_e4m3fn"
+    if weight.dtype == torch.float8_e5m2:
+        return "float8_e5m2"
+    # Some older files stored FP8 bytes in uint8 containers. Without a
+    # format marker, a single weight scale is the only safe legacy signal.
+    if weight.dtype == torch.uint8 and scale is not None:
+        return "float8_e4m3fn"
+    return None
+
+
 def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict[str, torch.Tensor], prefix: str, local_metadata, strict, missing_keys, unexpected_keys, error_msgs, load_extra_params=False):
     device = module.factory_kwargs["device"]
     compute_dtype = module.factory_kwargs["dtype"]
@@ -70,13 +89,24 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
         module.weight = torch.nn.Parameter(weight.to(device=device, dtype=compute_dtype), requires_grad=False)
     else:
         module.quant_format = layer_conf.get("format", None)
+        module.quant_format = {
+            "int8": "int8_tensorwise",
+            "fp8": "float8_e4m3fn",
+            "fp8_e4m3": "float8_e4m3fn",
+            "fp8_e5m2": "float8_e5m2",
+        }.get(module.quant_format, module.quant_format)
+        if module.quant_format is None:
+            module.quant_format = _infer_quant_format(weight, state_dict, prefix)
         module._full_precision_mm_config = layer_conf.get("full_precision_matrix_mult", False)
         if not module._full_precision_mm:
             module._full_precision_mm = module._full_precision_mm_config
         if module.quant_format in disabled_formats:
             module._full_precision_mm = True
         if module.quant_format is None:
-            raise ValueError(f"Unknown quantization format for layer {layer_name}")
+            raise ValueError(
+                f"Unknown quantization format for layer {layer_name}; "
+                "the checkpoint has incomplete quantization metadata"
+            )
 
         qconfig = QUANT_ALGOS[module.quant_format]
         module.layout_type = qconfig["comfy_tensor_layout"]

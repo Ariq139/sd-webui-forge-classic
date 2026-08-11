@@ -5,13 +5,15 @@ import threading
 import gradio as gr
 import torch
 
-from backend import memory_management
+from backend import memory_management, mmgp_loader, mmgp_native
 from modules import shared
+from modules_forge import main_thread
 from modules_forge.native_models import is_compatible_model, resolve_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
     configure_pipeline,
+    configure_attention,
     configure_prompt_cache,
     configure_vae_tiling,
     resolve_vae_tiling_mode,
@@ -146,7 +148,8 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
     model_path = resolve_model_path(model_path)
     device = _device()
     dtype = _default_dtype(precision)
-    key = (model_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache))
+    mmgp_active = mmgp_native.enabled()
+    key = (model_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), mmgp_active, memory_management.MEMORY_RUNTIME_SIGNATURE)
 
     with _pipeline_lock:
         if _pipeline is not None and _pipeline_key == key:
@@ -154,8 +157,25 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
 
         unload()
         unload_forge_model()
-        _pipeline = Ideogram4Pipeline.from_pretrained(model_path, torch_dtype=dtype)
-        configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
+        pipeline_kwargs = {"torch_dtype": dtype}
+        if mmgp_loader.can_attempt(model_path):
+            try:
+                _pipeline = mmgp_loader.load_pipeline(Ideogram4Pipeline, model_path, pipeline_kwargs, dtype)
+                logger.info("Ideogram 4 native pipeline loaded through MMGP's low-RAM component loader")
+            except mmgp_loader.MMGPLoaderUnavailable:
+                logger.info("Ideogram 4 model layout is not supported by the MMGP loader; using Diffusers loader")
+                _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
+            except Exception:
+                logger.exception("MMGP native loading failed; using Diffusers loader")
+                _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
+        else:
+            _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
+        if mmgp_active:
+            configure_attention(_pipeline, attention_backend, device, logger)
+            if not mmgp_native.attach(_pipeline, compile_enabled=compile_enabled):
+                configure_pipeline(_pipeline, device, offload, attention_backend, False, logger)
+        else:
+            configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
         configure_prompt_cache(_pipeline, prompt_cache, logger)
         _pipeline_key = key
         return _pipeline
@@ -170,6 +190,7 @@ def unload():
             return
 
         try:
+            mmgp_native.release(_pipeline)
             _pipeline.to("cpu")
         except Exception:
             pass
@@ -231,6 +252,9 @@ def generate(
             return [], "Ideogram 4 steps must be between 1 and 150."
 
         pipe = _get_pipeline(model_path, precision, offload, attention_backend, compile_enabled, prompt_cache)
+        prompt, lora_warning = mmgp_native.configure_prompt_loras(pipe, prompt)
+        if lora_warning:
+            logger.warning(lora_warning)
         configure_vae_tiling(
             pipe.vae,
             resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),
@@ -296,6 +320,8 @@ def generate(
         if memory_management.is_oom(error):
             logger.exception("Ideogram 4 generation ran out of memory")
             unload()
+            if getattr(shared.opts, "forge_oom_retry_enabled", True):
+                raise
             shared.state.textinfo = "Ideogram 4: out of memory"
             return [], "Ideogram 4 ran out of memory. Reduce resolution, image count, or enable sequential CPU offload."
         logger.exception("Ideogram 4 generation failed")
@@ -448,7 +474,10 @@ def create_ui():
             prompt_temperature,
             seed,
         ]
-        generate_ideogram = wrap_gradio_gpu_call(generate, extra_outputs=[None])
+        generate_ideogram = wrap_gradio_gpu_call(
+            lambda *args, **kwargs: main_thread.run_and_wait_result(generate, *args, **kwargs),
+            extra_outputs=[None],
+        )
         generate_button.click(generate_ideogram, inputs=inputs, outputs=[output, status])
         prompt.submit(generate_ideogram, inputs=inputs, outputs=[output, status])
         auto_vae_tiling.change(

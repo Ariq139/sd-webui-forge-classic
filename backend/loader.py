@@ -15,7 +15,7 @@ except ImportError:
     from transformers.modeling_utils import no_init_weights
 
 import backend.args
-from backend import memory_management, utils
+from backend import memory_management, mmgp_loader, utils
 from backend.diffusion_engine.anima import Anima
 from backend.diffusion_engine.chroma import Chroma
 from backend.diffusion_engine.ernie import ErnieImage
@@ -227,7 +227,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = IntegratedAutoencoderKL.from_config(config)
 
-            load_state_dict(model, state_dict, ignore_start="loss.")
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_start="loss."):
+                load_state_dict(model, state_dict, ignore_start="loss.")
             model._forge_vae_is_wan = False
             model._forge_vae_is_flux2 = False
             return model
@@ -244,7 +245,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = AutoencoderKLFlux2.from_config(config)
 
-            load_state_dict(model, state_dict, ignore_start="loss.")
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_start="loss."):
+                load_state_dict(model, state_dict, ignore_start="loss.")
             model._forge_vae_is_wan = False
             model._forge_vae_is_flux2 = True
             return model
@@ -265,7 +267,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = WanVAE.from_config(config)
 
-            load_state_dict(model, state_dict)
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name):
+                load_state_dict(model, state_dict)
             model._forge_vae_is_wan = True
             model._forge_vae_is_flux2 = False
             return model
@@ -286,7 +289,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with using_forge_operations(**to_args, manual_cast_enabled=True):
                     model = IntegratedCLIP(CLIPTextModel, config, add_text_projection=True).to(**to_args)
 
-            load_state_dict(model, state_dict, ignore_errors=["transformer.text_projection.weight", "transformer.text_model.embeddings.position_ids", "logit_scale"], log_name=cls_name)
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_errors=["transformer.text_projection.weight", "transformer.text_model.embeddings.position_ids", "logit_scale"]):
+                load_state_dict(model, state_dict, ignore_errors=["transformer.text_projection.weight", "transformer.text_model.embeddings.position_ids", "logit_scale"], log_name=cls_name)
             return model
         if cls_name == "Qwen2_5_VLForConditionalGeneration":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have Qwen 2.5 state dict!"
@@ -320,7 +324,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, extra_dtype=quant_config):
                         model = Qwen25_7BVLI(config)
 
-            load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_start="lm_head."):
+                load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
             return model
         if cls_name == "Gemma2Model":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have Gemma2 state dict!"
@@ -354,7 +359,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, extra_dtype=quant_config):
                         model = Gemma2_2B(config)
 
-            load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_start="lm_head."):
+                load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
             return model
         if cls_name == "Mistral3Model":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have Mistral3 state dict!"
@@ -388,7 +394,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, extra_dtype=quant_config):
                         model = Ministral3_3B(config)
 
-            load_state_dict(model, state_dict, log_name=cls_name)
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name):
+                load_state_dict(model, state_dict, log_name=cls_name)
             return model
         if cls_name in ["Qwen3Model", "Qwen3ForCausalLM", "Qwen3VLModel"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have Qwen3 state dict!"
@@ -439,7 +446,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     },
                 )
 
-            load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_start="lm_head."):
+                load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
             return model
         if cls_name in ["T5EncoderModel", "UMT5EncoderModel"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have T5 state dict!"
@@ -483,7 +491,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, extra_dtype=quant_config):
                         model = IntegratedT5(config)
 
-            load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=["transformer.encoder.embed_tokens.weight", "logit_scale"])
+            if not mmgp_loader.load_forge_component(model, state_dict, component_name, ignore_errors=["transformer.encoder.embed_tokens.weight", "logit_scale"]):
+                load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=["transformer.encoder.embed_tokens.weight", "logit_scale"])
             return model
 
         # region UNet / DiT
@@ -617,7 +626,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = model_loader(unet_config).to(**to_args)
 
             model = pre_func(model)
-            load_state_dict(model, state_dict)
+            model.storage_dtype = storage_dtype
+            use_mmgp_loader = not guess.nunchaku and quant_config is None and storage_dtype not in ["nf4", "fp4", "gguf"]
+            if not use_mmgp_loader or not mmgp_loader.load_forge_component(model, state_dict, "transformer"):
+                load_state_dict(model, state_dict)
             # model = post_func(model)
 
             if hasattr(model, "_internal_dict"):
@@ -1011,8 +1023,7 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
 
 
 @torch.inference_mode()
-def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None) -> "ForgeDiffusionEngine":
-    state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
+def _forge_loader_from_components(state_dicts, estimated_config, sd: os.PathLike) -> "ForgeDiffusionEngine":
     repo_name: str = estimated_config.huggingface_repo
 
     backend.args.dynamic_args.reset()
@@ -1082,3 +1093,20 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
             return M(estimated_config=estimated_config, huggingface_components=huggingface_components)
 
     raise ModuleNotFoundError("Failed to recognize model...")
+
+
+@torch.inference_mode()
+def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None) -> "ForgeDiffusionEngine":
+    """Load a checkpoint, using the low-RAM source when it is compatible."""
+    streaming_checkpoint = mmgp_loader.open_forge_checkpoint(sd, additional_state_dicts=additional_state_dicts)
+    if streaming_checkpoint is not None:
+        try:
+            with streaming_checkpoint:
+                return _forge_loader_from_components(streaming_checkpoint, streaming_checkpoint.guess, sd)
+        except mmgp_loader.MMGPLoaderUnavailable:
+            logger.info("MMGP low-RAM checkpoint path is incompatible; using the Forge checkpoint loader")
+        except Exception:
+            logger.exception("MMGP low-RAM checkpoint path failed; retrying with the Forge checkpoint loader")
+
+    state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
+    return _forge_loader_from_components(state_dicts, estimated_config, sd)

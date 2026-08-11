@@ -26,7 +26,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > - **Settings navigation:** searchable and clickable settings panels, collapsible category groups, open/close-all controls, restored option descriptions, and safer handling of inactive controls.
 > - **LTX-2.3 Video:** `ltx2` UI preset integration for text-to-video and image-to-video generation, optional audio, CPU offload, VAE tiling, and PrunaVAED decoder support. See the [LTX Video guide](docs/LTX_VIDEO.md).
 > - **Ideogram 4:** native Diffusers text-to-image page and `ideogram` UI preset with flow scheduling, prompt upsampling, offload, and VAE tiling. See the [Ideogram 4 guide](docs/IDEOGRAM4.md).
-> - **Optional memory management:** an MMGP-style manager behind `--mmgp`, named RAM/VRAM profiles, per-component budgets, pinned CPU memory, asynchronous transfers, residency hints, and explicit interaction rules with Forge's VRAM flags.
+> - **Optional alternate memory management:** the reference [MMGP](https://github.com/deepbeepmeep/mmgp) path behind `--mmgp`, with named RAM/VRAM profiles, per-component budgets, pinned CPU memory, asynchronous transfers, optional quantization/compilation, low-RAM component loading for compatible native Diffusers pipelines, and fallback to Forge for unsupported formats. Forge still prepares LoRA and model patches before MMGP takes over base-component residency.
 > - **Extra Networks:** simple-list mode, optional cards and grouping, preset-aware group priority/open state, automatic search, improved LoRA metadata/category detection, metadata view/edit handling, and safer default LoRA insertion weights.
 > - **Backend improvements:** additional GGUF dequantization coverage and Comfy-inspired VAE/offload handling.
 >

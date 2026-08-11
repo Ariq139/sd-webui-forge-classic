@@ -916,6 +916,13 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     if p.scripts is not None:
         p.scripts.process(p)
 
+    # Scripts such as Dynamic Prompts replace all_prompts with the expanded
+    # per-image values. Use that list for metadata instead of the template.
+    if p.all_prompts:
+        p.main_prompt = p.all_prompts[0]
+    if p.all_negative_prompts:
+        p.main_negative_prompt = p.all_negative_prompts[0]
+
     infotexts = []
     output_images = []
     with torch.inference_mode():
@@ -1047,7 +1054,15 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
-                x_sample = 255.0 * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
+                x_sample = x_sample.cpu().numpy()
+                if x_sample.ndim != 3 or x_sample.shape[0] not in (1, 3, 4):
+                    raise RuntimeError(
+                        f"Decoded image has invalid shape {tuple(x_sample.shape)}; "
+                        "the selected VAE/model did not return an RGB/RGBA image."
+                    )
+                if x_sample.shape[0] == 1:
+                    x_sample = np.repeat(x_sample, 3, axis=0)
+                x_sample = 255.0 * np.moveaxis(x_sample, 0, 2)
                 x_sample = x_sample.astype(np.uint8)
                 if _is_video:
                     frames.append(x_sample)

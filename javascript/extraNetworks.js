@@ -167,6 +167,13 @@ function setupExtraNetworksForTab(tabname) {
             search.addEventListener("input", function () {
                 applyFilter();
             });
+            // The controls live inside Gradio's tablist. Stop the tablist
+            // handler from stealing focus when the search field is touched.
+            ["mousedown", "mouseup", "click", "touchstart", "touchend"].forEach(function (eventName) {
+                search.addEventListener(eventName, function (event) {
+                    event.stopPropagation();
+                });
+            });
             search.dataset.extraNetworksBound = "true";
         }
         applySort();
@@ -190,14 +197,7 @@ function setupExtraNetworksForTab(tabname) {
     });
 
     extraNetworksNormalizeTabNav(tabname);
-    extraTabs.querySelectorAll(".extra-network-pane[id$='_pane']").forEach(function (pane) {
-        let tabnameFull = pane.id.slice(0, -"_pane".length);
-        let extraPage = tabnameFull.slice((tabname + "_").length);
-        let priorityButton = gradioApp().getElementById(tabnameFull + "_extra_group_priority");
-        if (priorityButton) {
-            extraNetworksSetCategoryPriority(tabname, extraPage, priorityButton.classList.contains("extra-network-control--enabled"));
-        }
-    });
+    extraNetworksReapplyCategoryPriority(tabname);
     registerPrompt(tabname, tabname + "_prompt");
     registerPrompt(tabname, tabname + "_neg_prompt");
 }
@@ -635,6 +635,23 @@ function extraNetworksSetCategoryPriority(tabname, extra_networks_tabname, enabl
     }
 }
 
+function extraNetworksReapplyCategoryPriority(tabname) {
+    const root = gradioApp();
+    root.querySelectorAll(".extra-network-pane[id$='_pane']").forEach(function (pane) {
+        const tabnameFull = pane.id.slice(0, -"_pane".length);
+        if (!tabnameFull.startsWith(tabname + "_")) return;
+        const extraPage = tabnameFull.slice((tabname + "_").length);
+        const priorityButton = root.getElementById(tabnameFull + "_extra_group_priority");
+        if (priorityButton) {
+            extraNetworksSetCategoryPriority(
+                tabname,
+                extraPage,
+                priorityButton.classList.contains("extra-network-control--enabled"),
+            );
+        }
+    });
+}
+
 function extraNetworksControlGroupPriorityOnClick(event, tabname, extra_networks_tabname) {
     let button = event.currentTarget;
     let enabled = !button.classList.contains("extra-network-control--enabled");
@@ -677,6 +694,8 @@ function clickLoraRefresh() {
             }
         }
     });
+    extraNetworksReapplyCategoryPriority("txt2img");
+    extraNetworksReapplyCategoryPriority("img2img");
     refreshExtraNetworkCategoryOpenState();
 }
 

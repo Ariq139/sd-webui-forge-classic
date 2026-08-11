@@ -14,7 +14,13 @@ from modules_forge import main_entry
 from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS, get_memory_profile
 
 CURRENT_ROW: gr.Row = None
-MMGP_UI_SETTING_KEYS = {"forge_memory_profile", *MEMORY_SETTING_KEYS}
+MMGP_UI_SETTING_KEYS = {
+    "forge_memory_profile",
+    "forge_memory_dynamic_lora_enabled",
+    "forge_memory_persistent_cache_enabled",
+    "forge_memory_cache_directory",
+    *MEMORY_SETTING_KEYS,
+}
 
 
 def get_value_for_setting(key):
@@ -225,6 +231,10 @@ class UiSettings:
                     with gr.Row():
                         calculate_all_checkpoint_hash = gr.Button(value="Calculate hash for all checkpoint", elem_id="calculate_all_checkpoint_hash")
                         calculate_all_checkpoint_hash_threads = gr.Number(value=1, label="Number of parallel calculations", elem_id="calculate_all_checkpoint_hash_threads", precision=0, minimum=1)
+                    with gr.Row():
+                        mmgp_export_directory = gr.Textbox(value="", label="MMGP export directory (blank = configured cache/exports)", elem_id="mmgp_export_directory")
+                        mmgp_export_models = gr.Button(value="Export loaded MMGP models", elem_id="mmgp_export_models", interactive=bool(shared.cmd_opts.mmgp))
+                        mmgp_cache_status = gr.Button(value="MMGP cache status", elem_id="mmgp_cache_status", interactive=bool(shared.cmd_opts.mmgp))
 
                 with gr.TabItem("Licenses", id="licenses", elem_id="settings_tab_licenses") as license_tab:
                     gr.HTML(shared.html("licenses.html"), elem_id="licenses")
@@ -324,6 +334,21 @@ class UiSettings:
             calculate_all_checkpoint_hash.click(
                 fn=calculate_all_checkpoint_hash_fn,
                 inputs=[calculate_all_checkpoint_hash_threads],
+            )
+
+            from backend import mmgp_cache
+
+            mmgp_export_models.click(
+                fn=mmgp_cache.export_loaded_models,
+                inputs=[mmgp_export_directory],
+                outputs=[self.result],
+                show_progress="full",
+            )
+            mmgp_cache_status.click(
+                fn=mmgp_cache.status,
+                inputs=[],
+                outputs=[self.result],
+                show_progress=False,
             )
 
         self.interface = settings_interface

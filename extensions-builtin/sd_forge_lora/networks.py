@@ -1,4 +1,3 @@
-import functools
 import logging
 import os.path
 import re
@@ -22,7 +21,11 @@ logger = logging.getLogger("lora")
 setup_logger(logger)
 
 
-load_lora_state_dict = functools.partial(load_torch_file, safe_load=True)
+def load_lora_state_dict(filename):
+    """Use lazy safetensors reads for the optional MMGP path."""
+    from backend import mmgp_loader
+
+    return mmgp_loader.open_streaming_state_dict(filename) or load_torch_file(filename, safe_load=True)
 
 
 def process_anima(lora: dict[str, torch.Tensor]):
@@ -144,9 +147,15 @@ def load_networks(names: list[str], te_multipliers: list[float] = None, unet_mul
 
     for filename, strength_model, strength_clip, online_mode in compiled_lora_targets:
         lora_sd = load_lora_state_dict(filename)
-        if any(key.startswith("lora_unet__") for key in lora_sd):
-            lora_sd = state_dict_prefix_replace(lora_sd, {"lora_unet__": "lora_unet_"})
-        current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip, filename=filename, online_mode=online_mode)
+        source = lora_sd
+        try:
+            if any(key.startswith("lora_unet__") for key in lora_sd):
+                lora_sd = state_dict_prefix_replace(lora_sd, {"lora_unet__": "lora_unet_"})
+            current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip, filename=filename, online_mode=online_mode)
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
 
     current_sd.forge_objects_after_applying_lora = current_sd.forge_objects.shallow_copy()
 

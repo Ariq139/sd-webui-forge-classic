@@ -537,7 +537,17 @@ div.toprow-compact-tools {
 }
 
 #setting_sd_model_checkpoint input {
-    width: 20vw;
+    width: 100% !important;
+    min-width: 0 !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#setting_sd_model_checkpoint,
+#setting_sd_model_checkpoint > div,
+#setting_sd_model_checkpoint .wrap,
+#setting_sd_model_checkpoint .wrap-inner {
+    min-width: 0 !important;
 }
 
 #setting_sd_modules input {
@@ -2155,6 +2165,38 @@ body.resizing .resize-handle {
     #quicksettings > * {
         min-width: min(100%, 18rem) !important;
         flex: 1 1 18rem !important;
+    }
+
+    #quicksettings > #forge_refresh_checkpoint {
+        flex: 0 0 2.5rem !important;
+        width: 2.5rem !important;
+        min-width: 2.5rem !important;
+    }
+
+    .extra-network-control {
+        flex-wrap: wrap;
+        gap: 0.15rem;
+    }
+
+    .extra-network-control .extra-network-control--search {
+        flex: 1 1 100%;
+        min-width: 100%;
+        margin-bottom: 0.25rem;
+    }
+
+    .extra-network-control .extra-network-control--search-text {
+        min-height: 2.25rem;
+        font-size: 1rem;
+    }
+
+    .extra-network-control .extra-network-control--refresh,
+    .extra-network-control .extra-network-control--tree-view,
+    .extra-network-control .extra-network-control--group-priority,
+    .extra-network-control .extra-network-control--sort,
+    .extra-network-control .extra-network-control--sort-dir {
+        flex: 0 0 2.25rem;
+        width: 2.25rem;
+        min-width: 2.25rem;
     }
 
     #txt2img_toprow,
