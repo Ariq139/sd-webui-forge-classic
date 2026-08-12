@@ -19,12 +19,12 @@ from backend.attention import attention_function
 from backend.memory_management import is_device_mps
 from backend.operations import (
     main_stream_worker,
+    match_attention_dtypes,
     scaled_dot_product_attention,
     weights_manual_cast,
 )
 from backend.quant_ops import ck
 from backend.utils import pad_to_patch_size
-
 # region DiT
 
 
@@ -585,6 +585,7 @@ class Attention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
+        query_states, key_states, value_states = match_attention_dtypes(query_states, key_states, value_states)
         attn_output = scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

@@ -110,6 +110,118 @@ FRAMES = {
     PresetArch.ltx2.name: 8,
 }
 
+_DEFAULT_CAPABILITIES = {
+    "txt2img": True,
+    "img2img": True,
+    "hires": True,
+    "cfg": True,
+    "negative_prompt": True,
+    "txt2img_batch_count": True,
+    "img2img_batch_count": True,
+    "txt2img_batch_size": True,
+    "img2img_batch_size": True,
+    "img2img_denoising": True,
+    "standard_sampling": True,
+    "img2img_batch_tab": True,
+}
+
+_CAPABILITIES = {
+    PresetArch.flux.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.klein.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.qwen.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.zit.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.wan.name: {"cfg": False, "negative_prompt": False, "hires": False},
+    PresetArch.ernie.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.pid.name: {
+        "txt2img": False,
+        "cfg": False,
+        "negative_prompt": False,
+        "hires": False,
+        "img2img_batch_size": False,
+    },
+    PresetArch.krea.name: {"cfg": False, "negative_prompt": False},
+    PresetArch.ltx2.name: {
+        "standard_sampling": False,
+        "hires": False,
+        "txt2img_batch_count": False,
+        "img2img_batch_count": False,
+        "img2img_denoising": False,
+        "img2img_batch_tab": False,
+    },
+    PresetArch.ideogram.name: {
+        "standard_sampling": False,
+        "hires": False,
+        "negative_prompt": False,
+        "img2img": False,
+        "img2img_batch_count": False,
+        "img2img_batch_size": False,
+        "img2img_denoising": False,
+        "img2img_batch_tab": False,
+        # Ideogram's shared txt2img wrapper uses Batch Size as num_images.
+        "txt2img_batch_count": False,
+    },
+}
+
+
+_MODEL_CAPABILITIES = {
+    # These are derived from the model implementations, not from their saved
+    # UI defaults.  The preset table below is only needed before a checkpoint
+    # has been loaded and its detected config is available.
+    "flux": {"cfg": False, "negative_prompt": False},
+    "flux2": {"cfg": False, "negative_prompt": False},
+    "chroma": {"cfg": False, "negative_prompt": False},
+    "qwen_image": {"cfg": False, "negative_prompt": False},
+    "lumina2": {"cfg": True, "negative_prompt": True},
+    "anima": {"cfg": True, "negative_prompt": True},
+    "wan2.1": {"cfg": False, "negative_prompt": False, "hires": False},
+    "krea2": {"cfg": False, "negative_prompt": False},
+    "ernie": {"cfg": False, "negative_prompt": False},
+    "pid": {
+        "txt2img": False,
+        "cfg": False,
+        "negative_prompt": False,
+        "hires": False,
+        "img2img_batch_size": False,
+    },
+}
+
+
+def _get_loaded_model_capabilities(model) -> dict[str, bool]:
+    """Read restrictions from the detected Forge model config when available."""
+    config = getattr(model, "model_config", None)
+    unet_config = getattr(config, "unet_config", {}) or {}
+    image_model = unet_config.get("image_model")
+    capabilities = _MODEL_CAPABILITIES.get(image_model, {}).copy()
+
+    # Wan T2V accepts a single image as img2img input, but its 36-channel
+    # video conditioning path is only valid for I2V/first-frame inputs.
+    if image_model == "wan2.1" and unet_config.get("model_type") == "t2v":
+        capabilities["img2img_batch_size"] = False
+
+    # Lumina2 and Z-Image share a detector; only the 3840-dim Z-Image config
+    # is the fixed-CFG turbo variant.
+    if image_model == "lumina2" and unet_config.get("dim") == 3840:
+        capabilities.update({"cfg": False, "negative_prompt": False})
+
+    return capabilities
+
+
+def get_capabilities(arch: str, checkpoint: str = "", model=None) -> dict[str, bool]:
+    """Return UI and processing constraints, preferring detected model metadata."""
+    capabilities = _DEFAULT_CAPABILITIES.copy()
+    capabilities.update(_CAPABILITIES.get(arch, {}))
+
+    # Once Forge has loaded the checkpoint, its detected architecture is the
+    # source of truth.  This keeps changing preset defaults from changing the
+    # actual model restrictions.
+    capabilities.update(_get_loaded_model_capabilities(model))
+
+    # Flux Schnell has no guidance embedding or distilled-CFG input.
+    if model is None and arch == PresetArch.flux.name and "schnell" in str(checkpoint).lower():
+        capabilities.update({"cfg": False, "negative_prompt": False})
+
+    return capabilities
+
 
 def use_distill(arch: str) -> bool:
     return arch in [preset.name for preset in DISTILL.keys()]

@@ -23,6 +23,7 @@ from modules.sd_models import get_closet_checkpoint_match, model_data
 from modules.shared import opts, state
 from modules.ui import _STEP, plaintext_to_html, sRound
 from modules_forge import main_thread
+from modules_forge.presets import get_capabilities
 
 
 def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, scale_by=1.0, use_png_info=False, png_info_props=None, png_info_dir=None):
@@ -175,11 +176,28 @@ def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, 
 def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
 
     override_settings = create_override_settings_dict(override_settings_texts)
+    capabilities = get_capabilities(
+        opts.forge_preset,
+        getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
+    )
 
-    if opts.forge_preset == "ideogram":
-        raise RuntimeError("Ideogram 4 is text-to-image only in Forge. Use the txt2img page or the Ideogram 4 page.")
+    if not capabilities["img2img"]:
+        raise RuntimeError(f"The {opts.forge_preset} preset does not support img2img.")
 
     is_batch = mode == 5
+    if is_batch and not capabilities["img2img_batch_tab"]:
+        raise RuntimeError(f"The {opts.forge_preset} preset does not support img2img batch mode.")
+
+    if not capabilities["cfg"]:
+        cfg_scale = 1.0
+    if not capabilities["negative_prompt"]:
+        negative_prompt = ""
+    if not capabilities["img2img_batch_count"]:
+        n_iter = 1
+    if not capabilities["img2img_batch_size"]:
+        batch_size = 1
+    if not capabilities["img2img_denoising"]:
+        denoising_strength = 1.0
 
     height, width = int(height), int(width)
 

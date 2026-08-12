@@ -34,6 +34,7 @@ from modules.shared import cmd_opts, opts, state
 from modules.sysinfo import set_config
 from modules.ui import sRound
 from modules_forge import main_entry
+from modules_forge.presets import get_capabilities
 from modules_forge.utils import apply_circular_forge
 
 logger = logging.getLogger("processing")
@@ -791,6 +792,39 @@ def manage_model_and_prompt_cache(p: StableDiffusionProcessing):
     need_global_unload = False
 
 
+def apply_model_capabilities(p: StableDiffusionProcessing):
+    """Normalize stale UI/API values against the loaded model's detected config."""
+    capabilities = get_capabilities(getattr(opts, "forge_preset", "sd"), model=p.sd_model)
+
+    if isinstance(p, StableDiffusionProcessingTxt2Img) and not capabilities["txt2img"]:
+        raise RuntimeError("The loaded model does not support txt2img.")
+    if isinstance(p, StableDiffusionProcessingImg2Img) and not capabilities["img2img"]:
+        raise RuntimeError("The loaded model does not support img2img.")
+
+    if not capabilities["cfg"]:
+        p.cfg_scale = 1.0
+        if hasattr(p, "hr_cfg"):
+            p.hr_cfg = 1.0
+        if hasattr(p, "image_cfg_scale"):
+            p.image_cfg_scale = 1.0
+    if not capabilities["negative_prompt"]:
+        p.negative_prompt = ""
+        if hasattr(p, "hr_negative_prompt"):
+            p.hr_negative_prompt = ""
+    if not capabilities["hires"] and hasattr(p, "enable_hr"):
+        p.enable_hr = False
+    if not capabilities["txt2img_batch_count"] and isinstance(p, StableDiffusionProcessingTxt2Img):
+        p.n_iter = 1
+    if not capabilities["img2img_batch_count"] and isinstance(p, StableDiffusionProcessingImg2Img):
+        p.n_iter = 1
+    if not capabilities["txt2img_batch_size"] and isinstance(p, StableDiffusionProcessingTxt2Img):
+        p.batch_size = 1
+    if not capabilities["img2img_batch_size"] and isinstance(p, StableDiffusionProcessingImg2Img):
+        p.batch_size = 1
+    if not capabilities["img2img_denoising"] and isinstance(p, StableDiffusionProcessingImg2Img):
+        p.denoising_strength = 1.0
+
+
 _overridden_modules: Optional[list[str]] = None
 
 
@@ -818,6 +852,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             pass
         else:
             manage_model_and_prompt_cache(p)
+            apply_model_capabilities(p)
             if _vae_override is not None:
                 global _overridden_modules
                 _overridden_modules = shared.opts.forge_additional_modules.copy()

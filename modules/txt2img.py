@@ -13,12 +13,32 @@ from modules.infotext_utils import (
 from modules.shared import opts
 from modules.ui import plaintext_to_html
 from modules_forge import main_thread
+from modules_forge.presets import get_capabilities
 
 
 def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt, hr_cfg: float, hr_distilled_cfg: float, override_settings_texts, *args, force_enable_hr=False):
+    capabilities = get_capabilities(
+        opts.forge_preset,
+        getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
+    )
+    if not capabilities["txt2img"]:
+        raise RuntimeError(f"The {opts.forge_preset} preset does not support txt2img.")
+
+    if not capabilities["cfg"]:
+        cfg_scale = hr_cfg = 1.0
+    if not capabilities["negative_prompt"]:
+        negative_prompt = ""
+        hr_negative_prompt = ""
+    if not capabilities["hires"]:
+        enable_hr = False
+    if not capabilities["txt2img_batch_count"]:
+        n_iter = 1
+    if not capabilities["txt2img_batch_size"]:
+        batch_size = 1
+
     override_settings = create_override_settings_dict(override_settings_texts)
 
-    if force_enable_hr:
+    if force_enable_hr and capabilities["hires"]:
         enable_hr = True
 
     p = processing.StableDiffusionProcessingTxt2Img(
@@ -63,7 +83,11 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
 
 
 def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
-    if opts.forge_preset in {"ltx2", "ideogram"}:
+    capabilities = get_capabilities(
+        opts.forge_preset,
+        getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
+    )
+    if not capabilities["hires"]:
         return gallery, generation_info, "This preset does not support the Forge Hires fix/upscale action.", ""
 
     assert len(gallery) > 0, "No image to upscale"
@@ -133,6 +157,13 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
 
 
 def txt2img_function(id_task: str, request: gr.Request, *args):
+    capabilities = get_capabilities(
+        opts.forge_preset,
+        getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
+    )
+    if not capabilities["txt2img"]:
+        raise RuntimeError(f"The {opts.forge_preset} preset does not support txt2img.")
+
     if opts.forge_preset == "ltx2":
         from modules.ui_ltx2_video import generate_from_preset
 

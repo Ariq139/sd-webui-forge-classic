@@ -1684,6 +1684,7 @@ def configure_memory_features(
     residency_components: set[str] | list[str] | tuple[str, ...] = (),
     compile_enabled: bool = False,
     partial_pinning: bool = False,
+    alternate_quantization: bool = False,
     quantization_type: str = "qint8",
 ):
     """Apply optional MMGP settings; Forge remains the fallback manager."""
@@ -1760,7 +1761,8 @@ def configure_memory_features(
         PINNING_ENABLED,
         bool(compile_enabled) if effective_enabled else False,
         bool(partial_pinning) if effective_enabled else False,
-        str(quantization_type) if effective_enabled else "",
+        bool(alternate_quantization) if effective_enabled else False,
+        str(quantization_type) if effective_enabled and alternate_quantization else "",
     )
     if MEMORY_RUNTIME_SIGNATURE is not None and runtime_signature != MEMORY_RUNTIME_SIGNATURE:
         logger.info("Memory-management mode changed; unloading models before applying the new mode")

@@ -48,6 +48,7 @@ class AlternateMMGP:
         self.modules = {}
         self.patchers = {}
         self.signatures = None
+        self.failed_signature = None
 
     def _engine(self):
         return self.engine_ref()
@@ -141,6 +142,22 @@ class AlternateMMGP:
 
     def suspend(self):
         self._release()
+        self.failed_signature = None
+
+    @staticmethod
+    def _reset_forge_patchers(patchers):
+        """Undo the temporary CPU patching before Forge takes ownership again."""
+        cpu = torch.device("cpu")
+        for patcher in patchers.values():
+            try:
+                # _prepare_patchers() applies Forge patches on CPU so MMGP can
+                # inspect the modules.  If profiling fails, clear that state;
+                # otherwise Forge can see forge_patched_weights and skip the
+                # move back to CUDA during its normal fallback load.
+                patcher.unpatch_model(cpu, unpatch_weights=True)
+                patcher.model_patches_to(cpu)
+            except Exception:
+                logger.debug("Could not restore Forge patcher after MMGP setup failure", exc_info=True)
 
     def _prepare_patchers(self, patchers):
         cpu = torch.device("cpu")
@@ -180,7 +197,7 @@ class AlternateMMGP:
         if quantize and profile in {"LowRAM_HighVRAM", "LowRAM_LowVRAM", "VerylowRAM_LowVRAM"}:
             text_encoder = current_modules.get("text_encoder")
             module_names = {getattr(module, "__module__", "").lower() for module in text_encoder.modules()} if text_encoder else set()
-            if any(any(marker in module_name for marker in ("t5", "llama", "llm")) for module_name in module_names):
+            if not mmgp_loader.has_llm_adapter(text_encoder) and any(any(marker in module_name for marker in ("t5", "llama", "llm")) for module_name in module_names):
                 extra_models_to_quantize.append("text_encoder")
         preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if memory_management.feature_enabled("residency_hints") else set()
         component_ids = {"unet": "transformer", "text_encoder": "text_encoder", "vae": "vae"}
@@ -240,6 +257,7 @@ class AlternateMMGP:
             else:
                 self.manager = offload.all(modules, **settings)
         except Exception:
+            self._reset_forge_patchers(patchers)
             self._release()
             raise
 
@@ -257,18 +275,24 @@ class AlternateMMGP:
             self.suspend()
             return False
         signature = self._signature(current_patchers)
+        if self.manager is None and signature == self.failed_signature:
+            return False
         if self.manager is None or signature != self.signatures or set(current_modules) != set(self.modules):
             try:
                 built = self._build()
-            except Exception:
-                logger.exception("Reference MMGP could not manage this Forge model; using Forge memory management")
-                self.suspend()
+            except Exception as error:
+                self.failed_signature = signature
+                logger.warning(
+                    "Reference MMGP is incompatible with this Forge model (%s); using Forge memory management",
+                    type(error).__name__,
+                )
+                logger.debug("Reference MMGP setup details", exc_info=True)
                 built = False
             if not built:
                 return False
 
         if not self.handles(models):
-            self.suspend()
+            self._release()
             return False
 
         return True

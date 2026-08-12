@@ -59,7 +59,15 @@ def gr_show(visible=True):
 
 
 def use_cfg(val: float | None):
-    return gr.skip() if val is None else gr.update(interactive=(val > 1.0))
+    if val is None:
+        return gr.skip()
+
+    from modules_forge.presets import get_capabilities
+
+    preset = getattr(opts, "forge_preset", "sd")
+    checkpoint = getattr(opts, f"forge_checkpoint_{preset}", getattr(opts, "sd_model_checkpoint", ""))
+    capabilities = get_capabilities(preset, checkpoint)
+    return gr.update(interactive=capabilities["negative_prompt"] and val > 1.0)
 
 
 def no_config(*comps: gr.components.Component):
@@ -556,6 +564,7 @@ def create_ui():
                                     img2img_batch_png_info_props = gr.CheckboxGroup(["Prompt", "Negative prompt", "Seed", "CFG scale", "Sampler", "Steps", "Model hash", "Filename"], label="Parameters to take from png info", info="Prompts from png info will be appended to prompts set in ui.")
 
                             img2img_tabs = [tab_img2img, tab_sketch, tab_inpaint, tab_inpaint_color, tab_inpaint_upload, tab_batch]
+                            main_entry.register_native_tab("img2img_batch", tab_batch)
 
                             for i, tab in enumerate(img2img_tabs):
                                 tab.select(fn=lambda tabnum=i: tabnum, outputs=[img2img_selected_tab])

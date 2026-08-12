@@ -17,7 +17,7 @@ from modules import (
     shared_items,
     ui_common,
 )
-from modules_forge.presets import PresetArch, is_video, use_distill, use_shift
+from modules_forge.presets import PresetArch, get_capabilities, is_video, use_distill, use_shift
 from modules_forge.native_models import compatible_model_directories, is_compatible_model
 
 logger = logging.getLogger("ui_models")
@@ -45,7 +45,7 @@ LTX2_MODEL_DEFAULT = "diffusers/LTX-2.3-Diffusers"
 IDEOGRAM_MODEL_DEFAULT = "ideogram-ai/ideogram-v4"
 NATIVE_PIPELINE_PRESETS = {PresetArch.ltx2.name, PresetArch.ideogram.name}
 NATIVE_TAB_PRESETS = {"ltx_video": PresetArch.ltx2.name, "ideogram": PresetArch.ideogram.name}
-PRESET_TAB_IDS = {*NATIVE_TAB_PRESETS, "img2img"}
+PRESET_TAB_IDS = {*NATIVE_TAB_PRESETS, "txt2img", "img2img", "img2img_batch"}
 
 
 def register_native_tab(tab_id: str, tab: gr.TabItem):
@@ -53,8 +53,12 @@ def register_native_tab(tab_id: str, tab: gr.TabItem):
 
 
 def preset_tab_visible(tab_id: str, preset: str) -> bool:
+    if tab_id == "txt2img":
+        return get_capabilities(preset)["txt2img"]
     if tab_id == "img2img":
-        return preset != PresetArch.ideogram.name
+        return get_capabilities(preset)["img2img"]
+    if tab_id == "img2img_batch":
+        return get_capabilities(preset)["img2img_batch_tab"]
     expected_preset = NATIVE_TAB_PRESETS.get(tab_id)
     return expected_preset is None or expected_preset == preset
 
@@ -518,6 +522,9 @@ def forge_main_entry():
         queue=False,
         show_progress=False,
     ).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
+    # A checkpoint can change capabilities without changing the preset, for
+    # example Flux dev versus Flux Schnell.
+    ui_checkpoint.change(on_preset_change, inputs=[ui_forge_preset, ui_checkpoint], outputs=output_targets, queue=False, show_progress=False)
     Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
     for tab_id in PRESET_TAB_IDS:
@@ -563,14 +570,19 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
     restore_standard_preset(ui_forge_preset)
 
 
-def on_preset_change(preset: str):
+def on_preset_change(preset: str, checkpoint_override: str | None = None):
     assert preset is not None
     shared.opts.set("forge_preset", preset)
     shared.opts.save(shared.config_filename)
 
+    checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
+    checkpoint = checkpoint_override or checkpoint_value_for_preset(preset, checkpoint_list)
+    capabilities = get_capabilities(preset, checkpoint)
+    flux_schnell = preset == PresetArch.flux.name and "schnell" in str(checkpoint).lower()
+
     if use_shift(preset):
         d_args = {"visible": getattr(shared.opts, f"{preset}_show_shift", True), "label": "Shift"}
-    elif use_distill(preset):
+    elif use_distill(preset) and not flux_schnell:
         d_args = {"visible": True, "label": "Distilled CFG Scale"}
     else:
         d_args = {"visible": False}
@@ -587,7 +599,6 @@ def on_preset_change(preset: str):
 
     native_pipeline = preset in NATIVE_PIPELINE_PRESETS
     ideogram = preset == PresetArch.ideogram.name
-    checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
     t2i_cfg = getattr(shared.opts, f"{preset}_t2i_cfg", 1.0)
     i2i_cfg = getattr(shared.opts, f"{preset}_i2i_cfg", 1.0)
     hr_cfg = getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)
@@ -597,6 +608,22 @@ def on_preset_change(preset: str):
             return float(value) > 1.0
         except (TypeError, ValueError):
             return False
+
+    t2i_cfg = float(t2i_cfg) if capabilities["cfg"] else 1.0
+    i2i_cfg = float(i2i_cfg) if capabilities["cfg"] else 1.0
+    hr_cfg = float(hr_cfg) if capabilities["cfg"] else 1.0
+    t2i_batch_size_args = {**batch_args_t2i, "visible": capabilities["txt2img_batch_size"], "interactive": capabilities["txt2img_batch_size"]}
+    i2i_batch_size_args = {**batch_args_i2i, "visible": capabilities["img2img_batch_size"], "interactive": capabilities["img2img_batch_size"]}
+    t2i_batch_count_args = {"visible": capabilities["txt2img_batch_count"], "interactive": capabilities["txt2img_batch_count"]}
+    i2i_batch_count_args = {"visible": capabilities["img2img_batch_count"], "interactive": capabilities["img2img_batch_count"]}
+    if not capabilities["txt2img_batch_size"]:
+        t2i_batch_size_args["value"] = 1
+    if not capabilities["img2img_batch_size"]:
+        i2i_batch_size_args["value"] = 1
+    if not capabilities["txt2img_batch_count"]:
+        t2i_batch_count_args["value"] = 1
+    if not capabilities["img2img_batch_count"]:
+        i2i_batch_count_args["value"] = 1
 
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
@@ -612,34 +639,33 @@ def on_preset_change(preset: str):
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_step", 20)) > 0 else gr.skip(),
         gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),
         gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_step", 20)) > 0 else gr.skip(),
-        gr.update(visible=not native_pipeline, interactive=not native_pipeline),
-        gr.update(visible=not ideogram, interactive=not ideogram and cfg_enabled(t2i_cfg)),
-        gr.update(interactive=cfg_enabled(hr_cfg)),
-        gr.update(visible=not ideogram, interactive=not ideogram and cfg_enabled(i2i_cfg)),
-        gr.update(visible=not native_pipeline),
-        gr.update(visible=not native_pipeline),
+        gr.update(visible=capabilities["hires"] and capabilities["txt2img"], interactive=capabilities["hires"] and capabilities["txt2img"]),
+        gr.update(visible=capabilities["txt2img"], interactive=capabilities["negative_prompt"] and cfg_enabled(t2i_cfg)),
+        gr.update(visible=capabilities["hires"] and capabilities["negative_prompt"], interactive=capabilities["negative_prompt"] and cfg_enabled(hr_cfg)),
+        gr.update(visible=capabilities["img2img"], interactive=capabilities["negative_prompt"] and cfg_enabled(i2i_cfg)),
+        gr.update(visible=capabilities["img2img"] and capabilities["img2img_denoising"], interactive=capabilities["img2img"] and capabilities["img2img_denoising"]),
+        gr.update(visible=False),
         # ui_txt2img_sampler, ui_img2img_sampler, ui_txt2img_scheduler, ui_img2img_scheduler
-        gr.update(value=getattr(shared.opts, f"{preset}_t2i_sampler", "Euler"), visible=not native_pipeline, interactive=not native_pipeline),
-        gr.update(value=getattr(shared.opts, f"{preset}_i2i_sampler", "Euler"), visible=not native_pipeline, interactive=not native_pipeline),
-        gr.update(value=getattr(shared.opts, f"{preset}_t2i_scheduler", "Simple"), visible=not native_pipeline, interactive=not native_pipeline),
-        gr.update(value=getattr(shared.opts, f"{preset}_i2i_scheduler", "Simple"), visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(value=getattr(shared.opts, f"{preset}_t2i_sampler", "Euler"), visible=capabilities["txt2img"] and capabilities["standard_sampling"], interactive=capabilities["txt2img"] and capabilities["standard_sampling"]),
+        gr.update(value=getattr(shared.opts, f"{preset}_i2i_sampler", "Euler"), visible=capabilities["img2img"] and not native_pipeline, interactive=capabilities["img2img"] and not native_pipeline),
+        gr.update(value=getattr(shared.opts, f"{preset}_t2i_scheduler", "Simple"), visible=capabilities["txt2img"] and capabilities["standard_sampling"], interactive=capabilities["txt2img"] and capabilities["standard_sampling"]),
+        gr.update(value=getattr(shared.opts, f"{preset}_i2i_scheduler", "Simple"), visible=capabilities["img2img"] and not native_pipeline, interactive=capabilities["img2img"] and not native_pipeline),
         # ui_txt2img_width, ui_img2img_width, ui_txt2img_height, ui_img2img_height
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_width", 1024)) > 0 else gr.skip(),
-        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_width", 1024)) > 0 else gr.skip(),
-        gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_height", 1024)) > 0 else gr.skip(),
-        gr.update(value=v, visible=not ideogram, interactive=not ideogram) if (v := getattr(shared.opts, f"{preset}_i2i_height", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=capabilities["txt2img"], interactive=capabilities["txt2img"]) if (v := getattr(shared.opts, f"{preset}_t2i_width", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=capabilities["img2img"], interactive=capabilities["img2img"]) if (v := getattr(shared.opts, f"{preset}_i2i_width", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=capabilities["txt2img"], interactive=capabilities["txt2img"]) if (v := getattr(shared.opts, f"{preset}_t2i_height", 1024)) > 0 else gr.skip(),
+        gr.update(value=v, visible=capabilities["img2img"], interactive=capabilities["img2img"]) if (v := getattr(shared.opts, f"{preset}_i2i_height", 1024)) > 0 else gr.skip(),
         # ui_txt2img_cfg, ui_txt2img_hr_cfg, ui_img2img_cfg
-        gr.update(value=t2i_cfg) if t2i_cfg > 0 else gr.skip(),
-        gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_cfg", 1.0)) > 0 else gr.skip(),
-        gr.update(value=i2i_cfg, visible=not ideogram, interactive=not ideogram) if i2i_cfg > 0 else gr.skip(),
+        gr.update(value=t2i_cfg, visible=capabilities["txt2img"], interactive=capabilities["cfg"]),
+        gr.update(value=hr_cfg, visible=capabilities["hires"] and capabilities["txt2img"], interactive=capabilities["cfg"]),
+        gr.update(value=i2i_cfg, visible=capabilities["img2img"], interactive=capabilities["cfg"]),
         # ui_txt2img_distilled_cfg, ui_img2img_distilled_cfg, ui_txt2img_hr_distilled_cfg
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_dcfg", 3.0), **d_args),
         gr.update(value=getattr(shared.opts, f"{preset}_t2i_hr_dcfg", 3.0), **d_args),
         gr.update(value=getattr(shared.opts, f"{preset}_i2i_dcfg", 3.0), **d_args),
         # ui_txt2img_batch_size, ui_img2img_batch_size
-        gr.update(**batch_args_t2i),
-        gr.update(**batch_args_i2i, visible=not ideogram, interactive=not ideogram),
-        # LTX produces one video per request; Ideogram supports the txt2img batch count.
-        gr.update(visible=preset != PresetArch.ltx2.name, interactive=preset != PresetArch.ltx2.name),
-        gr.update(visible=not native_pipeline, interactive=not native_pipeline),
+        gr.update(**t2i_batch_size_args),
+        gr.update(**i2i_batch_size_args),
+        gr.update(**t2i_batch_count_args),
+        gr.update(**i2i_batch_count_args),
     ]

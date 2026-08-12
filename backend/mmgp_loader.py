@@ -183,6 +183,7 @@ class _StreamingForgeCheckpoint:
             streaming=True,
         )
         self._extra_sources = {}
+        self._has_external_vae = False
         source_keys = tuple(self.loader.keys())
         self._text_state = None
         metadata_reader = getattr(self.loader, "metadata", None)
@@ -262,6 +263,7 @@ class _StreamingForgeCheckpoint:
 
             vae_prefix = (getattr(self.guess, "vae_key_prefix", ()) or (None,))[0]
             if vae_prefix and ({"decoder.conv_in.weight", "decoder.conv1.weight"} & keys or "decoder.middle.0.residual.0.gamma" in keys):
+                self._has_external_vae = True
                 self._register_streaming_state(source, vae_prefix)
                 return True
 
@@ -303,7 +305,7 @@ class _StreamingForgeCheckpoint:
         if not paths:
             return
 
-        from backend.loader import load_torch_file, replace_state_dict
+        from backend.loader import _is_detectable_standalone_vae, load_torch_file, replace_state_dict
         from backend.state_dict import convert_quantization
 
         for path in paths:
@@ -314,6 +316,7 @@ class _StreamingForgeCheckpoint:
                 continue
             extra, metadata = load_torch_file(path, return_metadata=True)
             extra, metadata = convert_quantization(extra, metadata)
+            self._has_external_vae |= _is_detectable_standalone_vae(extra)
             reason = _special_format_reason(extra, metadata)
             if reason:
                 self.close()
@@ -322,6 +325,7 @@ class _StreamingForgeCheckpoint:
             del extra
             memory_management.soft_empty_cache()
         self.keys = tuple(self.state.keys())
+        self.guess._forge_external_vae = self._has_external_vae
 
     def close(self):
         loader = getattr(self, "loader", None)
@@ -502,6 +506,23 @@ def _component_kind(name: str) -> str:
     return "unet"
 
 
+def has_llm_adapter(model) -> bool:
+    """Return whether a text encoder embeds an LLM adapter module."""
+    return bool(model and any("llmadapter" in module.__class__.__name__.lower() for module in model.modules()))
+
+
+def _can_quantize_forge_component(model, name: str, quantize: bool) -> bool:
+    if not quantize or name == "transformer":
+        return False
+
+    if _component_kind(name) != "text_encoder":
+        return False
+
+    # Forge-managed text encoders with an embedded adapter use a mixed-dtype
+    # attention path that MMGP's Quanto router cannot safely quantize.
+    return not has_llm_adapter(model)
+
+
 def _component_options(name: str, dtype: torch.dtype) -> dict:
     from modules.shared import opts
 
@@ -644,10 +665,11 @@ def load_forge_component(model, state_dict: dict, name: str, ignore_start: str |
             if missing:
                 logger.debug("MMGP state-dict missing %s keys for %s; using Forge loader", len(missing), name)
                 return False
+        do_quantize = quantize and (name == "transformer" or _can_quantize_forge_component(model, name, quantize))
         offload.load_model_data(
             model,
             filtered_state_dict,
-            do_quantize=quantize and (name == "transformer" or kind == "text_encoder"),
+            do_quantize=do_quantize,
             quantizationType=quantization_type(),
             pinToMemory=pinned,
             partialPinning=bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),

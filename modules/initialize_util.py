@@ -218,6 +218,7 @@ def configure_memory_features():
         ],
         compile_enabled=getattr(opts, "forge_memory_compile_enabled", False),
         partial_pinning=getattr(opts, "forge_memory_partial_pinning_enabled", False),
+        alternate_quantization=getattr(opts, "forge_memory_alternate_quantization", False),
         quantization_type=getattr(opts, "forge_memory_quantization_type", "qint8"),
     )
 
@@ -239,7 +240,14 @@ def configure_opts_onchange():
         shared.opts.onchange(key, configure_memory_features, call=False)
     from modules_forge.main_entry import refresh_model_loading_parameters
 
-    shared.opts.onchange("forge_memory_management_enabled", refresh_model_loading_parameters, call=False)
+    def configure_memory_mode():
+        configure_memory_features()
+        refresh_model_loading_parameters()
+
+    # The master switch must reconfigure the memory backend before refreshing
+    # model-loading flags; otherwise changing only this setting leaves loaded
+    # models under the previous residency mode.
+    shared.opts.onchange("forge_memory_management_enabled", configure_memory_mode, call=False)
     shared.opts.onchange("forge_memory_dynamic_lora_enabled", refresh_model_loading_parameters, call=False)
     configure_memory_features()
     shared.opts.onchange("klein_no_reference", clear_references)

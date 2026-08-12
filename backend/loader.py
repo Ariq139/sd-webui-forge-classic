@@ -164,6 +164,11 @@ def _load_detected_vae(state_dict: dict[str, torch.Tensor], vae_format: str):
     return None
 
 
+def _is_detectable_standalone_vae(state_dict: dict[str, torch.Tensor]) -> bool:
+    normalized = _normalize_vae_state_dict(state_dict)
+    return _detect_vae_format(normalized) in {"wan21", "qwen2d"}
+
+
 def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
     config_path = os.path.join(repo_path, component_name)
 
@@ -185,7 +190,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
         if component_name == "vae" and isinstance(state_dict, dict):
             state_dict = _normalize_vae_state_dict(state_dict)
             vae_format = _detect_vae_format(state_dict)
-            detected_vae = _load_detected_vae(state_dict, vae_format) if vae_format in {"wan21", "qwen2d"} else None
+            use_detected_vae = bool(getattr(guess, "_forge_external_vae", False))
+            detected_vae = _load_detected_vae(state_dict, vae_format) if use_detected_vae and vae_format in {"wan21", "qwen2d"} else None
             if detected_vae is not None:
                 return detected_vae
 
@@ -986,12 +992,16 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
             }
         )
 
+    has_external_vae = False
     if isinstance(additional_state_dicts, list):
         for asd in additional_state_dicts:
             _asd, _meta = load_torch_file(asd, return_metadata=True)
             _asd, _ = convert_quantization(_asd, _meta)
+            has_external_vae |= _is_detectable_standalone_vae(_asd)
             sd = replace_state_dict(sd, _asd, guess, asd)
             del _asd
+
+    guess._forge_external_vae = has_external_vae
 
     guess.clip_target = guess.clip_target(sd)
     guess.model_type = guess.model_type(sd)

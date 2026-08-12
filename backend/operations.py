@@ -29,6 +29,14 @@ def repeat_kv_for_gqa(k: torch.Tensor, v: torch.Tensor, query_heads: int, head_d
     return k, v
 
 
+def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if q.dtype == k.dtype == v.dtype:
+        return q, k, v
+
+    target_dtype = torch.float32 if torch.float32 in (q.dtype, k.dtype, v.dtype) else q.dtype
+    return tuple(t if t.dtype == target_dtype else t.to(target_dtype) for t in (q, k, v))
+
+
 def scaled_dot_product_attention(q, k, v, *args, **kwargs):
     attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
     if kwargs.get("enable_gqa", False) and attn_mask is not None:
