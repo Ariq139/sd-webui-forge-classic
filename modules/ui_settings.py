@@ -16,11 +16,13 @@ from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS, get_memory_profile
 CURRENT_ROW: gr.Row = None
 MMGP_UI_SETTING_KEYS = {
     "forge_memory_profile",
+    "forge_memory_attention_backend",
     "forge_memory_dynamic_lora_enabled",
     "forge_memory_persistent_cache_enabled",
     "forge_memory_cache_directory",
     *MEMORY_SETTING_KEYS,
 }
+MMGP_DEPENDENT_SETTING_KEYS = tuple(key for key in MMGP_UI_SETTING_KEYS if key != "forge_memory_management_enabled")
 
 
 def get_value_for_setting(key):
@@ -29,13 +31,21 @@ def get_value_for_setting(key):
     info = opts.data_labels[key]
     args = info.component_args() if callable(info.component_args) else info.component_args or {}
     args = {k: v for k, v in args.items() if k not in {"precision"}}
+    if key in {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"} and value not in args.get("choices", ()):
+        value = "automatic"
 
     return gr.update(value=value, **args)
 
 
 def create_setting_component(key, is_quicksettings=False):
     def fun():
-        return opts.data[key] if key in opts.data else opts.data_labels[key].default
+        value = opts.data[key] if key in opts.data else opts.data_labels[key].default
+        if key in {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"}:
+            info = opts.data_labels[key]
+            choices_args = info.component_args() if callable(info.component_args) else info.component_args or {}
+            if value not in choices_args.get("choices", ()):
+                value = "automatic"
+        return value
 
     info = opts.data_labels[key]
     t = type(info.default)
@@ -43,9 +53,11 @@ def create_setting_component(key, is_quicksettings=False):
     args = info.component_args() if callable(info.component_args) else info.component_args
     args = dict(args or {})
 
-    # Disable MMGP controls unless --mmgp is active.
-    if key in MMGP_UI_SETTING_KEYS and not shared.cmd_opts.mmgp:
-        args["interactive"] = False
+    # Disable MMGP controls unless --mmgp and the UI master switch are active.
+    if key in MMGP_UI_SETTING_KEYS:
+        args["interactive"] = bool(shared.cmd_opts.mmgp)
+        if key != "forge_memory_management_enabled":
+            args["interactive"] = args["interactive"] and bool(getattr(opts, "forge_memory_management_enabled", False))
 
     if info.component is not None:
         comp = info.component
@@ -269,6 +281,25 @@ class UiSettings:
                     fn=apply_memory_profile,
                     inputs=[profile_component],
                     outputs=profile_outputs,
+                    queue=False,
+                    show_progress=False,
+                )
+
+            mmgp_master = self.component_dict.get("forge_memory_management_enabled")
+            mmgp_dependents = [
+                self.component_dict[key]
+                for key in MMGP_DEPENDENT_SETTING_KEYS
+                if key in self.component_dict
+            ]
+            if mmgp_master is not None and mmgp_dependents:
+                def update_mmgp_controls(enabled):
+                    interactive = bool(enabled and shared.cmd_opts.mmgp)
+                    return [gr.update(interactive=interactive) for _ in mmgp_dependents]
+
+                mmgp_master.change(
+                    fn=update_mmgp_controls,
+                    inputs=[mmgp_master],
+                    outputs=mmgp_dependents,
                     queue=False,
                     show_progress=False,
                 )

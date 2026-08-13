@@ -16,6 +16,7 @@ from torchvision.transforms import InterpolationMode, functional
 
 from backend.args import dynamic_args
 from backend.attention import attention_function
+from backend import memory_management
 from backend.memory_management import is_device_mps
 from backend.operations import (
     main_stream_worker,
@@ -585,7 +586,8 @@ class Attention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
-        query_states, key_states, value_states = match_attention_dtypes(query_states, key_states, value_states)
+        if memory_management.MMGP_RUNTIME_ACTIVE:
+            query_states, key_states, value_states = match_attention_dtypes(query_states, key_states, value_states)
         attn_output = scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

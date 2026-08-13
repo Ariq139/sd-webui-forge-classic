@@ -30,6 +30,8 @@ def repeat_kv_for_gqa(k: torch.Tensor, v: torch.Tensor, query_heads: int, head_d
 
 
 def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not memory_management.MMGP_RUNTIME_ACTIVE:
+        return q, k, v
     if q.dtype == k.dtype == v.dtype:
         return q, k, v
 
@@ -38,6 +40,8 @@ def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
 
 
 def scaled_dot_product_attention(q, k, v, *args, **kwargs):
+    if memory_management.MMGP_RUNTIME_ACTIVE:
+        q, k, v = match_attention_dtypes(q, k, v)
     attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
     if kwargs.get("enable_gqa", False) and attn_mask is not None:
         k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
@@ -58,6 +62,8 @@ try:
             ]
 
             def scaled_dot_product_attention(q, k, v, *args, **kwargs):
+                if memory_management.MMGP_RUNTIME_ACTIVE:
+                    q, k, v = match_attention_dtypes(q, k, v)
                 attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
                 if kwargs.get("enable_gqa", False) and attn_mask is not None and not memory_management.is_nvidia():
                     k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)

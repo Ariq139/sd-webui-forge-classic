@@ -3,6 +3,8 @@
 
 MEMORY_SETTING_KEYS = (
     "forge_memory_management_enabled",
+    "forge_memory_attention_backend",
+    "forge_memory_vae_attention_backend",
     "forge_memory_alternate_quantization",
     "forge_memory_quantization_type",
     "forge_memory_compile_enabled",
@@ -24,6 +26,25 @@ MEMORY_SETTING_KEYS = (
     "forge_memory_keep_text_encoder_loaded",
     "forge_memory_keep_vae_loaded",
     "forge_memory_keep_controlnet_loaded",
+)
+
+MMGP_ATTENTION_BACKEND_CHOICES = (
+    "automatic",
+    "sdpa",
+    "sage",
+    "sage2",
+    "sage3",
+    "flash",
+    "flash3",
+    "radial",
+    "xformers",
+)
+
+MMGP_VAE_ATTENTION_BACKEND_CHOICES = (
+    "automatic",
+    "sdpa",
+    "xformers",
+    "slice",
 )
 
 # MMGP's minimum hardware targets; these are labels, not hard caps.
@@ -56,6 +77,8 @@ MEMORY_PROFILE_CHOICES = (
 MEMORY_PROFILES = {
     "HighRAM_HighVRAM": {
         "forge_memory_management_enabled": True,
+        "forge_memory_attention_backend": "automatic",
+        "forge_memory_vae_attention_backend": "automatic",
         "forge_memory_alternate_quantization": True,
         "forge_memory_quantization_type": "qint8",
         "forge_memory_compile_enabled": False,
@@ -80,6 +103,8 @@ MEMORY_PROFILES = {
     },
     "HighRAM_LowVRAM": {
         "forge_memory_management_enabled": True,
+        "forge_memory_attention_backend": "automatic",
+        "forge_memory_vae_attention_backend": "automatic",
         "forge_memory_alternate_quantization": True,
         "forge_memory_quantization_type": "qint8",
         "forge_memory_compile_enabled": False,
@@ -104,6 +129,8 @@ MEMORY_PROFILES = {
     },
     "LowRAM_HighVRAM": {
         "forge_memory_management_enabled": True,
+        "forge_memory_attention_backend": "automatic",
+        "forge_memory_vae_attention_backend": "automatic",
         "forge_memory_alternate_quantization": True,
         "forge_memory_quantization_type": "qint8",
         "forge_memory_compile_enabled": False,
@@ -128,6 +155,8 @@ MEMORY_PROFILES = {
     },
     "LowRAM_LowVRAM": {
         "forge_memory_management_enabled": True,
+        "forge_memory_attention_backend": "automatic",
+        "forge_memory_vae_attention_backend": "automatic",
         "forge_memory_alternate_quantization": True,
         "forge_memory_quantization_type": "qint8",
         "forge_memory_compile_enabled": False,
@@ -152,6 +181,8 @@ MEMORY_PROFILES = {
     },
     "VerylowRAM_LowVRAM": {
         "forge_memory_management_enabled": True,
+        "forge_memory_attention_backend": "automatic",
+        "forge_memory_vae_attention_backend": "automatic",
         "forge_memory_alternate_quantization": True,
         "forge_memory_quantization_type": "qint8",
         "forge_memory_compile_enabled": False,

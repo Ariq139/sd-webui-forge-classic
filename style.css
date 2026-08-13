@@ -2270,11 +2270,6 @@ body.resizing .resize-handle {
         box-sizing: border-box;
     }
 
-    #tabs:has(#tab_ltx_video[style*="display: none"]) > .tab-wrapper > .overflow-menu > .overflow-dropdown > button:nth-child(1),
-    #tabs:has(#tab_ideogram[style*="display: none"]) > .tab-wrapper > .overflow-menu > .overflow-dropdown > button:nth-child(2) {
-        display: none !important;
-    }
-
     #tabs > .tab-wrapper > .tab-container,
     .extra-networks > .tab-wrapper > .tab-container,
     #txt2img_extra_tabs > .tab-wrapper > .tab-container,
@@ -2285,9 +2280,49 @@ body.resizing .resize-handle {
         overflow-y: hidden !important;
     }
 
+    /* Keep the Extra Networks tabs usable, then give their view controls a
+       full row. Without this, the controls remain a shrinking flex item in
+       the tab list and their search/sort buttons collapse on mobile. */
+    #txt2img_extra_tabs > .tab-wrapper > .tab-container[role="tablist"],
+    #img2img_extra_tabs > .tab-wrapper > .tab-container[role="tablist"],
+    .extra-networks > .tab-wrapper > .tab-container[role="tablist"] {
+        height: auto !important;
+        min-height: 43.2px !important;
+        align-content: flex-start !important;
+        flex-wrap: wrap !important;
+        overflow-x: visible !important;
+        overflow-y: visible !important;
+    }
+
+    #txt2img_extra_tabs > .tab-wrapper,
+    #img2img_extra_tabs > .tab-wrapper,
+    .extra-networks > .tab-wrapper {
+        height: auto !important;
+        min-height: 0 !important;
+    }
+
+    #txt2img_extra_tabs > .tab-wrapper > .tab-container[role="tablist"] > .extra-networks-controls-div,
+    #img2img_extra_tabs > .tab-wrapper > .tab-container[role="tablist"] > .extra-networks-controls-div,
+    .extra-networks > .tab-wrapper > .tab-container[role="tablist"] > .extra-networks-controls-div {
+        flex: 0 0 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        margin-left: 0 !important;
+        margin-top: 0.25rem !important;
+        order: 100;
+    }
+
+    .extra-networks-controls-div > .extra-network-control {
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+
     #tabs > .tab-wrapper > .tab-container > button,
     .extra-networks > .tab-wrapper > .tab-container > button {
         flex: 0 0 auto !important;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
         white-space: nowrap;
     }
 

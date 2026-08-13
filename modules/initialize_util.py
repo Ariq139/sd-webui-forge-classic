@@ -191,6 +191,8 @@ def configure_memory_features():
 
     apply_memory_features(
         enabled=getattr(opts, "forge_memory_management_enabled", False),
+        attention_backend=getattr(opts, "forge_memory_attention_backend", "automatic"),
+        vae_attention_backend=getattr(opts, "forge_memory_vae_attention_backend", "automatic"),
         budgets=getattr(opts, "forge_memory_budgets_enabled", False),
         pinned_memory=getattr(opts, "forge_memory_pinned_memory_enabled", False),
         async_transfers=getattr(opts, "forge_memory_async_transfers_enabled", False),
@@ -242,6 +244,11 @@ def configure_opts_onchange():
 
     def configure_memory_mode():
         configure_memory_features()
+        # Rebuild the model after a mode change so MMGP-prepared modules cannot
+        # remain in the normal Forge path.
+        from modules import sd_models
+
+        sd_models.unload_model_weights()
         refresh_model_loading_parameters()
 
     # The master switch must reconfigure the memory backend before refreshing

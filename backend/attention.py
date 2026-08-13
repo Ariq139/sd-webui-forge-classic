@@ -2,6 +2,8 @@
 
 import logging
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 from einops import rearrange, repeat
@@ -13,6 +15,17 @@ from backend.logging import setup_logger
 
 logger = logging.getLogger("attention")
 setup_logger(logger)
+
+SAGE2_ATTN = None
+SAGE_VARLEN_ATTN = None
+SAGE3_ATTN = None
+FLASH_ATTN_VARLEN = None
+FLASH_ATTN3_VARLEN = None
+RADIAL_ATTN = None
+IS_SAGE_1 = False
+IS_SAGE_3 = False
+_RADIAL_WARNING_EMITTED = False
+_SAGE2_MASK_WARNING_EMITTED = False
 
 
 if memory_management.xformers_enabled() or memory_management.xformers_enabled_vae():
@@ -33,6 +46,22 @@ if memory_management.sage_enabled():
         from functools import partial
 
         import sageattention
+
+        SAGE2_ATTN = getattr(sageattention, "sageattn", None)
+        SAGE_VARLEN_ATTN = getattr(sageattention, "sageattn_varlen", None)
+
+        try:
+            from spas_sage_attn import block_sparse_sage2_attn_cuda as RADIAL_ATTN
+        except ImportError:
+            pass
+
+        try:
+            from sageattention import sageattn_blackwell as SAGE3_ATTN
+        except ImportError:
+            try:
+                from sageattn3 import sageattn3_blackwell as SAGE3_ATTN
+            except ImportError:
+                pass
 
         from backend.args import SageAttentionFuncs
 
@@ -59,7 +88,14 @@ if memory_management.sage_enabled():
 
 
 if memory_management.flash_enabled():
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+
+    FLASH_ATTN_VARLEN = flash_attn_varlen_func
+    try:
+        import flash_attn_interface
+        FLASH_ATTN3_VARLEN = getattr(flash_attn_interface, "flash_attn_varlen_func", None)
+    except ImportError:
+        pass
 
     @torch.library.custom_op("flash_attention::flash_attn", mutates_args=())
     def flash_attn_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float = 0.0, causal: bool = False) -> torch.Tensor:
@@ -97,6 +133,90 @@ def _reshape_qkv_to_heads(q, k, v, b, heads, dim_head, enable_gqa=False, expand_
     if enable_gqa and expand_kv:
         k, v = operations.repeat_kv_for_gqa(k, v, heads, -2)
     return q, k, v
+
+
+def _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape):
+    if skip_reshape:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            return None
+        q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    else:
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            return None
+        b, _, inner_dim = q.shape
+        if inner_dim % heads != 0:
+            return None
+        dim_head = inner_dim // heads
+        q, k, v = (t.view(b, -1, heads, dim_head).contiguous() for t in (q, k, v))
+
+    if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2] or q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        return None
+    return q, k, v
+
+
+def _equal_attention_cu_seqlens(batch, sequence_length, device):
+    return torch.arange(0, (batch + 1) * sequence_length, sequence_length, dtype=torch.int32, device=device)
+
+
+def _attention_lengths(lengths, batch, maximum, device):
+    if lengths is None:
+        return torch.full((batch,), maximum, dtype=torch.int32, device=device)
+    if not torch.is_tensor(lengths):
+        lengths = torch.as_tensor(lengths, dtype=torch.int32, device=device)
+    else:
+        lengths = lengths.to(device=device, dtype=torch.int32)
+    if lengths.numel() == 1 and batch != 1:
+        lengths = lengths.expand(batch)
+    if lengths.numel() != batch:
+        raise ValueError(f"attention lengths must contain one value per batch item, got {lengths.numel()} for batch {batch}")
+    if torch.any(lengths <= 0) or torch.any(lengths > maximum):
+        raise ValueError(f"attention lengths must be in the range 1..{maximum}")
+    return lengths.contiguous()
+
+
+def _pack_attention_inputs(q, k, v, q_lens=None, k_lens=None):
+    batch, query_length, _, _ = q.shape
+    key_length = k.shape[1]
+    q_lens = _attention_lengths(q_lens, batch, query_length, q.device)
+    k_lens = _attention_lengths(k_lens, batch, key_length, k.device)
+    q_packed = torch.cat([q[i, : int(q_lens[i])] for i in range(batch)], dim=0)
+    k_packed = torch.cat([k[i, : int(k_lens[i])] for i in range(batch)], dim=0)
+    v_packed = torch.cat([v[i, : int(k_lens[i])] for i in range(batch)], dim=0)
+    cu_q = torch.cat([torch.zeros(1, dtype=torch.int32, device=q.device), q_lens.cumsum(0, dtype=torch.int32)])
+    cu_k = torch.cat([torch.zeros(1, dtype=torch.int32, device=k.device), k_lens.cumsum(0, dtype=torch.int32)])
+    return q_packed, k_packed, v_packed, cu_q, cu_k, int(q_lens.max()), int(k_lens.max()), q_lens
+
+
+def _unpack_attention_output(output, q_lens, batch, query_length):
+    heads, dim_head = output.shape[-2:]
+    result = torch.zeros((batch, query_length, heads, dim_head), dtype=output.dtype, device=output.device)
+    offset = 0
+    for index, length in enumerate(q_lens.tolist()):
+        result[index, :length] = output[offset : offset + length]
+        offset += length
+    return result
+
+
+def _sage2_mask_support_reason(q, mask):
+    if mask is None:
+        return None
+    if not q.is_cuda:
+        return "CUDA is unavailable"
+    try:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability[0] < 8:
+            return f"CUDA architecture sm_{capability[0]}{capability[1]} has no masked SageAttention path"
+        if q.shape[-1] > 128:
+            return f"head_dim {q.shape[-1]} is unsupported"
+        if SAGE2_ATTN is None:
+            return "SageAttention 2 is unavailable"
+        import inspect
+
+        if "attn_mask" not in inspect.signature(SAGE2_ATTN).parameters and not any(parameter.kind == parameter.VAR_KEYWORD for parameter in inspect.signature(SAGE2_ATTN).parameters.values()):
+            return "installed SageAttention does not expose attn_mask"
+    except (TypeError, ValueError):
+        return "unable to inspect installed SageAttention mask support"
+    return None
 
 
 if memory_management.is_nvidia():
@@ -222,6 +342,11 @@ def attention_xformers(q, k, v, heads, mask=None, attn_precision=None, skip_resh
 
 
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
+    output_dtype = v.dtype
+    if mmgp_active:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
+
     if skip_reshape:
         b, _, _, dim_head = q.shape
     else:
@@ -253,12 +378,16 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
 
             out[i : i + SDP_BATCH_LIMIT] = operations.scaled_dot_product_attention(q[i : i + SDP_BATCH_LIMIT], k[i : i + SDP_BATCH_LIMIT], v[i : i + SDP_BATCH_LIMIT], attn_mask=m, dropout_p=0.0, is_causal=False, **sdpa_extra).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
 
-    return out
+    return out.to(output_dtype) if mmgp_active and out.dtype != output_dtype else out
 
 
 @torch.compiler.disable
 def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     in_dtype = v.dtype
+    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
+    sage_kernel = kwargs.pop("_sage_kernel", sageattn)
+    if mmgp_active:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -284,7 +413,7 @@ def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=
 
     try:
         if not _fallback:
-            out = sageattn(q, k, v, attn_mask=mask, is_causal=False, tensor_layout=tensor_layout).to(in_dtype)
+            out = sage_kernel(q, k, v, attn_mask=mask, is_causal=False, tensor_layout=tensor_layout).to(in_dtype)
     except Exception as e:
         logger.error(f"Error running sageattn: {e}")
         _fallback = True
@@ -310,7 +439,119 @@ def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=
 
 
 @torch.compiler.disable
+def attention_sage_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    if SAGE_VARLEN_ATTN is None or mask is not None:
+        return attention_sage(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    original_q, original_k, original_v = q, k, v
+    output_dtype = v.dtype
+    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if torch.float32 in (q.dtype, k.dtype, v.dtype):
+        q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+
+    qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
+    if qkv is None:
+        return attention_sage(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    q, k, v = qkv
+    batch, query_length, _, _ = q.shape
+    key_length = k.shape[1]
+    requested_q_lens = kwargs.pop("q_lens", None)
+    requested_k_lens = kwargs.pop("k_lens", None)
+    fallback_kwargs = dict(kwargs)
+    fallback_kwargs.update(q_lens=requested_q_lens, k_lens=requested_k_lens)
+    if requested_q_lens is None and requested_k_lens is None:
+        q_packed = q.reshape(-1, q.shape[2], q.shape[3])
+        k_packed = k.reshape(-1, k.shape[2], k.shape[3])
+        v_packed = v.reshape(-1, v.shape[2], v.shape[3])
+        cu_seqlens_q = _equal_attention_cu_seqlens(batch, query_length, q.device)
+        cu_seqlens_k = _equal_attention_cu_seqlens(batch, key_length, k.device)
+        max_query_length = query_length
+        max_key_length = key_length
+        q_lens = torch.full((batch,), query_length, dtype=torch.int32, device=q.device)
+    else:
+        q_packed, k_packed, v_packed, cu_seqlens_q, cu_seqlens_k, max_query_length, max_key_length, q_lens = _pack_attention_inputs(q, k, v, requested_q_lens, requested_k_lens)
+
+    try:
+        out = SAGE_VARLEN_ATTN(
+            q_packed,
+            k_packed,
+            v_packed,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_query_length,
+            max_key_length,
+            is_causal=False,
+            sm_scale=kwargs.get("scale"),
+        )
+        out = _unpack_attention_output(out, q_lens, batch, query_length)
+    except Exception as e:
+        logger.error(f"Error running varlen sageattn: {e}")
+        return attention_sage(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **fallback_kwargs).to(output_dtype)
+
+    if skip_output_reshape:
+        out = out.transpose(1, 2)
+    else:
+        out = out.reshape(batch, query_length, -1)
+    return out.to(output_dtype)
+
+
+@torch.compiler.disable
+def attention_sage2(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    if SAGE2_ATTN is None:
+        logger.warning("SageAttention 2 is unavailable; using PyTorch attention")
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    if mask is not None:
+        q_for_check = q if skip_reshape else q.view(q.shape[0], -1, heads, q.shape[-1] // heads)
+        reason = _sage2_mask_support_reason(q_for_check, mask)
+        if reason is not None:
+            global _SAGE2_MASK_WARNING_EMITTED
+            if not _SAGE2_MASK_WARNING_EMITTED:
+                logger.warning("SageAttention 2 cannot use this attention mask (%s); using PyTorch attention", reason)
+                _SAGE2_MASK_WARNING_EMITTED = True
+            return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    return attention_sage(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, _sage_kernel=SAGE2_ATTN, **kwargs)
+
+
+@torch.compiler.disable
+def attention_sage3(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    if SAGE3_ATTN is None or mask is not None:
+        return attention_sage(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    original_q, original_k, original_v = q, k, v
+    output_dtype = v.dtype
+    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if torch.float32 in (q.dtype, k.dtype, v.dtype):
+        q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+
+    qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
+    if qkv is None:
+        return attention_sage(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    q, k, v = qkv
+    batch, query_length = q.shape[:2]
+    try:
+        out = SAGE3_ATTN(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+    except Exception as e:
+        logger.error(f"Error running sageattn3: {e}")
+        return attention_sage(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs).to(output_dtype)
+
+    if skip_output_reshape:
+        out = out.transpose(1, 2)
+    else:
+        out = out.reshape(batch, query_length, -1)
+    return out.to(output_dtype)
+
+
+@torch.compiler.disable
 def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
+    output_dtype = v.dtype
+    if mmgp_active:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
+
     if skip_reshape:
         b, _, _, dim_head = q.shape
     else:
@@ -347,11 +588,116 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     if not skip_output_reshape:
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
-    return out
+    return out.to(output_dtype) if mmgp_active and out.dtype != output_dtype else out
+
+
+@torch.compiler.disable
+def attention_flash_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    if kwargs.get("_flash_kernel", FLASH_ATTN_VARLEN) is None or mask is not None:
+        return attention_flash(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    original_q, original_k, original_v = q, k, v
+    output_dtype = v.dtype
+    q, k, v = operations.match_attention_dtypes(q, k, v)
+    qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
+    if qkv is None:
+        return attention_flash(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    q, k, v = qkv
+    if torch.float32 in (q.dtype, k.dtype, v.dtype):
+        q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+
+    batch, query_length = q.shape[:2]
+    key_length = k.shape[1]
+    requested_q_lens = kwargs.pop("q_lens", None)
+    requested_k_lens = kwargs.pop("k_lens", None)
+    fallback_kwargs = dict(kwargs)
+    fallback_kwargs.update(q_lens=requested_q_lens, k_lens=requested_k_lens)
+    if requested_q_lens is None and requested_k_lens is None:
+        q_packed = q.reshape(-1, q.shape[2], q.shape[3])
+        k_packed = k.reshape(-1, k.shape[2], k.shape[3])
+        v_packed = v.reshape(-1, v.shape[2], v.shape[3])
+        cu_seqlens_q = _equal_attention_cu_seqlens(batch, query_length, q.device)
+        cu_seqlens_k = _equal_attention_cu_seqlens(batch, key_length, k.device)
+        max_query_length = query_length
+        max_key_length = key_length
+        q_lens = torch.full((batch,), query_length, dtype=torch.int32, device=q.device)
+    else:
+        q_packed, k_packed, v_packed, cu_seqlens_q, cu_seqlens_k, max_query_length, max_key_length, q_lens = _pack_attention_inputs(q, k, v, requested_q_lens, requested_k_lens)
+    flash_kernel = kwargs.pop("_flash_kernel", FLASH_ATTN_VARLEN)
+
+    try:
+        flash_kwargs = dict(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_query_length,
+            max_seqlen_k=max_key_length,
+            dropout_p=0.0,
+            softmax_scale=kwargs.get("scale"),
+            causal=False,
+        )
+        try:
+            out = flash_kernel(q_packed, k_packed, v_packed, **flash_kwargs)
+        except TypeError:
+            # FlashAttention 3 uses the same packed inputs but also accepts
+            # explicit sequence-use arguments in some releases.
+            flash_kwargs.update(seqused_q=None, seqused_k=None)
+            out = flash_kernel(q_packed, k_packed, v_packed, **flash_kwargs)
+        if isinstance(out, tuple):
+            out = out[0]
+        out = _unpack_attention_output(out, q_lens, batch, query_length)
+    except Exception as e:
+        logger.error(f"Error running varlen flash_attn: {e}")
+        return attention_flash(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **fallback_kwargs).to(output_dtype)
+
+    if skip_output_reshape:
+        out = out.transpose(1, 2)
+    else:
+        out = out.reshape(batch, query_length, -1)
+    return out.to(output_dtype)
+
+
+@torch.compiler.disable
+def attention_flash3_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    if FLASH_ATTN3_VARLEN is None:
+        return attention_flash_varlen(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    return attention_flash_varlen(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, _flash_kernel=FLASH_ATTN3_VARLEN, **kwargs)
+
+
+@torch.compiler.disable
+def attention_radial(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    """Use Wan2GP's block-sparse Sage2 kernel only with an explicit radial mask."""
+    global _RADIAL_WARNING_EMITTED
+    mask_id = kwargs.pop("mask_id", kwargs.pop("radial_mask_id", None))
+    if RADIAL_ATTN is None or mask_id is None or mask is not None:
+        if mask_id is None and RADIAL_ATTN is not None and not _RADIAL_WARNING_EMITTED:
+            logger.warning("Radial attention needs a model-provided mask_id; using SageAttention 2")
+            _RADIAL_WARNING_EMITTED = True
+        return attention_sage2(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    original_q, original_k, original_v = q, k, v
+    output_dtype = v.dtype
+    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if torch.float32 in (q.dtype, k.dtype, v.dtype):
+        q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+    qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
+    if qkv is None:
+        return attention_sage2(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    q, k, v = qkv
+    try:
+        out = RADIAL_ATTN(q, k, v, mask_id=mask_id, scale=kwargs.get("scale"), tensor_layout="NHD", output_dtype=output_dtype)
+    except Exception as error:
+        logger.warning("Radial Sage2 attention failed; using SageAttention 2: %s", error)
+        return attention_sage2(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    if skip_output_reshape:
+        out = out.transpose(1, 2)
+    else:
+        out = out.reshape(out.shape[0], out.shape[1], -1)
+    return out.to(output_dtype)
 
 
 if memory_management.sage_enabled():
-    attention_function = attention_sage
+    _automatic_attention_function = attention_sage
     if IS_SAGE_1:
         logger.info("Using SageAttention")
     elif IS_SAGE_3:
@@ -368,19 +714,95 @@ if memory_management.sage_enabled():
                 logger.info("Using SageAttention 2 (fp8 CUDA)")
             case SageAttentionFuncs.fp8_cuda_pp:
                 logger.info("Using SageAttention 2 (fp8 CUDA ++)")
-
 elif memory_management.flash_enabled():
     logger.info("Using FlashAttention")
-    attention_function = attention_flash
+    _automatic_attention_function = attention_flash
 elif memory_management.xformers_enabled():
     logger.info("Using xformers Cross Attention")
-    attention_function = attention_xformers
+    _automatic_attention_function = attention_xformers
 elif memory_management.pytorch_attention_enabled():
     logger.info("Using PyTorch Cross Attention")
-    attention_function = attention_pytorch
+    _automatic_attention_function = attention_pytorch
 else:
     logger.info("Using Basic Cross Attention")
-    attention_function = attention_basic
+    _automatic_attention_function = attention_basic
+
+
+def _resolve_mmgp_attention_backend(requested):
+    if requested == "sdpa":
+        return attention_pytorch
+    if requested == "sage2" and memory_management.sage_enabled() and SAGE2_ATTN is not None:
+        return attention_sage2
+    if requested == "sage" and memory_management.sage_enabled():
+        return attention_sage_varlen if SAGE_VARLEN_ATTN is not None else attention_sage
+    if requested == "sage3" and memory_management.sage_enabled() and SAGE3_ATTN is not None:
+        return attention_sage3
+    if requested == "flash" and memory_management.flash_enabled():
+        return attention_flash_varlen if FLASH_ATTN_VARLEN is not None else attention_flash
+    if requested == "flash3" and FLASH_ATTN3_VARLEN is not None and memory_management.flash_enabled():
+        return attention_flash3_varlen
+    if requested == "radial" and RADIAL_ATTN is not None and memory_management.sage_enabled():
+        return attention_radial
+    if requested == "xformers" and memory_management.xformers_enabled():
+        return attention_xformers
+    return _automatic_attention_function
+
+
+_last_attention_backend = memory_management.mmgp_attention_backend()
+_active_attention_function = _resolve_mmgp_attention_backend(_last_attention_backend)
+if _last_attention_backend != "automatic" and _active_attention_function is _automatic_attention_function:
+    logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", _last_attention_backend)
+
+
+def _dispatch_attention(*args, **kwargs):
+    global _last_attention_backend, _active_attention_function
+    if not memory_management.MMGP_RUNTIME_ACTIVE and _ATTENTION_OVERRIDE.get() is None:
+        return _automatic_attention_function(*args, **kwargs)
+
+    requested = _ATTENTION_OVERRIDE.get()
+    if requested is None:
+        requested = kwargs.get("force_attention")
+    if requested is None:
+        transformer_options = kwargs.get("transformer_options") or {}
+        requested = transformer_options.get("attention_backend") or transformer_options.get("force_attention")
+    requested = requested or memory_management.mmgp_attention_backend()
+    if str(requested).lower() in {"auto", "automatic", "sol"}:
+        requested = "automatic"
+    if requested != _last_attention_backend:
+        _last_attention_backend = requested
+        _active_attention_function = _resolve_mmgp_attention_backend(requested)
+        if requested != "automatic" and _active_attention_function is _automatic_attention_function:
+            logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", requested)
+    return _active_attention_function(*args, **kwargs)
+
+
+attention_function = _dispatch_attention
+
+
+_ATTENTION_OVERRIDE: ContextVar[str | None] = ContextVar("forge_attention_override", default=None)
+
+
+@contextmanager
+def attention_shared_state(default_attention=None):
+    """Temporarily provide a per-generation attention default."""
+    token = None
+    if _ATTENTION_OVERRIDE.get() is None:
+        token = _ATTENTION_OVERRIDE.set(default_attention or "automatic")
+    try:
+        yield
+    finally:
+        if token is not None:
+            _ATTENTION_OVERRIDE.reset(token)
+
+
+@contextmanager
+def attention_config_shared_state(attention_backend=None):
+    """Temporarily force one attention backend for the current execution context."""
+    token = _ATTENTION_OVERRIDE.set(str(attention_backend or "automatic").strip().lower())
+    try:
+        yield _ATTENTION_OVERRIDE.get()
+    finally:
+        _ATTENTION_OVERRIDE.reset(token)
 
 
 # region VAE
@@ -491,11 +913,57 @@ def pytorch_attention_vae(q, k, v):
 
 
 if memory_management.xformers_enabled_vae():
+    _automatic_vae_attention_function = xformers_attention_vae
     logger.info("Using xformers Attention for VAE")
-    attention_function_vae = xformers_attention_vae
 elif memory_management.pytorch_attention_enabled():
+    _automatic_vae_attention_function = pytorch_attention_vae
     logger.info("Using PyTorch Attention for VAE")
-    attention_function_vae = pytorch_attention_vae
 else:
+    _automatic_vae_attention_function = normal_attention_vae
     logger.info("Using Slice Attention for VAE")
-    attention_function_vae = normal_attention_vae
+
+
+_VAE_ATTENTION_OVERRIDE: ContextVar[str | None] = ContextVar("forge_vae_attention_override", default=None)
+_last_vae_attention_backend = memory_management.mmgp_vae_attention_backend()
+
+
+def _resolve_mmgp_vae_attention_backend(requested):
+    if requested == "sdpa":
+        return pytorch_attention_vae
+    if requested == "xformers" and memory_management.xformers_enabled_vae():
+        return xformers_attention_vae
+    if requested == "slice":
+        return normal_attention_vae
+    return _automatic_vae_attention_function
+
+
+_active_vae_attention_function = _resolve_mmgp_vae_attention_backend(_last_vae_attention_backend)
+
+
+def _dispatch_vae_attention(*args, **kwargs):
+    global _last_vae_attention_backend, _active_vae_attention_function
+    if not memory_management.MMGP_RUNTIME_ACTIVE and _VAE_ATTENTION_OVERRIDE.get() is None:
+        return _automatic_vae_attention_function(*args, **kwargs)
+
+    requested = _VAE_ATTENTION_OVERRIDE.get() or memory_management.mmgp_vae_attention_backend()
+    if requested in {"auto", "automatic"}:
+        requested = "automatic"
+    if requested != _last_vae_attention_backend:
+        _last_vae_attention_backend = requested
+        _active_vae_attention_function = _resolve_mmgp_vae_attention_backend(requested)
+        if requested != "automatic" and _active_vae_attention_function is _automatic_vae_attention_function:
+            logger.warning("MMGP VAE attention backend %s is unavailable; using Forge's automatic VAE attention priority", requested)
+    return _active_vae_attention_function(*args, **kwargs)
+
+
+attention_function_vae = _dispatch_vae_attention
+
+
+@contextmanager
+def vae_attention_config_shared_state(attention_backend=None):
+    """Temporarily force one VAE attention backend for the current execution context."""
+    token = _VAE_ATTENTION_OVERRIDE.set(str(attention_backend or "automatic").strip().lower())
+    try:
+        yield _VAE_ATTENTION_OVERRIDE.get()
+    finally:
+        _VAE_ATTENTION_OVERRIDE.reset(token)

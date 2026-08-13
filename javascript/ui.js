@@ -304,32 +304,54 @@ document.addEventListener("visibilitychange", restoreProgressAfterPageResume);
 window.addEventListener("pageshow", restoreProgressAfterPageResume);
 
 function syncPresetTabOverflow() {
-    const tabs = gradioApp().querySelector("#tabs");
+    // Use the browser document here because this helper also runs while the
+    // compact overflow menu is being rebuilt by Gradio.
+    const root = document;
+    const tabs = root.querySelector("#tabs");
     const overflow = tabs?.querySelector(":scope > .tab-wrapper > .overflow-menu");
     if (!overflow) return;
 
+    const preset = root.querySelector("#forge_ui_preset input")?.value?.trim().toLowerCase();
     const presetTabs = {
-        "LTX Video": gradioApp().getElementById("tab_ltx_video"),
-        "Ideogram 4": gradioApp().getElementById("tab_ideogram"),
+        "LTX Video": { id: "tab_ltx_video", preset: "ltx2" },
+        "Ideogram 4": { id: "tab_ideogram", preset: "ideogram" },
     };
 
     overflow.querySelectorAll(":scope > .overflow-dropdown > button").forEach((button) => {
-        const tab = presetTabs[button.textContent.trim()];
-        if (!tab) return;
+        const entry = presetTabs[button.textContent.trim()];
+        if (!entry) return;
 
-        const display = getComputedStyle(tab).display === "none" ? "none" : "";
+        const tab = root.getElementById(entry.id);
+        const display = preset
+            ? (preset === entry.preset ? "" : "none")
+            : (tab && getComputedStyle(tab).display === "none" ? "none" : "");
         if (button.style.display !== display) button.style.display = display;
     });
 }
 
-onUiLoaded(function () {
-    syncPresetTabOverflow();
-    const tabs = gradioApp().querySelector("#tabs");
-    if (!tabs || tabs.dataset.presetOverflowObserver) return;
+window.setTimeout(syncPresetTabOverflow, 1000);
+window.setTimeout(syncPresetTabOverflow, 2500);
+window.setInterval(syncPresetTabOverflow, 1000);
+document.addEventListener("click", () => window.setTimeout(syncPresetTabOverflow, 0), true);
+if (typeof onUiUpdate === "function") onUiUpdate(syncPresetTabOverflow);
 
-    const observer = new MutationObserver(syncPresetTabOverflow);
-    observer.observe(tabs, { attributes: true, childList: true, subtree: true, attributeFilter: ["aria-hidden", "class", "style"] });
-    tabs.dataset.presetOverflowObserver = "true";
+if (typeof onUiLoaded === "function") onUiLoaded(function () {
+    const attachPresetTabOverflowObserver = () => {
+        const tabs = gradioApp().querySelector("#tabs");
+        if (!tabs) {
+            window.setTimeout(attachPresetTabOverflowObserver, 100);
+            return;
+        }
+
+        syncPresetTabOverflow();
+        if (tabs.dataset.presetOverflowObserver) return;
+
+        const observer = new MutationObserver(syncPresetTabOverflow);
+        observer.observe(tabs, { attributes: true, childList: true, subtree: true, attributeFilter: ["aria-hidden", "class", "style"] });
+        tabs.dataset.presetOverflowObserver = "true";
+    };
+
+    attachPresetTabOverflowObserver();
 });
 
 /**

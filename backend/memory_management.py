@@ -21,6 +21,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import gc
 import importlib
+import importlib.metadata
 import logging
 import os
 import platform
@@ -63,6 +64,9 @@ MEMORY_WORKING_VRAM_BYTES = 0
 MEMORY_PINNED_MEMORY_PERCENT = 45.0
 MEMORY_ASYNC_STREAMS = 2
 MEMORY_VRAM_SAFETY_PERCENT = 80.0
+MMGP_ATTENTION_BACKEND = "automatic"
+MMGP_VAE_ATTENTION_BACKEND = "automatic"
+MMGP_RUNTIME_ACTIVE = False
 MEMORY_RUNTIME_SIGNATURE = None
 
 
@@ -1120,6 +1124,42 @@ def flash_enabled() -> bool:
     return FLASH_IS_AVAILABLE
 
 
+def mmgp_attention_backend_choices() -> tuple[str, ...]:
+    """Return attention choices that are installed and usable on this host."""
+    choices = ["automatic", "sdpa"]
+    try:
+        capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        triton_available = importlib.util.find_spec("triton") is not None
+    except Exception:
+        capability = (0, 0)
+        triton_available = False
+
+    if sage_enabled() and triton_available and capability[0] >= 7:
+        choices.append("sage")
+    try:
+        sage2_package = importlib.metadata.version("sageattention").startswith("2")
+    except importlib.metadata.PackageNotFoundError:
+        sage2_package = False
+    if sage_enabled() and sage2_package and triton_available and capability[0] >= 8:
+        choices.append("sage2")
+        if importlib.util.find_spec("spas_sage_attn") is not None:
+            choices.append("radial")
+    if sage_enabled() and triton_available and capability[0] >= 10:
+        if importlib.util.find_spec("sageattn3") is not None or importlib.util.find_spec("sageattn_blackwell") is not None:
+            choices.append("sage3")
+    if flash_enabled():
+        choices.append("flash")
+        try:
+            import flash_attn_interface  # noqa: F401
+        except Exception:
+            pass
+        else:
+            choices.append("flash3")
+    if xformers_enabled():
+        choices.append("xformers")
+    return tuple(choices)
+
+
 def pytorch_attention_enabled() -> bool:
     return ENABLE_PYTORCH_ATTENTION
 
@@ -1624,12 +1664,22 @@ def feature_enabled(feature: str) -> bool:
 
 def mmgp_enabled() -> bool:
     """Whether the optional MMGP path is active at runtime."""
-    return bool(getattr(args, "mmgp", False) and feature_enabled("enabled"))
+    return MMGP_RUNTIME_ACTIVE
 
 
 def mmgp_flag_present() -> bool:
     """Whether the user requested the optional MMGP path at launch."""
     return bool(getattr(args, "mmgp", False))
+
+
+def mmgp_attention_backend() -> str:
+    """Return the optional attention backend without changing Forge defaults."""
+    return MMGP_ATTENTION_BACKEND if mmgp_enabled() else "automatic"
+
+
+def mmgp_vae_attention_backend() -> str:
+    """Return the optional VAE attention backend without changing Forge defaults."""
+    return MMGP_VAE_ATTENTION_BACKEND if mmgp_enabled() else "automatic"
 
 
 def async_transfers_enabled() -> bool:
@@ -1671,6 +1721,8 @@ def _setting_number(value, default):
 def configure_memory_features(
     *,
     enabled: bool = False,
+    attention_backend: str = "automatic",
+    vae_attention_backend: str = "automatic",
     budgets: bool = False,
     pinned_memory: bool = False,
     async_transfers: bool = False,
@@ -1696,6 +1748,9 @@ def configure_memory_features(
     global MEMORY_PINNED_MEMORY_PERCENT
     global MEMORY_ASYNC_STREAMS
     global MEMORY_VRAM_SAFETY_PERCENT
+    global MMGP_ATTENTION_BACKEND
+    global MMGP_VAE_ATTENTION_BACKEND
+    global MMGP_RUNTIME_ACTIVE
     global MEMORY_RUNTIME_SIGNATURE
     global NUM_STREAMS
     global PINNING_ENABLED
@@ -1705,6 +1760,17 @@ def configure_memory_features(
 
     # Saved settings are inactive without --mmgp.
     effective_enabled = bool(enabled and mmgp_flag_present())
+    MMGP_RUNTIME_ACTIVE = effective_enabled
+    cli_attention = getattr(args, "mmgp_attention", "automatic")
+    requested_attention = attention_backend if cli_attention == "automatic" else cli_attention
+    requested_attention = requested_attention or "automatic"
+    if requested_attention not in {"automatic", "sdpa", "sage", "sage2", "sage3", "flash", "flash3", "radial", "xformers"}:
+        requested_attention = "automatic"
+    MMGP_ATTENTION_BACKEND = requested_attention if effective_enabled else "automatic"
+    requested_vae_attention = str(vae_attention_backend or "automatic").strip().lower()
+    if requested_vae_attention not in {"automatic", "sdpa", "xformers", "slice"}:
+        requested_vae_attention = "automatic"
+    MMGP_VAE_ATTENTION_BACKEND = requested_vae_attention if effective_enabled else "automatic"
     MEMORY_FEATURES = {
         "enabled": effective_enabled,
         "budgets": effective_enabled and bool(budgets),
@@ -1764,6 +1830,8 @@ def configure_memory_features(
         bool(partial_pinning) if effective_enabled else False,
         bool(alternate_quantization) if effective_enabled else False,
         str(quantization_type) if effective_enabled and alternate_quantization else "",
+        MMGP_ATTENTION_BACKEND if effective_enabled else "automatic",
+        MMGP_VAE_ATTENTION_BACKEND if effective_enabled else "automatic",
     )
     if MEMORY_RUNTIME_SIGNATURE is not None and runtime_signature != MEMORY_RUNTIME_SIGNATURE:
         logger.info("Memory-management mode changed; unloading models before applying the new mode")
