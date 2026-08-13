@@ -1707,10 +1707,10 @@ def configure_memory_features(
     effective_enabled = bool(enabled and mmgp_flag_present())
     MEMORY_FEATURES = {
         "enabled": effective_enabled,
-        "budgets": bool(budgets),
-        "pinned_memory": bool(pinned_memory),
-        "async_transfers": bool(async_transfers),
-        "residency_hints": bool(residency_hints),
+        "budgets": effective_enabled and bool(budgets),
+        "pinned_memory": effective_enabled and bool(pinned_memory),
+        "async_transfers": effective_enabled and bool(async_transfers),
+        "residency_hints": effective_enabled and bool(residency_hints),
     }
     if effective_enabled and cpu_state is CPUState.GPU:
         vram_state = VRAMState.NORMAL_VRAM
@@ -1720,16 +1720,17 @@ def configure_memory_features(
         vram_state = FORGE_VRAM_STATE
         set_vram_to = FORGE_SET_VRAM_TO
     MEMORY_BUDGETS_BYTES = {}
-    for component, value in (model_budgets_mb or {}).items():
-        value = _setting_number(value, 0)
-        if value > 0:
-            MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
-    MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ())
-    MEMORY_PINNED_COMPONENTS = set(pinned_components or ())
-    MEMORY_WORKING_VRAM_BYTES = max(0, int(_setting_number(working_vram_mb, 0) * 1024 * 1024))
-    MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, _setting_number(pinned_memory_percent, 45)))
-    MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, _setting_number(vram_safety_percent, 80)))
-    MEMORY_ASYNC_STREAMS = min(8, max(1, int(_setting_number(async_streams, 2))))
+    if effective_enabled:
+        for component, value in (model_budgets_mb or {}).items():
+            value = _setting_number(value, 0)
+            if value > 0:
+                MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
+    MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ()) if effective_enabled else set()
+    MEMORY_PINNED_COMPONENTS = set(pinned_components or ()) if effective_enabled else set()
+    MEMORY_WORKING_VRAM_BYTES = max(0, int(_setting_number(working_vram_mb, 0) * 1024 * 1024)) if effective_enabled else 0
+    MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, _setting_number(pinned_memory_percent, 45))) if effective_enabled else 45.0
+    MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, _setting_number(vram_safety_percent, 80))) if effective_enabled else 80.0
+    MEMORY_ASYNC_STREAMS = min(8, max(1, int(_setting_number(async_streams, 2)))) if effective_enabled else 2
 
     requested_streams = MEMORY_ASYNC_STREAMS if feature_enabled("async_transfers") else 0
     if args.cuda_stream is not None:

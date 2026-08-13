@@ -442,6 +442,13 @@ div#extras_scale_to_tab div.form {
     overflow-wrap: break-word;
 }
 
+/* Keep the gallery's JSON backing field hidden even if Gradio reapplies an
+   inline display value while updating a result. */
+#generation_info_txt2img,
+#generation_info_img2img {
+    display: none !important;
+}
+
 #img2img_column_batch {
     align-self: end;
     margin-bottom: 0.9em;
@@ -1504,9 +1511,12 @@ body.resizing .resize-handle {
 /* ========================= */
 .extra-network-pane {
     display: flex;
+    width: 100%;
     height: calc(100vh - 24rem);
     resize: vertical;
     min-height: 52rem;
+    min-width: 0;
+    box-sizing: border-box;
     flex-direction: column;
     overflow: hidden;
 }
@@ -2167,6 +2177,13 @@ body.resizing .resize-handle {
         flex: 1 1 18rem !important;
     }
 
+    /* The desktop quicksetting inputs are intentionally compact. On mobile,
+       make the whole stacked control the dropdown hit target. */
+    #quicksettings > #forge_ui_preset input,
+    #quicksettings > #forge_ui_dtype input {
+        width: 100% !important;
+    }
+
     #quicksettings > #forge_refresh_checkpoint {
         flex: 0 0 2.5rem !important;
         width: 2.5rem !important;
@@ -2202,6 +2219,60 @@ body.resizing .resize-handle {
     #txt2img_toprow,
     #img2img_toprow {
         flex-direction: column !important;
+    }
+
+    /* Keep nested tab panels full width on narrow screens. */
+    #tabs,
+    #tabs > .tab-wrapper,
+    #tabs > .tab-wrapper > .tabitem,
+    #tabs > .tab-wrapper > .tabitem > .column,
+    #tab_txt2img,
+    #tab_img2img,
+    #tab_txt2img > .column,
+    #tab_img2img > .column,
+    #txt2img_extra_tabs,
+    #img2img_extra_tabs,
+    #txt2img_extra_tabs > .tab-wrapper > .tabitem,
+    #img2img_extra_tabs > .tab-wrapper > .tabitem,
+    #txt2img_lora,
+    #img2img_lora {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: none !important;
+    }
+
+    #txt2img_lora_cards_html .html-container,
+    #img2img_lora_cards_html .html-container {
+        width: 100% !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+
+    .extra-network-pane .card.extra-network-simple-card .actions .name {
+        overflow: visible;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        white-space: normal;
+    }
+
+    .extra-network-pane .card.extra-network-simple-card {
+        flex-direction: column;
+    }
+
+    .extra-network-pane .card.extra-network-simple-card .actions {
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    .extra-network-pane .card.extra-network-simple-card .button-row {
+        width: 100%;
+        justify-content: flex-end;
+        box-sizing: border-box;
+    }
+
+    #tabs:has(#tab_ltx_video[style*="display: none"]) > .tab-wrapper > .overflow-menu > .overflow-dropdown > button:nth-child(1),
+    #tabs:has(#tab_ideogram[style*="display: none"]) > .tab-wrapper > .overflow-menu > .overflow-dropdown > button:nth-child(2) {
+        display: none !important;
     }
 
     #tabs > .tab-wrapper > .tab-container,

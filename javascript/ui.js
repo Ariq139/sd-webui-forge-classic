@@ -303,6 +303,35 @@ function restoreProgressAfterPageResume() {
 document.addEventListener("visibilitychange", restoreProgressAfterPageResume);
 window.addEventListener("pageshow", restoreProgressAfterPageResume);
 
+function syncPresetTabOverflow() {
+    const tabs = gradioApp().querySelector("#tabs");
+    const overflow = tabs?.querySelector(":scope > .tab-wrapper > .overflow-menu");
+    if (!overflow) return;
+
+    const presetTabs = {
+        "LTX Video": gradioApp().getElementById("tab_ltx_video"),
+        "Ideogram 4": gradioApp().getElementById("tab_ideogram"),
+    };
+
+    overflow.querySelectorAll(":scope > .overflow-dropdown > button").forEach((button) => {
+        const tab = presetTabs[button.textContent.trim()];
+        if (!tab) return;
+
+        const display = getComputedStyle(tab).display === "none" ? "none" : "";
+        if (button.style.display !== display) button.style.display = display;
+    });
+}
+
+onUiLoaded(function () {
+    syncPresetTabOverflow();
+    const tabs = gradioApp().querySelector("#tabs");
+    if (!tabs || tabs.dataset.presetOverflowObserver) return;
+
+    const observer = new MutationObserver(syncPresetTabOverflow);
+    observer.observe(tabs, { attributes: true, childList: true, subtree: true, attributeFilter: ["aria-hidden", "class", "style"] });
+    tabs.dataset.presetOverflowObserver = "true";
+});
+
 /**
  * Configure the width and height elements on `tabname` to accept
  * pasting of resolutions in the form of "width x height".

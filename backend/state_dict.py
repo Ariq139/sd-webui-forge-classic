@@ -108,13 +108,25 @@ def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = 
     return None
 
 
+def _quantization_metadata(metadata: dict) -> dict:
+    raw = (metadata or {}).get("_quantization_metadata")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict) -> tuple[dict[str, torch.Tensor], dict]:
     # https://github.com/Comfy-Org/ComfyUI/blob/v0.19.0/comfy/utils.py#L1358
     if metadata is None:
         metadata = {}
 
     if "_quantization_metadata" in metadata:
-        quant_metadata = json.loads(metadata["_quantization_metadata"]) or {}
+        quant_metadata = _quantization_metadata(metadata)
     else:
         model_prefix = None
 
@@ -171,6 +183,10 @@ def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict) ->
 
     if layers := quant_metadata.get("layers", None):
         for k, v in layers.items():
-            state_dict["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
+            weight_key = f"{k}.weight"
+            marker_key = f"{k}.comfy_quant"
+            if weight_key not in state_dict or marker_key in state_dict or not isinstance(v, dict):
+                continue
+            state_dict[marker_key] = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
 
     return state_dict, metadata

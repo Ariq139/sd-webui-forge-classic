@@ -59,6 +59,18 @@ def _infer_quant_format(weight: torch.Tensor, state_dict: dict[str, torch.Tensor
     return None
 
 
+def _normalize_quant_format(value):
+    if not isinstance(value, str):
+        return None
+    return {
+        "int8": "int8_tensorwise",
+        "fp8": "float8_e4m3fn",
+        "fp8_e4m3": "float8_e4m3fn",
+        "fp8_e5m2": "float8_e5m2",
+        "nvfp4_mixed": "nvfp4",
+    }.get(value.strip().lower(), value.strip().lower())
+
+
 def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict[str, torch.Tensor], prefix: str, local_metadata, strict, missing_keys, unexpected_keys, error_msgs, load_extra_params=False):
     device = module.factory_kwargs["device"]
     compute_dtype = module.factory_kwargs["dtype"]
@@ -83,18 +95,17 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
 
     layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
     if layer_conf is not None:
-        layer_conf = json.loads(layer_conf.numpy().tobytes())
+        if isinstance(layer_conf, torch.Tensor):
+            layer_conf = json.loads(layer_conf.detach().cpu().numpy().tobytes())
+        elif isinstance(layer_conf, (bytes, bytearray)):
+            layer_conf = json.loads(layer_conf)
+        if not isinstance(layer_conf, dict):
+            layer_conf = {}
 
     if layer_conf is None:
         module.weight = torch.nn.Parameter(weight.to(device=device, dtype=compute_dtype), requires_grad=False)
     else:
-        module.quant_format = layer_conf.get("format", None)
-        module.quant_format = {
-            "int8": "int8_tensorwise",
-            "fp8": "float8_e4m3fn",
-            "fp8_e4m3": "float8_e4m3fn",
-            "fp8_e5m2": "float8_e5m2",
-        }.get(module.quant_format, module.quant_format)
+        module.quant_format = _normalize_quant_format(layer_conf.get("format"))
         if module.quant_format is None:
             module.quant_format = _infer_quant_format(weight, state_dict, prefix)
         module._full_precision_mm_config = layer_conf.get("full_precision_matrix_mult", False)
