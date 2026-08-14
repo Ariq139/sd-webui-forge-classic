@@ -193,6 +193,9 @@ class AlternateMMGP:
 
         profile = getattr(opts, "forge_memory_profile", "Custom")
         quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
+        engine = self._engine()
+        forge_unet = getattr(getattr(engine, "forge_objects", None), "unet", None)
+        convert_dtype = memory_management.mmgp_compute_dtype(getattr(forge_unet, "model", None))
         extra_models_to_quantize = []
         if quantize and profile in {"LowRAM_HighVRAM", "LowRAM_LowVRAM", "VerylowRAM_LowVRAM"}:
             text_encoder = current_modules.get("text_encoder")
@@ -222,7 +225,7 @@ class AlternateMMGP:
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
             "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if memory_management.feature_enabled("pinned_memory") else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False)),
-            "convertWeightsFloatTo": torch.bfloat16,
+            "convertWeightsFloatTo": convert_dtype,
             "coTenantsMap": cotenants,
             "vram_safety_coefficient": memory_management.MEMORY_VRAM_SAFETY_PERCENT / 100.0,
             "verboseLevel": 0,

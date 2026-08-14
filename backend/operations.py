@@ -35,7 +35,15 @@ def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
     if q.dtype == k.dtype == v.dtype:
         return q, k, v
 
-    target_dtype = torch.float32 if torch.float32 in (q.dtype, k.dtype, v.dtype) else q.dtype
+    low_precision_dtypes = (torch.float16, torch.bfloat16)
+    if v.dtype in low_precision_dtypes:
+        target_dtype = v.dtype
+    elif q.dtype in low_precision_dtypes:
+        target_dtype = q.dtype
+    elif k.dtype in low_precision_dtypes:
+        target_dtype = k.dtype
+    else:
+        target_dtype = torch.float32 if torch.float32 in (q.dtype, k.dtype, v.dtype) else q.dtype
     return tuple(t if t.dtype == target_dtype else t.to(target_dtype) for t in (q, k, v))
 
 

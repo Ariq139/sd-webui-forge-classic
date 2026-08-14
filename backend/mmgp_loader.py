@@ -645,6 +645,7 @@ def load_forge_component(model, state_dict: dict, name: str, ignore_start: str |
         dtype = getattr(model, "storage_dtype", None)
         if not isinstance(dtype, torch.dtype):
             dtype = next((parameter.dtype for parameter in model.parameters() if parameter.device.type != "meta"), torch.bfloat16)
+        dtype = memory_management.mmgp_compute_dtype(model, fallback=dtype)
         kind = _component_kind(name)
         quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
         pinned = bool(memory_management.feature_enabled("pinned_memory") and kind in memory_management.MEMORY_PINNED_COMPONENTS)

@@ -805,6 +805,31 @@ def dtype_size(dtype: torch.dtype) -> int:
     return getattr(dtype, "itemsize", 4)
 
 
+def mmgp_compute_dtype(model=None, fallback: torch.dtype = None) -> torch.dtype:
+    """Choose the low-precision dtype already used by a model for MMGP leftovers."""
+    supported = (torch.float16, torch.bfloat16, torch.float32)
+
+    for attribute in ("computation_dtype", "_model_dtype", "storage_dtype", "dtype"):
+        value = getattr(model, attribute, None) if model is not None else None
+        if value in supported:
+            return value
+
+    counts = {dtype: 0 for dtype in supported}
+    if model is not None and hasattr(model, "named_parameters"):
+        for parameter in model.parameters():
+            if parameter.dtype in counts:
+                counts[parameter.dtype] += parameter.numel()
+
+    for value in (torch.float16, torch.bfloat16, torch.float32):
+        if counts[value] == max(counts.values()) and counts[value] > 0:
+            return value
+
+    if fallback in supported:
+        return fallback
+    device = get_torch_device()
+    return torch.bfloat16 if should_use_bf16(device) else torch.float16
+
+
 def unet_offload_device():
     if vram_state is VRAMState.HIGH_VRAM:
         return get_torch_device()

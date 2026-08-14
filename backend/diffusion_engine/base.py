@@ -85,7 +85,14 @@ class ForgeDiffusionEngine:
     @torch.inference_mode()
     def decode_first_stage(self, x: torch.Tensor):
         sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, (2 if self.is_wan else 1)).mul_(2.0).sub_(1.0)
+        sample = self.forge_objects.vae.decode(sample)
+        if sample.ndim == 5:
+            sample = sample.movedim(-1, (2 if self.is_wan else 1))
+        elif sample.ndim == 4:
+            sample = sample.movedim(-1, 1)
+        else:
+            raise RuntimeError(f"Decoded image has unsupported shape {tuple(sample.shape)}")
+        sample = sample.mul_(2.0).sub_(1.0)
         return sample.to(x)
 
     def get_prompt_lengths_on_ui(self, prompt):

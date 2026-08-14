@@ -113,6 +113,7 @@ class NativeMMGP:
 
         profile = getattr(opts, "forge_memory_profile", "Custom")
         quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
+        convert_dtype = memory_management.mmgp_compute_dtype(components.get("transformer"), fallback=getattr(pipeline, "dtype", None))
         extra_models_to_quantize = [name for name in names if name != "transformer" and _component_kind(name) == "text_encoder"] if quantize else []
         return {
             "profile": profile,
@@ -127,7 +128,7 @@ class NativeMMGP:
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
             "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if memory_management.feature_enabled("pinned_memory") else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False) if self.compile_enabled is None else self.compile_enabled),
-            "convertWeightsFloatTo": torch.bfloat16,
+            "convertWeightsFloatTo": convert_dtype,
             "coTenantsMap": cotenants,
             "vram_safety_coefficient": memory_management.MEMORY_VRAM_SAFETY_PERCENT / 100.0,
             "verboseLevel": 0,
