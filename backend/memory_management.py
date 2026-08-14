@@ -37,7 +37,7 @@ import torch
 
 from backend.args import args
 from backend.logging import setup_logger
-from backend.quant_ops import QuantizedTensor
+from backend.quant_ops import QuantizedTensor, ck
 
 if TYPE_CHECKING:
     from backend.patcher.base import ModelPatcher
@@ -1147,6 +1147,17 @@ def flash_enabled() -> bool:
     if not is_nvidia():
         return False
     return FLASH_IS_AVAILABLE
+
+
+def ck_enabled() -> bool:
+    if cpu_state is not CPUState.GPU:
+        return False
+    try:
+        CK_IS_AVAILABLE = ck.int8_attention_is_available()
+    except Exception:
+        return False
+    else:
+        return CK_IS_AVAILABLE and args.use_ck_attention
 
 
 def mmgp_attention_backend_choices() -> tuple[str, ...]:
