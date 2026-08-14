@@ -4,7 +4,6 @@ import json
 
 import torch
 
-from backend.args import args
 from backend.memory_management import cast_to_device, logger
 
 from .operations import (
@@ -118,6 +117,8 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
                 f"Unknown quantization format for layer {layer_name}; "
                 "the checkpoint has incomplete quantization metadata"
             )
+        if module.quant_format not in QUANT_ALGOS:
+            raise ValueError(f"Unsupported quantization format for layer {layer_name}: {module.quant_format}")
 
         qconfig = QUANT_ALGOS[module.quant_format]
         module.layout_type = qconfig["comfy_tensor_layout"]

@@ -6,10 +6,12 @@
 
 html {
     min-height: 100%;
+    background: var(--body-background-fill, #0f0f11);
 }
 
 body {
     min-height: 100vh;
+    background: var(--body-background-fill, #0f0f11);
 }
 
 :root,

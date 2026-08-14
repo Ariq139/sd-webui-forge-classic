@@ -26,6 +26,7 @@ IS_SAGE_1 = False
 IS_SAGE_3 = False
 _RADIAL_WARNING_EMITTED = False
 _SAGE2_MASK_WARNING_EMITTED = False
+_SAGE2_ACCEPTS_MASK = None
 
 
 if memory_management.xformers_enabled() or memory_management.xformers_enabled_vae():
@@ -126,7 +127,7 @@ if memory_management.ck_enabled():
 
     def attention_comfy_kitchen_int8(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
         q, k, v, mask, b, dim_head = _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False))
-        out = ck.int8_attention(q, k, v, scale=kwargs.get("scale", None), attn_mask=mask)
+        out = ck.int8_attention(q, k, v, scale=kwargs.get("scale"), attn_mask=mask)
         if not skip_output_reshape:
             out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
@@ -224,6 +225,8 @@ def _unpack_attention_output(output, q_lens, batch, query_length):
 
 
 def _sage2_mask_support_reason(q, mask):
+    global _SAGE2_ACCEPTS_MASK
+
     if mask is None:
         return None
     if not q.is_cuda:
@@ -236,11 +239,17 @@ def _sage2_mask_support_reason(q, mask):
             return f"head_dim {q.shape[-1]} is unsupported"
         if SAGE2_ATTN is None:
             return "SageAttention 2 is unavailable"
-        import inspect
+        if _SAGE2_ACCEPTS_MASK is None:
+            import inspect
 
-        if "attn_mask" not in inspect.signature(SAGE2_ATTN).parameters and not any(parameter.kind == parameter.VAR_KEYWORD for parameter in inspect.signature(SAGE2_ATTN).parameters.values()):
+            parameters = inspect.signature(SAGE2_ATTN).parameters
+            _SAGE2_ACCEPTS_MASK = "attn_mask" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+            )
+        if not _SAGE2_ACCEPTS_MASK:
             return "installed SageAttention does not expose attn_mask"
     except (TypeError, ValueError):
+        _SAGE2_ACCEPTS_MASK = False
         return "unable to inspect installed SageAttention mask support"
     return None
 
@@ -724,9 +733,8 @@ def attention_radial(q, k, v, heads, mask=None, attn_precision=None, skip_reshap
 
 if memory_management.ck_enabled():
     logger.info("Using Comfy-Kitchen Attention")
-    attention_function = attention_comfy_kitchen_int8
+    _automatic_attention_function = attention_comfy_kitchen_int8
 elif memory_management.sage_enabled():
-    attention_function = attention_sage
     _automatic_attention_function = attention_sage
     if IS_SAGE_1:
         logger.info("Using SageAttention")
@@ -759,6 +767,9 @@ else:
 
 
 def _resolve_mmgp_attention_backend(requested):
+    requested = str(requested or "automatic").strip().lower()
+    if requested == "ck" and memory_management.ck_enabled():
+        return attention_comfy_kitchen_int8
     if requested == "sdpa":
         return attention_pytorch
     if requested == "sage2" and memory_management.sage_enabled() and SAGE2_ATTN is not None:
@@ -778,10 +789,23 @@ def _resolve_mmgp_attention_backend(requested):
     return _automatic_attention_function
 
 
+_attention_backend_cache = {}
+_attention_backend_warnings = set()
+
+
+def _get_mmgp_attention_backend(requested):
+    requested = str(requested or "automatic").strip().lower()
+    if requested not in _attention_backend_cache:
+        function = _resolve_mmgp_attention_backend(requested)
+        _attention_backend_cache[requested] = function
+        if requested != "automatic" and function is _automatic_attention_function and requested not in _attention_backend_warnings:
+            logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", requested)
+            _attention_backend_warnings.add(requested)
+    return _attention_backend_cache[requested]
+
+
 _last_attention_backend = memory_management.mmgp_attention_backend()
-_active_attention_function = _resolve_mmgp_attention_backend(_last_attention_backend)
-if _last_attention_backend != "automatic" and _active_attention_function is _automatic_attention_function:
-    logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", _last_attention_backend)
+_active_attention_function = _get_mmgp_attention_backend(_last_attention_backend)
 
 
 def _dispatch_attention(*args, **kwargs):
@@ -795,14 +819,12 @@ def _dispatch_attention(*args, **kwargs):
     if requested is None:
         transformer_options = kwargs.get("transformer_options") or {}
         requested = transformer_options.get("attention_backend") or transformer_options.get("force_attention")
-    requested = requested or memory_management.mmgp_attention_backend()
-    if str(requested).lower() in {"auto", "automatic", "sol"}:
+    requested = str(requested or memory_management.mmgp_attention_backend()).strip().lower()
+    if requested in {"auto", "automatic", "sol"}:
         requested = "automatic"
     if requested != _last_attention_backend:
         _last_attention_backend = requested
-        _active_attention_function = _resolve_mmgp_attention_backend(requested)
-        if requested != "automatic" and _active_attention_function is _automatic_attention_function:
-            logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", requested)
+        _active_attention_function = _get_mmgp_attention_backend(requested)
     return _active_attention_function(*args, **kwargs)
 
 
@@ -955,9 +977,11 @@ else:
 
 _VAE_ATTENTION_OVERRIDE: ContextVar[str | None] = ContextVar("forge_vae_attention_override", default=None)
 _last_vae_attention_backend = memory_management.mmgp_vae_attention_backend()
+_vae_attention_backend_cache = {}
 
 
 def _resolve_mmgp_vae_attention_backend(requested):
+    requested = str(requested or "automatic").strip().lower()
     if requested == "sdpa":
         return pytorch_attention_vae
     if requested == "xformers" and memory_management.xformers_enabled_vae():
@@ -967,7 +991,8 @@ def _resolve_mmgp_vae_attention_backend(requested):
     return _automatic_vae_attention_function
 
 
-_active_vae_attention_function = _resolve_mmgp_vae_attention_backend(_last_vae_attention_backend)
+_vae_attention_backend_cache[_last_vae_attention_backend] = _resolve_mmgp_vae_attention_backend(_last_vae_attention_backend)
+_active_vae_attention_function = _vae_attention_backend_cache[_last_vae_attention_backend]
 
 
 def _dispatch_vae_attention(*args, **kwargs):
@@ -975,12 +1000,14 @@ def _dispatch_vae_attention(*args, **kwargs):
     if not memory_management.MMGP_RUNTIME_ACTIVE and _VAE_ATTENTION_OVERRIDE.get() is None:
         return _automatic_vae_attention_function(*args, **kwargs)
 
-    requested = _VAE_ATTENTION_OVERRIDE.get() or memory_management.mmgp_vae_attention_backend()
+    requested = str(_VAE_ATTENTION_OVERRIDE.get() or memory_management.mmgp_vae_attention_backend()).strip().lower()
     if requested in {"auto", "automatic"}:
         requested = "automatic"
     if requested != _last_vae_attention_backend:
         _last_vae_attention_backend = requested
-        _active_vae_attention_function = _resolve_mmgp_vae_attention_backend(requested)
+        if requested not in _vae_attention_backend_cache:
+            _vae_attention_backend_cache[requested] = _resolve_mmgp_vae_attention_backend(requested)
+        _active_vae_attention_function = _vae_attention_backend_cache[requested]
         if requested != "automatic" and _active_vae_attention_function is _automatic_vae_attention_function:
             logger.warning("MMGP VAE attention backend %s is unavailable; using Forge's automatic VAE attention priority", requested)
     return _active_vae_attention_function(*args, **kwargs)

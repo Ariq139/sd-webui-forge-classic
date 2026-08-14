@@ -321,6 +321,7 @@ function setupSettingsSearch() {
 
 function startSettingsLayoutObserver() {
     let root = gradioApp();
+    let initializationPending = false;
 
     function initializeSettings() {
         setupSettingsControls();
@@ -330,12 +331,23 @@ function startSettingsLayoutObserver() {
         addSettingsCategories();
     }
 
-    let observer = new MutationObserver(initializeSettings);
+    function scheduleInitialization() {
+        if (initializationPending) return;
+        initializationPending = true;
+
+        const run = () => {
+            initializationPending = false;
+            initializeSettings();
+        };
+        if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+        else window.setTimeout(run, 0);
+    }
+
+    let observer = new MutationObserver(scheduleInitialization);
     observer.observe(root, { childList: true, subtree: true });
-    initializeSettings();
-    setTimeout(initializeSettings, 0);
-    setTimeout(initializeSettings, 500);
-    setTimeout(initializeSettings, 1500);
+    scheduleInitialization();
+    setTimeout(scheduleInitialization, 500);
+    setTimeout(scheduleInitialization, 1500);
 }
 
 if (document.readyState === "loading") {

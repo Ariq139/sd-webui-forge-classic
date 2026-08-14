@@ -59,25 +59,38 @@ class _LazySafeTensorStateDict(MutableMapping):
 
     def __init__(self, loader, keys):
         self._loader = loader
-        self._keys = tuple(keys)
+        self._keys = list(keys)
+        self._key_set = set(self._keys)
         self._values = {}
 
     def __getitem__(self, key):
-        if key not in self._keys:
+        if key not in self._key_set:
             raise KeyError(key)
         if key not in self._values:
             self._values[key] = self._loader.get_tensor(key)
         return self._values[key]
 
+    def __contains__(self, key):
+        return key in self._key_set
+
+    def _replace_keys(self, keys):
+        self._keys = list(keys)
+        self._key_set = set(self._keys)
+
+    def _append_key(self, key):
+        self._keys.append(key)
+        self._key_set.add(key)
+
     def __setitem__(self, key, value):
-        if key not in self._keys:
-            self._keys = (*self._keys, key)
+        if key not in self._key_set:
+            self._append_key(key)
         self._values[key] = value
 
     def __delitem__(self, key):
-        if key not in self._keys:
+        if key not in self._key_set:
             raise KeyError(key)
-        self._keys = tuple(item for item in self._keys if item != key)
+        self._keys.remove(key)
+        self._key_set.remove(key)
         self._values.pop(key, None)
 
     def __iter__(self):
@@ -92,25 +105,34 @@ class StreamingStateDict(MutableMapping):
 
     def __init__(self, loader):
         self.loader = loader
-        self._keys = tuple(loader.keys())
+        self._keys = list(loader.keys())
+        self._key_set = set(self._keys)
         self._values = {}
 
     def __getitem__(self, key):
-        if key not in self._keys:
+        if key not in self._key_set:
             raise KeyError(key)
         if key not in self._values:
             self._values[key] = self.loader.get_tensor(key)
         return self._values[key]
 
+    def __contains__(self, key):
+        return key in self._key_set
+
+    def _append_key(self, key):
+        self._keys.append(key)
+        self._key_set.add(key)
+
     def __setitem__(self, key, value):
-        if key not in self._keys:
-            self._keys = (*self._keys, key)
+        if key not in self._key_set:
+            self._append_key(key)
         self._values[key] = value
 
     def __delitem__(self, key):
-        if key not in self._keys:
+        if key not in self._key_set:
             raise KeyError(key)
-        self._keys = tuple(item for item in self._keys if item != key)
+        self._keys.remove(key)
+        self._key_set.remove(key)
         self._values.pop(key, None)
 
     def __iter__(self):
@@ -233,7 +255,7 @@ class _StreamingForgeCheckpoint:
 
     def _remove_state_prefix(self, prefix):
         keys = tuple(key for key in self.state if not key.startswith(prefix))
-        self.state._keys = keys
+        self.state._replace_keys(keys)
         self.state._values = {key: value for key, value in self.state._values.items() if key in keys}
         self._extra_sources = {key: value for key, value in self._extra_sources.items() if key in keys}
 
@@ -244,7 +266,7 @@ class _StreamingForgeCheckpoint:
             if source_key in skipped:
                 continue
             key = prefix + source_key
-            self.state._keys = (*self.state._keys, key)
+            self.state._append_key(key)
             self._extra_sources[key] = (source.loader, source_key)
 
         source.loader = None
@@ -368,16 +390,14 @@ class _StreamingForgeCheckpoint:
         for key in self.keys:
             if any(key.startswith(prefix) for prefix in prefixes):
                 text_state[key] = self.get_tensor(key)
+
+        self._text_state = self.guess.process_clip_state_dict(text_state) if text_state else {}
         if self.guess.huggingface_repo == "circlestone-labs/Anima":
             unet_prefix = tuple(getattr(self.guess, "unet_key_prefix", ()) or ())
             for key in self.keys:
-                if any(key.startswith(prefix + "llm_adapter.") for prefix in unet_prefix):
-                    text_state[key[len(unet_prefix[0]) :]] = self.get_tensor(key)
-        if not text_state:
-            self._text_state = {}
-            return self._text_state
-
-        self._text_state = self.guess.process_clip_state_dict(text_state)
+                prefix = next((prefix for prefix in unet_prefix if key.startswith(prefix + "llm_adapter.")), None)
+                if prefix is not None:
+                    self._text_state[key[len(prefix) :]] = self.get_tensor(key)
         return self._text_state
 
     def pop(self, component_name, default=None):
@@ -402,6 +422,8 @@ class _StreamingForgeCheckpoint:
                     for key in list(text_state):
                         if key.startswith(prefix):
                             del text_state[key]
+                    if self.guess.huggingface_repo == "circlestone-labs/Anima":
+                        selected.update({key: value for key, value in text_state.items() if key.startswith("llm_adapter.")})
                     return selected
 
         return default
@@ -661,11 +683,16 @@ def load_forge_component(model, state_dict: dict, name: str, ignore_start: str |
             if target is not None and hasattr(value, "shape") and tuple(target.shape) != tuple(value.shape):
                 logger.debug("MMGP state-dict shape mismatch for %s.%s; using Forge loader", name, key)
                 return False
-        if not (ignore_start or ignored):
-            missing = [key for key in target_state_dict if key not in filtered_state_dict]
-            if missing:
-                logger.debug("MMGP state-dict missing %s keys for %s; using Forge loader", len(missing), name)
-                return False
+        missing = [
+            key
+            for key in target_state_dict
+            if key not in filtered_state_dict
+            and key not in ignored
+            and not (ignore_start and key.startswith(ignore_start))
+        ]
+        if missing:
+            logger.debug("MMGP state-dict missing %s keys for %s; using Forge loader", len(missing), name)
+            return False
         do_quantize = quantize and (name == "transformer" or _can_quantize_forge_component(model, name, quantize))
         offload.load_model_data(
             model,

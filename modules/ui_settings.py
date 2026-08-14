@@ -23,6 +23,7 @@ MMGP_UI_SETTING_KEYS = {
     *MEMORY_SETTING_KEYS,
 }
 MMGP_DEPENDENT_SETTING_KEYS = tuple(key for key in MMGP_UI_SETTING_KEYS if key != "forge_memory_management_enabled")
+MMGP_BACKEND_SETTING_KEYS = {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"}
 
 
 def get_value_for_setting(key):
@@ -31,7 +32,7 @@ def get_value_for_setting(key):
     info = opts.data_labels[key]
     args = info.component_args() if callable(info.component_args) else info.component_args or {}
     args = {k: v for k, v in args.items() if k not in {"precision"}}
-    if key in {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"} and value not in args.get("choices", ()):
+    if key in MMGP_BACKEND_SETTING_KEYS and value not in args.get("choices", ()):
         value = "automatic"
 
     return gr.update(value=value, **args)
@@ -40,7 +41,7 @@ def get_value_for_setting(key):
 def create_setting_component(key, is_quicksettings=False):
     def fun():
         value = opts.data[key] if key in opts.data else opts.data_labels[key].default
-        if key in {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"}:
+        if key in MMGP_BACKEND_SETTING_KEYS:
             info = opts.data_labels[key]
             choices_args = info.component_args() if callable(info.component_args) else info.component_args or {}
             if value not in choices_args.get("choices", ()):

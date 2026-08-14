@@ -41,6 +41,18 @@ def _component_kind(name: str) -> str:
     return "unet"
 
 
+def _find_lora_components(pipeline):
+    return tuple(
+        component
+        for component in getattr(pipeline, "components", {}).values()
+        if isinstance(component, torch.nn.Module)
+        and (
+            hasattr(component, "_loras_model_data")
+            or any(hasattr(child, "_loras_model_data") for child in component.modules())
+        )
+    )
+
+
 def _resolve_lora(name: str) -> str | None:
     """Resolve a Forge LoRA alias without scanning the model directories."""
     try:
@@ -84,6 +96,7 @@ class NativeMMGP:
         self.component_names = ()
         self.compile_enabled = compile_enabled
         self.lora_signature = None
+        self.lora_components = None
 
     def _pipeline(self):
         return self.pipeline_ref()
@@ -93,28 +106,32 @@ class NativeMMGP:
 
         components = getattr(pipeline, "components", {})
         names = tuple(name for name, value in components.items() if isinstance(value, torch.nn.Module))
+        component_kinds = {name: _component_kind(name) for name in names}
+        use_budgets = memory_management.feature_enabled("budgets")
+        use_pinned_memory = memory_management.feature_enabled("pinned_memory")
+        use_residency_hints = memory_management.feature_enabled("residency_hints")
         budgets = {}
         pinned = []
-        preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if memory_management.feature_enabled("residency_hints") else set()
+        preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if use_residency_hints else set()
 
         for name in names:
-            kind = _component_kind(name)
-            if memory_management.feature_enabled("budgets"):
+            kind = component_kinds[name]
+            if use_budgets:
                 budget = memory_management.MEMORY_BUDGETS_BYTES.get(kind, 0)
                 if budget > 0:
                     budgets[name] = budget / (1024 * 1024)
-            if memory_management.feature_enabled("pinned_memory") and kind in memory_management.MEMORY_PINNED_COMPONENTS:
+            if use_pinned_memory and kind in memory_management.MEMORY_PINNED_COMPONENTS:
                 pinned.append(name)
 
         cotenants = None
-        preferred_names = [name for name in names if _component_kind(name) in preferred]
+        preferred_names = [name for name in names if component_kinds[name] in preferred]
         if preferred_names:
             cotenants = {name: [other for other in preferred_names if other != name] for name in names}
 
         profile = getattr(opts, "forge_memory_profile", "Custom")
         quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
         convert_dtype = memory_management.mmgp_compute_dtype(components.get("transformer"), fallback=getattr(pipeline, "dtype", None))
-        extra_models_to_quantize = [name for name in names if name != "transformer" and _component_kind(name) == "text_encoder"] if quantize else []
+        extra_models_to_quantize = [name for name in names if name != "transformer" and component_kinds[name] == "text_encoder"] if quantize else []
         return {
             "profile": profile,
             "pinnedMemory": pinned or False,
@@ -126,7 +143,7 @@ class NativeMMGP:
             "extraModelsToQuantize": extra_models_to_quantize,
             "quantizationType": mmgp_loader.quantization_type(),
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
-            "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if memory_management.feature_enabled("pinned_memory") else 0,
+            "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if use_pinned_memory else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False) if self.compile_enabled is None else self.compile_enabled),
             "convertWeightsFloatTo": convert_dtype,
             "coTenantsMap": cotenants,
@@ -137,19 +154,19 @@ class NativeMMGP:
     def release(self):
         manager = self.manager
         pipeline = self._pipeline()
+        lora_components = self.lora_components
+        if lora_components is None and pipeline is not None:
+            lora_components = _find_lora_components(pipeline)
         self.manager = None
         self.component_names = ()
         self.lora_signature = None
+        self.lora_components = None
         try:
             from mmgp import offload
 
             if pipeline is not None:
-                for component in getattr(pipeline, "components", {}).values():
-                    if isinstance(component, torch.nn.Module) and (
-                        hasattr(component, "_loras_model_data")
-                        or any(hasattr(child, "_loras_model_data") for child in component.modules())
-                    ):
-                        offload.unload_loras_from_model(component)
+                for component in lora_components or ():
+                    offload.unload_loras_from_model(component)
         except Exception:
             logger.debug("MMGP native LoRA cleanup failed", exc_info=True)
         if manager is not None:
@@ -188,16 +205,10 @@ class NativeMMGP:
                 from mmgp import offload
                 from modules.shared import opts
 
-                components = getattr(pipeline, "components", {})
-                lora_components = [
-                    component
-                    for component in components.values()
-                    if isinstance(component, torch.nn.Module)
-                    and (
-                        hasattr(component, "_loras_model_data")
-                        or any(hasattr(child, "_loras_model_data") for child in component.modules())
-                    )
-                ]
+                lora_components = self.lora_components
+                if lora_components is None:
+                    lora_components = _find_lora_components(pipeline)
+                    self.lora_components = lora_components
                 if paths and not lora_components:
                     return prompt, "Native pipeline has no MMGP LoRA adapters"
 
@@ -264,6 +275,7 @@ class NativeMMGP:
             raise
 
         self.component_names = tuple(getattr(pipeline, "components", {}).keys())
+        self.lora_components = _find_lora_components(pipeline)
         logger.info("Reference MMGP residency manager active for native pipeline (%s)", ", ".join(self.component_names))
         return True
 
@@ -272,7 +284,9 @@ def attach(pipeline, compile_enabled: bool | None = None) -> bool:
     global _active
 
     if not enabled():
-        release(pipeline)
+        # Disabling the optional path must release whichever native pipeline
+        # was previously managed, even when the newly selected pipeline differs.
+        release_all()
         return False
     if _active is None or _active._pipeline() is not pipeline:
         release_all()

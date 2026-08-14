@@ -329,11 +329,29 @@ function syncPresetTabOverflow() {
     });
 }
 
-window.setTimeout(syncPresetTabOverflow, 1000);
-window.setTimeout(syncPresetTabOverflow, 2500);
-window.setInterval(syncPresetTabOverflow, 1000);
-document.addEventListener("click", () => window.setTimeout(syncPresetTabOverflow, 0), true);
-if (typeof onUiUpdate === "function") onUiUpdate(syncPresetTabOverflow);
+let presetTabOverflowSyncPending = false;
+
+function schedulePresetTabOverflowSync() {
+    if (presetTabOverflowSyncPending) return;
+    presetTabOverflowSyncPending = true;
+
+    const run = () => {
+        presetTabOverflowSyncPending = false;
+        syncPresetTabOverflow();
+    };
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+    else window.setTimeout(run, 0);
+}
+
+window.setTimeout(schedulePresetTabOverflowSync, 1000);
+window.setTimeout(schedulePresetTabOverflowSync, 2500);
+document.addEventListener("change", (event) => {
+    if (event.target?.closest?.("#forge_ui_preset")) schedulePresetTabOverflowSync();
+}, true);
+document.addEventListener("input", (event) => {
+    if (event.target?.closest?.("#forge_ui_preset")) schedulePresetTabOverflowSync();
+}, true);
+if (typeof onUiUpdate === "function") onUiUpdate(schedulePresetTabOverflowSync);
 
 if (typeof onUiLoaded === "function") onUiLoaded(function () {
     const attachPresetTabOverflowObserver = () => {
@@ -346,7 +364,7 @@ if (typeof onUiLoaded === "function") onUiLoaded(function () {
         syncPresetTabOverflow();
         if (tabs.dataset.presetOverflowObserver) return;
 
-        const observer = new MutationObserver(syncPresetTabOverflow);
+        const observer = new MutationObserver(schedulePresetTabOverflowSync);
         observer.observe(tabs, { attributes: true, childList: true, subtree: true, attributeFilter: ["aria-hidden", "class", "style"] });
         tabs.dataset.presetOverflowObserver = "true";
     };

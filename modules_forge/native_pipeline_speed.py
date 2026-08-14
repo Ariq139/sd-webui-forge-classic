@@ -10,6 +10,22 @@ ATTENTION_BACKEND_CHOICES = ("automatic", "native", "sage", "flash")
 OFFLOAD_CHOICES = ("none", "model", "group", "sequential")
 
 
+def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
+    from backend import mmgp_loader
+
+    if mmgp_loader.can_attempt(model_path):
+        try:
+            pipeline = mmgp_loader.load_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype)
+            logger.info("%s native pipeline loaded through MMGP's low-RAM component loader", label)
+            return pipeline
+        except mmgp_loader.MMGPLoaderUnavailable:
+            logger.info("%s model layout is not supported by the MMGP loader; using Diffusers loader", label)
+        except Exception:
+            logger.exception("MMGP native loading failed for %s; using Diffusers loader", label)
+
+    return pipeline_class.from_pretrained(model_path, **pipeline_kwargs)
+
+
 def resolve_vae_tiling_mode(auto: bool, force: bool) -> str:
     return "automatic" if auto else "enabled" if force else "disabled"
 
@@ -54,7 +70,7 @@ def _attention_components(pipe):
 
 
 def configure_attention(pipe, requested: str, device: torch.device, logger: logging.Logger) -> str:
-    requested = str(requested or "automatic").lower()
+    requested = str(requested or "automatic").strip().lower()
     candidates = ("sage", "flash", "native") if requested == "automatic" and device.type == "cuda" else (requested,)
     if requested not in ATTENTION_BACKEND_CHOICES:
         candidates = ("native",)

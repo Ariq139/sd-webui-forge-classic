@@ -7,7 +7,7 @@ import uuid
 import gradio as gr
 import torch
 
-from backend import memory_management, mmgp_loader, mmgp_native
+from backend import memory_management, mmgp_native
 from modules import paths, shared
 from modules_forge import main_thread
 from modules_forge.native_models import is_compatible_model, resolve_model_path
@@ -18,6 +18,7 @@ from modules_forge.native_pipeline_speed import (
     configure_attention,
     configure_prompt_cache,
     configure_vae_tiling,
+    load_native_pipeline,
     resolve_vae_tiling_mode,
 )
 
@@ -271,18 +272,7 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
             pipeline_kwargs["vae"] = vae
 
         pipeline_class = LTX2ImageToVideoPipeline if image_mode else LTX2Pipeline
-        if mmgp_loader.can_attempt(model_path):
-            try:
-                _pipeline = mmgp_loader.load_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype)
-                logger.info("LTX-2 native pipeline loaded through MMGP's low-RAM component loader")
-            except mmgp_loader.MMGPLoaderUnavailable:
-                logger.info("LTX-2 model layout is not supported by the MMGP loader; using Diffusers loader")
-                _pipeline = pipeline_class.from_pretrained(model_path, **pipeline_kwargs)
-            except Exception:
-                logger.exception("MMGP native loading failed; using Diffusers loader")
-                _pipeline = pipeline_class.from_pretrained(model_path, **pipeline_kwargs)
-        else:
-            _pipeline = pipeline_class.from_pretrained(model_path, **pipeline_kwargs)
+        _pipeline = load_native_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype, logger, "LTX-2")
         if mmgp_active:
             configure_attention(_pipeline, attention_backend, device, logger)
             if not mmgp_native.attach(_pipeline, compile_enabled=compile_enabled):

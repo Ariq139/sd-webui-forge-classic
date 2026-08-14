@@ -31,6 +31,7 @@ MEMORY_SETTING_KEYS = (
 MMGP_ATTENTION_BACKEND_CHOICES = (
     "automatic",
     "sdpa",
+    "ck",
     "sage",
     "sage2",
     "sage3",

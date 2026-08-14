@@ -1078,16 +1078,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.postprocess_batch_list(p, batch_params, batch_number=n)
                 x_samples_ddim = batch_params.images
 
+            prompts_were_expanded = (
+                bool(p.all_prompts)
+                and any(prompt != p.prompt_template for prompt in p.all_prompts)
+            ) or (
+                bool(p.all_negative_prompts)
+                and any(prompt != p.negative_prompt_template for prompt in p.all_negative_prompts)
+            )
+
             def infotext(index=0, use_main_prompt=False):
                 prompts = batch_prompts
                 negative_prompts = batch_negative_prompts
-                prompts_were_expanded = (
-                    bool(p.all_prompts)
-                    and any(prompt != p.prompt_template for prompt in p.all_prompts)
-                ) or (
-                    bool(p.all_negative_prompts)
-                    and any(prompt != p.negative_prompt_template for prompt in p.all_negative_prompts)
-                )
                 if opts.save_prompt_comments and not prompts_were_expanded and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
                     _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
@@ -1102,7 +1103,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
-                prompt_index = min(i, len(batch_prompts) - 1)
+                sample_index = i // _times if _is_video else i
+                prompt_index = min(sample_index, len(batch_prompts) - 1)
                 image_prompt = batch_prompts[prompt_index]
                 generated_prompts.append(image_prompt)
                 generated_negative_prompts.append(batch_negative_prompts[prompt_index])
@@ -1121,7 +1123,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
                 if p.restore_faces:
                     if save_samples and opts.save_images_before_face_restoration:
-                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", p.seeds[i], image_prompt, opts.samples_format, info=infotext(i), p=p, suffix="-before-face-restoration")
+                        images.save_image(Image.fromarray(x_sample), p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-before-face-restoration")
 
                     devices.torch_gc()
 
@@ -1152,7 +1154,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 if p.color_corrections is not None and i < len(p.color_corrections):
                     if save_samples and opts.save_images_before_color_correction:
                         image_without_cc, _ = apply_overlay(image, p.paste_to, overlay_image)
-                        images.save_image(image_without_cc, p.outpath_samples, "", p.seeds[i], image_prompt, opts.samples_format, info=infotext(i), p=p, suffix="-before-color-correction")
+                        images.save_image(image_without_cc, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-before-color-correction")
                     image = apply_color_correction(p.color_corrections[i], image)
 
                 # If the intention is to show the output from the model
@@ -1169,9 +1171,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     image = pp.image
 
                 if save_samples:
-                    images.save_image(image, p.outpath_samples, "", p.seeds[i], image_prompt, opts.samples_format, info=infotext(i), p=p)
+                    images.save_image(image, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p)
 
-                text = infotext(i)
+                text = infotext(sample_index)
                 infotexts.append(text)
                 if opts.enable_pnginfo:
                     image.info["parameters"] = text
@@ -1181,14 +1183,14 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     if opts.return_mask or opts.save_mask:
                         image_mask = mask_for_overlay.convert("RGB")
                         if save_samples and opts.save_mask:
-                            images.save_image(image_mask, p.outpath_samples, "", p.seeds[i], image_prompt, opts.samples_format, info=infotext(i), p=p, suffix="-mask")
+                            images.save_image(image_mask, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-mask")
                         if opts.return_mask:
                             output_images.append(image_mask)
 
                     if opts.return_mask_composite or opts.save_mask_composite:
                         image_mask_composite = Image.composite(original_denoised_image.convert("RGBA").convert("RGBa"), Image.new("RGBa", image.size), images.resize_image(2, mask_for_overlay, image.width, image.height).convert("L")).convert("RGBA")
                         if save_samples and opts.save_mask_composite:
-                            images.save_image(image_mask_composite, p.outpath_samples, "", p.seeds[i], image_prompt, opts.samples_format, info=infotext(i), p=p, suffix="-mask-composite")
+                            images.save_image(image_mask_composite, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-mask-composite")
                         if opts.return_mask_composite:
                             output_images.append(image_mask_composite)
 

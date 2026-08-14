@@ -5,7 +5,7 @@ import threading
 import gradio as gr
 import torch
 
-from backend import memory_management, mmgp_loader, mmgp_native
+from backend import memory_management, mmgp_native
 from modules import shared
 from modules_forge import main_thread
 from modules_forge.native_models import is_compatible_model, resolve_model_path
@@ -16,6 +16,7 @@ from modules_forge.native_pipeline_speed import (
     configure_attention,
     configure_prompt_cache,
     configure_vae_tiling,
+    load_native_pipeline,
     resolve_vae_tiling_mode,
 )
 
@@ -158,18 +159,7 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
         unload()
         unload_forge_model()
         pipeline_kwargs = {"torch_dtype": dtype}
-        if mmgp_loader.can_attempt(model_path):
-            try:
-                _pipeline = mmgp_loader.load_pipeline(Ideogram4Pipeline, model_path, pipeline_kwargs, dtype)
-                logger.info("Ideogram 4 native pipeline loaded through MMGP's low-RAM component loader")
-            except mmgp_loader.MMGPLoaderUnavailable:
-                logger.info("Ideogram 4 model layout is not supported by the MMGP loader; using Diffusers loader")
-                _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
-            except Exception:
-                logger.exception("MMGP native loading failed; using Diffusers loader")
-                _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
-        else:
-            _pipeline = Ideogram4Pipeline.from_pretrained(model_path, **pipeline_kwargs)
+        _pipeline = load_native_pipeline(Ideogram4Pipeline, model_path, pipeline_kwargs, dtype, logger, "Ideogram 4")
         if mmgp_active:
             configure_attention(_pipeline, attention_backend, device, logger)
             if not mmgp_native.attach(_pipeline, compile_enabled=compile_enabled):

@@ -20,6 +20,8 @@ from modules import errors, scripts, sd_models, shared
 logger = logging.getLogger("lora")
 setup_logger(logger)
 
+ANIMA_BLOCK_MAPPING = (0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27)
+
 
 def load_lora_state_dict(filename):
     """Use lazy safetensors reads for the optional MMGP path."""
@@ -48,20 +50,18 @@ def process_anima(lora: dict[str, torch.Tensor], blocks: int):
 
     logger.warning("Re-Mapping 28-Block Anima LoRA to 40-Block")
 
-    temp = lora.copy()
-    keys = list(temp.keys())
+    block_prefix = "lora_unet_blocks_"
+    blocks_by_index = {}
+    block_pattern = re.compile(r"^(lora_unet_blocks_)(\d+)(?=_|\.|$)")
+    for key in tuple(lora.keys()):
+        match = block_pattern.match(key)
+        if match:
+            blocks_by_index.setdefault(int(match.group(2)), []).append((key, match.end()))
 
-    MAPPING = [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27]
-
-    for i in range(blocks):
-        a = f"lora_unet_blocks_{MAPPING[i]}"
-        b = f"lora_unet_blocks_{i}"
-
-        for k in keys:
-            if a in k:
-                lora[k.replace(a, b)] = temp[k].clone()
-
-    del temp
+    for target_index, source_index in enumerate(ANIMA_BLOCK_MAPPING[:blocks]):
+        for key, suffix_start in blocks_by_index.get(source_index, ()):
+            target_key = f"{block_prefix}{target_index}{key[suffix_start:]}"
+            lora[target_key] = lora[key].clone()
 
 
 def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, torch.Tensor], strength_model: float, strength_clip: float, filename: str = "default", online_mode: bool = False):

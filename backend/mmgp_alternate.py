@@ -173,8 +173,11 @@ class AlternateMMGP:
         from modules.shared import opts
 
         current_modules, _ = self._get_modules_and_patchers()
+        use_budgets = memory_management.feature_enabled("budgets")
+        use_pinned_memory = memory_management.feature_enabled("pinned_memory")
+        use_residency_hints = memory_management.feature_enabled("residency_hints")
         budgets = {}
-        if memory_management.feature_enabled("budgets"):
+        if use_budgets:
             for component, module_id in (("unet", "transformer"), ("text_encoder", "text_encoder"), ("vae", "vae")):
                 value = memory_management.MEMORY_BUDGETS_BYTES.get(component, 0)
                 if value > 0:
@@ -184,7 +187,7 @@ class AlternateMMGP:
                 budgets.update({key: controlnet_budget / (1024 * 1024) for key in current_modules if key.startswith("extra_")})
 
         pinned = []
-        if memory_management.feature_enabled("pinned_memory"):
+        if use_pinned_memory:
             for component, module_id in (("unet", "transformer"), ("text_encoder", "text_encoder"), ("vae", "vae")):
                 if component in memory_management.MEMORY_PINNED_COMPONENTS:
                     pinned.append(module_id)
@@ -202,7 +205,7 @@ class AlternateMMGP:
             module_names = {getattr(module, "__module__", "").lower() for module in text_encoder.modules()} if text_encoder else set()
             if not mmgp_loader.has_llm_adapter(text_encoder) and any(any(marker in module_name for marker in ("t5", "llama", "llm")) for module_name in module_names):
                 extra_models_to_quantize.append("text_encoder")
-        preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if memory_management.feature_enabled("residency_hints") else set()
+        preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if use_residency_hints else set()
         component_ids = {"unet": "transformer", "text_encoder": "text_encoder", "vae": "vae"}
         preferred_ids = {component_ids[name] for name in preferred if name in component_ids}
         preferred_ids.update(key for key in current_modules if key.startswith("extra_") and "controlnet" in preferred)
@@ -223,7 +226,7 @@ class AlternateMMGP:
             "extraModelsToQuantize": extra_models_to_quantize,
             "quantizationType": mmgp_loader.quantization_type(),
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
-            "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if memory_management.feature_enabled("pinned_memory") else 0,
+            "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if use_pinned_memory else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False)),
             "convertWeightsFloatTo": convert_dtype,
             "coTenantsMap": cotenants,

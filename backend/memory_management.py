@@ -1150,19 +1150,21 @@ def flash_enabled() -> bool:
 
 
 def ck_enabled() -> bool:
-    if cpu_state is not CPUState.GPU:
+    if cpu_state is not CPUState.GPU or not args.use_ck_attention:
         return False
     try:
-        CK_IS_AVAILABLE = ck.int8_attention_is_available()
+        is_available = getattr(ck, "int8_attention_is_available", None)
+        int8_attention = getattr(ck, "int8_attention", None)
+        return callable(is_available) and callable(int8_attention) and bool(is_available())
     except Exception:
         return False
-    else:
-        return CK_IS_AVAILABLE and args.use_ck_attention
 
 
 def mmgp_attention_backend_choices() -> tuple[str, ...]:
     """Return attention choices that are installed and usable on this host."""
     choices = ["automatic", "sdpa"]
+    if ck_enabled():
+        choices.append("ck")
     try:
         capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
         triton_available = importlib.util.find_spec("triton") is not None
@@ -1797,10 +1799,10 @@ def configure_memory_features(
     # Saved settings are inactive without --mmgp.
     effective_enabled = bool(enabled and mmgp_flag_present())
     MMGP_RUNTIME_ACTIVE = effective_enabled
-    cli_attention = getattr(args, "mmgp_attention", "automatic")
+    cli_attention = str(getattr(args, "mmgp_attention", "automatic") or "automatic").strip().lower()
     requested_attention = attention_backend if cli_attention == "automatic" else cli_attention
-    requested_attention = requested_attention or "automatic"
-    if requested_attention not in {"automatic", "sdpa", "sage", "sage2", "sage3", "flash", "flash3", "radial", "xformers"}:
+    requested_attention = str(requested_attention or "automatic").strip().lower()
+    if requested_attention not in {"automatic", "sdpa", "ck", "sage", "sage2", "sage3", "flash", "flash3", "radial", "xformers"}:
         requested_attention = "automatic"
     MMGP_ATTENTION_BACKEND = requested_attention if effective_enabled else "automatic"
     requested_vae_attention = str(vae_attention_backend or "automatic").strip().lower()
