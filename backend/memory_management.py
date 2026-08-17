@@ -602,13 +602,14 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     can_unload = []
     hinted_can_unload = []
     unloaded_models = []
+    use_residency_hints = feature_enabled("residency_hints")
 
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 candidate = (-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i)
-                if residency_hint_enabled(shift_model.model):
+                if use_residency_hints and memory_component_for_model(shift_model.model) in MEMORY_RESIDENCY_COMPONENTS:
                     hinted_can_unload.append(candidate)
                 else:
                     can_unload.append(candidate)
@@ -641,7 +642,7 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
 
 
 def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False):
-    if mmgp_enabled() and feature_enabled("enabled"):
+    if mmgp_runtime_enabled():
         try:
             from backend.mmgp_alternate import get_manager_for_models
 
@@ -933,13 +934,13 @@ def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, su
 
 
 def text_encoder_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
 
 
 def text_encoder_device() -> torch.device:
     if args.text_enc_device is not None:
         return torch.device(args.text_enc_device)
-    if args.gpu_only and not mmgp_enabled():
+    if args.gpu_only and not mmgp_runtime_enabled():
         return get_torch_device()
     if args.cpu_text_enc:
         return cpu
@@ -983,7 +984,7 @@ def text_encoder_dtype(device=None) -> torch.dtype:
 
 
 def intermediate_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
 
 
 def vae_device() -> torch.device:
@@ -993,7 +994,7 @@ def vae_device() -> torch.device:
 
 
 def vae_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_enabled() else cpu
+    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
 
 
 def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
@@ -1550,25 +1551,30 @@ stream_counters: dict[torch.device, int] = {}
 
 
 def get_offload_stream(device: torch.device):
-    if not async_transfers_enabled() or NUM_STREAMS == 0:
+    if device is None or not (is_device_cuda(device) or is_device_xpu(device)):
+        return None
+    if NUM_STREAMS == 0 or not async_transfers_enabled():
         return None
     if torch.compiler.is_compiling():
         return None
 
     stream_counter = stream_counters.get(device, 0)
 
-    if device in STREAMS and len(STREAMS[device]) != NUM_STREAMS:
+    streams = STREAMS.get(device)
+    if streams is not None and len(streams) != NUM_STREAMS:
         # Keep old streams alive until this call finishes.
         del STREAMS[device]
         stream_counters.pop(device, None)
+        streams = None
+        stream_counter = 0
 
-    if device in STREAMS:
-        ss = STREAMS[device]
-        ss[stream_counter].wait_stream(current_stream(device))
-        stream_counter = (stream_counter + 1) % len(ss)
+    if streams is not None:
+        active_stream = current_stream(device)
+        streams[stream_counter].wait_stream(active_stream)
+        stream_counter = (stream_counter + 1) % len(streams)
         stream_counters[device] = stream_counter
-        return ss[stream_counter]
-    elif is_device_cuda(device):
+        return streams[stream_counter]
+    if is_device_cuda(device):
         ss = []
         for _ in range(NUM_STREAMS):
             s1 = torch.cuda.Stream(device=device, priority=0)
@@ -1591,9 +1597,11 @@ def get_offload_stream(device: torch.device):
 
 
 def sync_stream(device: torch.device, stream):
-    if stream is None or current_stream(device) is None:
+    if stream is None:
         return
-    current_stream(device).wait_stream(stream)
+    active_stream = current_stream(device)
+    if active_stream is not None:
+        active_stream.wait_stream(stream)
 
 
 # region Pin
@@ -1650,8 +1658,9 @@ def pin_memory(tensor, component: str = "auto"):
         return False
 
     # Skip pinning when host memory is low.
-    ram_headroom = max(2 * 1024 * 1024 * 1024, int(psutil.virtual_memory().total * 0.05))
-    if psutil.virtual_memory().available - size < ram_headroom:
+    virtual_memory = psutil.virtual_memory()
+    ram_headroom = max(2 * 1024 * 1024 * 1024, int(virtual_memory.total * 0.05))
+    if virtual_memory.available - size < ram_headroom:
         logger.debug("Skipping pinned-memory registration because host RAM is under pressure")
         return False
 
@@ -1697,12 +1706,18 @@ def unpin_memory(tensor):
 
 def feature_enabled(feature: str) -> bool:
     """Return whether an optional memory feature is currently active."""
-    return bool(MEMORY_FEATURES.get("enabled", False) and MEMORY_FEATURES.get(feature, False))
+    features = MEMORY_FEATURES
+    return bool(features.get("enabled", False) and features.get(feature, False))
 
 
 def mmgp_enabled() -> bool:
-    """Whether the optional MMGP path is active at runtime."""
+    """Whether optional MMGP runtime is active."""
     return MMGP_RUNTIME_ACTIVE
+
+
+def mmgp_runtime_enabled() -> bool:
+    """Whether MMGP was requested and its master switch is active."""
+    return bool(MMGP_RUNTIME_ACTIVE and MEMORY_FEATURES.get("enabled", False))
 
 
 def mmgp_flag_present() -> bool:
@@ -1712,17 +1727,22 @@ def mmgp_flag_present() -> bool:
 
 def mmgp_attention_backend() -> str:
     """Return the optional attention backend without changing Forge defaults."""
-    return MMGP_ATTENTION_BACKEND if mmgp_enabled() else "automatic"
+    return MMGP_ATTENTION_BACKEND if mmgp_runtime_enabled() else "automatic"
 
 
 def mmgp_vae_attention_backend() -> str:
     """Return the optional VAE attention backend without changing Forge defaults."""
-    return MMGP_VAE_ATTENTION_BACKEND if mmgp_enabled() else "automatic"
+    return MMGP_VAE_ATTENTION_BACKEND if mmgp_runtime_enabled() else "automatic"
 
 
 def async_transfers_enabled() -> bool:
     """Keep the existing CLI stream option working independently of UI settings."""
     return bool(args.cuda_stream is not None or feature_enabled("async_transfers"))
+
+
+def mmgp_async_transfers_enabled() -> bool:
+    """Return whether the optional MMGP manager may use asynchronous transfers."""
+    return bool(mmgp_runtime_enabled() and feature_enabled("async_transfers"))
 
 
 def memory_component_for_model(model) -> str:
@@ -1758,6 +1778,7 @@ def _setting_number(value, default):
 
 def configure_memory_features(
     *,
+    profile: str = "Custom",
     enabled: bool = False,
     attention_backend: str = "automatic",
     vae_attention_backend: str = "automatic",
@@ -1850,6 +1871,7 @@ def configure_memory_features(
     elif not args.pin_shared_memory:
         MAX_PINNED_MEMORY = -1
 
+    previous_signature = MEMORY_RUNTIME_SIGNATURE
     runtime_signature = (
         effective_enabled,
         feature_enabled("budgets"),
@@ -1870,8 +1892,10 @@ def configure_memory_features(
         str(quantization_type) if effective_enabled and alternate_quantization else "",
         MMGP_ATTENTION_BACKEND if effective_enabled else "automatic",
         MMGP_VAE_ATTENTION_BACKEND if effective_enabled else "automatic",
+        str(profile or "Custom") if effective_enabled else "Custom",
     )
-    if MEMORY_RUNTIME_SIGNATURE is not None and runtime_signature != MEMORY_RUNTIME_SIGNATURE:
+    mode_changed = previous_signature is not None and runtime_signature != previous_signature
+    if mode_changed:
         logger.info("Memory-management mode changed; unloading models before applying the new mode")
         unload_all_models()
         soft_empty_cache()
@@ -1887,6 +1911,7 @@ def configure_memory_features(
         feature_enabled("residency_hints"),
         NUM_STREAMS,
     )
+    return mode_changed
 
 
 # region Conv3d

@@ -102,7 +102,41 @@ def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
     return out
 
 
+def _ensure_nvfp4_markers(state_dict: dict[str, torch.Tensor]) -> bool:
+    """Recognize native NVFP4 weights even when exporters omit its marker."""
+    found = False
+    marker = json.dumps({"format": "nvfp4"}).encode("utf-8")
+    for scale_key in list(state_dict):
+        if not scale_key.endswith(".weight_scale_2"):
+            continue
+
+        layer = scale_key[: -len(".weight_scale_2")]
+        weight_key = f"{layer}.weight"
+        block_scale_key = f"{layer}.weight_scale"
+        weight = state_dict.get(weight_key)
+        block_scale = state_dict.get(block_scale_key)
+        if not isinstance(weight, torch.Tensor) or not isinstance(block_scale, torch.Tensor):
+            continue
+        if weight.dtype != torch.uint8 or weight.ndim != 2:
+            continue
+
+        found = True
+        marker_key = f"{layer}.comfy_quant"
+        marker_value = state_dict.get(marker_key)
+        replace_marker = marker_value is None
+        if isinstance(marker_value, torch.Tensor):
+            try:
+                marker_data = json.loads(marker_value.detach().cpu().numpy().tobytes())
+                replace_marker = marker_data.get("format") in {"fp8", "fp8_e4m3", "float8_e4m3fn", "float8_e5m2"}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                replace_marker = False
+        if replace_marker:
+            state_dict[marker_key] = torch.tensor(list(marker), dtype=torch.uint8)
+    return found
+
+
 def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
+    _ensure_nvfp4_markers(state_dict)
     if any(k.endswith(".comfy_quant") for k in state_dict):
         return {"mixed_ops": True, "TE": not is_unet}
     return None

@@ -1,6 +1,8 @@
 import importlib
+import json
 import logging
 import os.path
+import re
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -110,21 +112,105 @@ def _detect_vae_format(state_dict: dict[str, torch.Tensor]) -> str | None:
     return None
 
 
+def _detected_vae_config(vae_format: str) -> dict:
+    config_paths = {
+        "wan21": os.path.join(HF, "Wan-AI", "Wan2.1-T2V-14B", "vae", "config.json"),
+        "qwen2d": os.path.join(HF, "Qwen", "Qwen-Image", "vae", "config.json"),
+    }
+    path = config_paths.get(vae_format)
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _infer_flat_vae_layout(state_dict: dict[str, torch.Tensor], prefix: str, base_dim: int, residual_marker: str, output_suffix: str, temporal: bool = False) -> dict:
+    modules = {}
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)\.")
+    for key in state_dict:
+        match = pattern.match(key)
+        if match:
+            modules.setdefault(int(match.group(1)), []).append(key)
+
+    stage_dims = []
+    stage_blocks = []
+    attention_scales = []
+    temporal_downsample = []
+    current_dim = None
+    block_count = 0
+    scale = 1.0
+    for index in sorted(modules):
+        keys = modules[index]
+        if any(f"{prefix}{index}.resample." in key for key in keys):
+            if current_dim is not None:
+                stage_dims.append(current_dim)
+                stage_blocks.append(block_count)
+                current_dim = None
+                block_count = 0
+            if temporal:
+                temporal_downsample.append(any(f"{prefix}{index}.time_conv." in key for key in keys))
+            scale /= 2.0
+            continue
+
+        if any(key.endswith(residual_marker) for key in keys):
+            output_key = next((key for key in keys if key.endswith(output_suffix)), None)
+            if output_key is not None:
+                current_dim = int(state_dict[output_key].shape[0])
+                block_count += 1
+        if any("to_qkv.weight" in key for key in keys):
+            attention_scales.append(scale)
+
+    if current_dim is not None:
+        stage_dims.append(current_dim)
+        stage_blocks.append(block_count)
+
+    if not stage_dims or not all(dim % base_dim == 0 for dim in stage_dims):
+        return {}
+
+    dim_mult = [dim // base_dim for dim in stage_dims]
+    if any(value <= 0 for value in dim_mult) or len(stage_blocks) != len(dim_mult):
+        return {}
+
+    result = {
+        "dim_mult": dim_mult,
+        "num_res_blocks": stage_blocks[0] if stage_blocks and len(set(stage_blocks)) == 1 and stage_blocks[0] > 0 else None,
+        "attn_scales": sorted(set(attention_scales)),
+    }
+    if temporal and len(temporal_downsample) == len(dim_mult) - 1:
+        result["temporal_downsample"] = temporal_downsample
+    return {key: value for key, value in result.items() if value is not None}
+
+
 def _load_detected_vae(state_dict: dict[str, torch.Tensor], vae_format: str):
     """Build a VAE from its own keys, independent of the selected pipeline."""
     if vae_format == "wan21":
         from backend.nn.wan_vae import WanVAE
 
         # Infer the Wan config from tensor shapes, as ComfyUI does.
+        defaults = _detected_vae_config(vae_format)
         base_dim = int(state_dict["encoder.conv1.weight"].shape[0])
         z_dim = int(state_dict["conv1.weight"].shape[0] // 2)
+        defaults.update(
+            _infer_flat_vae_layout(
+                state_dict,
+                "encoder.downsamples.",
+                base_dim,
+                ".residual.0.gamma",
+                ".residual.2.weight",
+                temporal=True,
+            )
+        )
         config = {
-            "base_dim": base_dim,
-            "z_dim": z_dim,
-            "dim_mult": [1, 2, 4, 4],
-            "num_res_blocks": 2,
-            "attn_scales": [],
-            "temporal_downsample": [False, True, True],
+            "base_dim": base_dim or defaults.get("base_dim", 128),
+            "z_dim": z_dim or defaults.get("z_dim", 4),
+            "dim_mult": defaults.get("dim_mult", [1, 2, 4, 4]),
+            "num_res_blocks": defaults.get("num_res_blocks", 2),
+            "attn_scales": defaults.get("attn_scales", []),
+            "temporal_downsample": defaults.get("temporal_downsample", [False, True, True]),
             "image_channels": int(state_dict["encoder.conv1.weight"].shape[1]),
             "conv_out_channels": int(state_dict["decoder.head.2.weight"].shape[0]),
             "dropout": 0.0,
@@ -142,14 +228,24 @@ def _load_detected_vae(state_dict: dict[str, torch.Tensor], vae_format: str):
     if vae_format == "qwen2d":
         from backend.nn.wan_vae_2d import Qwen2DVAE
 
+        defaults = _detected_vae_config(vae_format)
+        defaults.update(
+            _infer_flat_vae_layout(
+                state_dict,
+                "encoder.down_blocks.",
+                int(state_dict["encoder.conv_in.weight"].shape[0]),
+                ".norm1.gamma",
+                ".conv1.weight",
+            )
+        )
         config = {
-            "base_dim": int(state_dict["encoder.conv_in.weight"].shape[0]),
-            "z_dim": int(state_dict["post_quant_conv.weight"].shape[0]),
+            "base_dim": int(state_dict["encoder.conv_in.weight"].shape[0]) or defaults.get("base_dim", 96),
+            "z_dim": int(state_dict["post_quant_conv.weight"].shape[0]) or defaults.get("z_dim", 16),
             "image_channels": int(state_dict["encoder.conv_in.weight"].shape[1]),
-            "dim_mult": [1, 2, 4, 4],
-            "num_res_blocks": 2,
-            "attn_scales": [],
-            "dropout": 0.0,
+            "dim_mult": defaults.get("dim_mult", [1, 2, 4, 4]),
+            "num_res_blocks": defaults.get("num_res_blocks", 2),
+            "attn_scales": defaults.get("attn_scales", []),
+            "dropout": defaults.get("dropout", 0.0),
         }
 
         with no_init_weights():

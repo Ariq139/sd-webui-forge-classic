@@ -298,7 +298,7 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
 
     unet_storage_dtype, lora_fp16 = forge_unet_storage_dtype_options.get(shared.opts.forge_unet_storage_dtype, (None, False))
 
-    model_data.forge_loading_parameters = dict(checkpoint_info=checkpoint_info, additional_modules=shared.opts.forge_additional_modules, unet_storage_dtype=unet_storage_dtype)
+    loading_parameters = dict(checkpoint_info=checkpoint_info, additional_modules=shared.opts.forge_additional_modules, unet_storage_dtype=unet_storage_dtype)
 
     ckpt: str = checkpoint_info.filename
     modules: list[str] = [os.path.basename(x) for x in shared.opts.forge_additional_modules]
@@ -311,11 +311,18 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
         logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
 
-    from backend.memory_management import mmgp_enabled
+    from backend.memory_management import mmgp_runtime_enabled
 
-    mmgp_dynamic_lora = bool(getattr(shared.opts, "forge_memory_dynamic_lora_enabled", True) and mmgp_enabled())
-    dynamic_args.online_lora = lora_fp16 or mmgp_dynamic_lora
-    logger.info(f"Patch LoRAs on-the-fly: {dynamic_args.online_lora} (fp16={lora_fp16}, mmgp_dynamic={mmgp_dynamic_lora})")
+    mmgp_dynamic_lora = bool(getattr(shared.opts, "forge_memory_dynamic_lora_enabled", True) and mmgp_runtime_enabled())
+    online_lora = lora_fp16 or mmgp_dynamic_lora
+    parameters_changed = model_data.forge_loading_parameters != loading_parameters
+    lora_mode_changed = dynamic_args.online_lora != online_lora
+    model_data.forge_loading_parameters = loading_parameters
+    dynamic_args.online_lora = online_lora
+    if not parameters_changed and not lora_mode_changed:
+        return
+
+    logger.info(f"Patch LoRAs on-the-fly: {online_lora} (fp16={lora_fp16}, mmgp_dynamic={mmgp_dynamic_lora})")
     if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
         logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
 
@@ -562,9 +569,13 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
             sd_models.unload_model_weights()
         except Exception:
             logger.debug("No Forge image model needed unloading before native pipeline", exc_info=True)
-        native_checkpoint = native_model_value(ui_forge_preset) or str(ui_checkpoint or "").strip()
+        native_checkpoint = native_model_value(ui_forge_preset)
         if native_checkpoint:
             checkpoint_change(native_checkpoint, ui_forge_preset, save=True, refresh=False)
+        else:
+            shared.opts.set(f"forge_checkpoint_{ui_forge_preset}", "")
+            shared.opts.set(f"{ui_forge_preset}_model_path", "")
+            shared.opts.save(shared.config_filename)
         return
 
     restore_standard_preset(ui_forge_preset)
@@ -572,8 +583,9 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
 
 def on_preset_change(preset: str, checkpoint_override: str | None = None):
     assert preset is not None
-    shared.opts.set("forge_preset", preset)
-    shared.opts.save(shared.config_filename)
+    preset_changed = shared.opts.set("forge_preset", preset)
+    if preset_changed:
+        shared.opts.save(shared.config_filename)
 
     checkpoint_list = checkpoint_choices(preset, shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short))
     checkpoint = checkpoint_override or checkpoint_value_for_preset(preset, checkpoint_list)

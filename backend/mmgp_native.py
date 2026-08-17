@@ -27,30 +27,44 @@ _LORA_TOKEN = re.compile(r"<lora:([^:>]+)(?::([^>]+))?>", re.IGNORECASE)
 
 
 def enabled() -> bool:
-    return bool(memory_management.mmgp_enabled() and memory_management.feature_enabled("enabled"))
+    return memory_management.mmgp_runtime_enabled()
 
 
-def _component_kind(name: str) -> str:
-    name = str(name).lower()
-    if "text" in name or "encoder" in name or "tokenizer" in name:
-        return "text_encoder"
-    if "vae" in name or "vocoder" in name or "decoder" in name:
-        return "vae"
-    if "control" in name:
-        return "controlnet"
-    return "unet"
+def _component_kind(name: str, model=None) -> str:
+    component = getattr(model, "memory_component", "auto") if model is not None else "auto"
+    if component and component != "auto":
+        return component
+    return mmgp_loader.component_kind(name, model)
+
+
+def _main_component_name(components) -> str | None:
+    for name in ("transformer", "unet", "diffusion_model", "denoiser", "model"):
+        if isinstance(components.get(name), torch.nn.Module):
+            return name
+    for name, model in components.items():
+        if isinstance(model, torch.nn.Module) and _component_kind(name, model) == "unet":
+            return name
+    return None
+
+
+def _manager_components(components) -> tuple[dict, str | None]:
+    modules = {name: model for name, model in components.items() if isinstance(model, torch.nn.Module)}
+    main_name = _main_component_name(modules)
+    if main_name and main_name != "transformer" and "transformer" not in modules:
+        modules["transformer"] = modules.pop(main_name)
+    return modules, main_name
 
 
 def _find_lora_components(pipeline):
-    return tuple(
-        component
-        for component in getattr(pipeline, "components", {}).values()
-        if isinstance(component, torch.nn.Module)
-        and (
-            hasattr(component, "_loras_model_data")
-            or any(hasattr(child, "_loras_model_data") for child in component.modules())
-        )
-    )
+    components = []
+    seen = set()
+    for component in getattr(pipeline, "components", {}).values():
+        if not isinstance(component, torch.nn.Module) or id(component) in seen:
+            continue
+        if hasattr(component, "_loras_model_data") or any(hasattr(child, "_loras_model_data") for child in component.modules()):
+            seen.add(id(component))
+            components.append(component)
+    return tuple(components)
 
 
 def _resolve_lora(name: str) -> str | None:
@@ -69,23 +83,25 @@ def _resolve_lora(name: str) -> str | None:
 
 
 def _prompt_loras(prompt: str) -> tuple[str, list[str], list[float], list[str]]:
-    clean_prompt = prompt
     paths = []
     weights = []
     unresolved = []
-    for match in _LORA_TOKEN.finditer(prompt or ""):
+
+    def remove_resolved(match):
         path = _resolve_lora(match.group(1).strip())
         if path is None:
             unresolved.append(match.group(1).strip())
-            continue
+            return match.group(0)
         try:
             weight = float(match.group(2)) if match.group(2) else 1.0
         except ValueError:
             unresolved.append(match.group(1).strip())
-            continue
+            return match.group(0)
         paths.append(path)
         weights.append(weight)
-        clean_prompt = clean_prompt.replace(match.group(0), "")
+        return ""
+
+    clean_prompt = _LORA_TOKEN.sub(remove_resolved, prompt or "")
     return clean_prompt.strip(), paths, weights, unresolved
 
 
@@ -94,6 +110,7 @@ class NativeMMGP:
         self.pipeline_ref = weakref.ref(pipeline)
         self.manager = None
         self.component_names = ()
+        self.manager_components = None
         self.compile_enabled = compile_enabled
         self.lora_signature = None
         self.lora_components = None
@@ -103,10 +120,12 @@ class NativeMMGP:
 
     def _settings(self, pipeline):
         from modules.shared import opts
+        from modules_forge.mmgp_profiles import extra_text_encoder_quantization_enabled, get_mmgp_quantization
 
         components = getattr(pipeline, "components", {})
-        names = tuple(name for name, value in components.items() if isinstance(value, torch.nn.Module))
-        component_kinds = {name: _component_kind(name) for name in names}
+        manager_components, _main_name = _manager_components(components)
+        names = tuple(manager_components)
+        component_kinds = {name: _component_kind(name, manager_components[name]) for name in names}
         use_budgets = memory_management.feature_enabled("budgets")
         use_pinned_memory = memory_management.feature_enabled("pinned_memory")
         use_residency_hints = memory_management.feature_enabled("residency_hints")
@@ -129,19 +148,23 @@ class NativeMMGP:
             cotenants = {name: [other for other in preferred_names if other != name] for name in names}
 
         profile = getattr(opts, "forge_memory_profile", "Custom")
-        quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
-        convert_dtype = memory_management.mmgp_compute_dtype(components.get("transformer"), fallback=getattr(pipeline, "dtype", None))
-        extra_models_to_quantize = [name for name in names if name != "transformer" and component_kinds[name] == "text_encoder"] if quantize else []
+        quantize, _quantization_type = get_mmgp_quantization(opts)
+        convert_dtype = memory_management.mmgp_compute_dtype(manager_components.get("transformer"), fallback=getattr(pipeline, "dtype", None))
+        extra_models_to_quantize = [
+            name for name in names
+            if name != "transformer" and extra_text_encoder_quantization_enabled(opts)
+            and mmgp_loader.is_large_text_encoder(manager_components[name], name)
+        ]
         return {
             "profile": profile,
             "pinnedMemory": pinned or False,
             "pinnedPEFTLora": bool(pinned and getattr(opts, "forge_memory_pinned_memory_enabled", False)),
             "budgets": budgets or None,
             "workingVRAM": memory_management.MEMORY_WORKING_VRAM_BYTES / (1024 * 1024) or None,
-            "asyncTransfers": memory_management.async_transfers_enabled(),
+            "asyncTransfers": memory_management.mmgp_async_transfers_enabled(),
             "quantizeTransformer": quantize and "transformer" in names,
             "extraModelsToQuantize": extra_models_to_quantize,
-            "quantizationType": mmgp_loader.quantization_type(),
+            "quantizationType": mmgp_loader.quantization_type(_quantization_type),
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
             "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if use_pinned_memory else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False) if self.compile_enabled is None else self.compile_enabled),
@@ -149,6 +172,7 @@ class NativeMMGP:
             "coTenantsMap": cotenants,
             "vram_safety_coefficient": memory_management.MEMORY_VRAM_SAFETY_PERCENT / 100.0,
             "verboseLevel": 0,
+            "_manager_components": manager_components,
         }
 
     def release(self):
@@ -159,6 +183,7 @@ class NativeMMGP:
             lora_components = _find_lora_components(pipeline)
         self.manager = None
         self.component_names = ()
+        self.manager_components = None
         self.lora_signature = None
         self.lora_components = None
         try:
@@ -213,6 +238,10 @@ class NativeMMGP:
                     return prompt, "Native pipeline has no MMGP LoRA adapters"
 
                 applied_components = 0
+                pinned_lora = bool(
+                    memory_management.feature_enabled("pinned_memory")
+                    and getattr(opts, "forge_memory_pinned_memory_enabled", False)
+                )
                 for component in lora_components:
                     offload.unload_loras_from_model(component)
                     if paths:
@@ -221,10 +250,7 @@ class NativeMMGP:
                             paths,
                             lora_multi=weights,
                             activate_all_loras=True,
-                            pinnedLora=bool(
-                                memory_management.feature_enabled("pinned_memory")
-                                and getattr(opts, "forge_memory_pinned_memory_enabled", False)
-                            ),
+                            pinnedLora=pinned_lora,
                             verboseLevel=0,
                         )
                         if loaded:
@@ -262,19 +288,21 @@ class NativeMMGP:
 
         settings = self._settings(pipeline)
         profile = settings.pop("profile")
+        manager_components = settings.pop("_manager_components")
         self.release()
+        self.manager_components = manager_components
         try:
             if profile in _PROFILE_NUMBERS:
                 profile_type = getattr(offload, "profile_type", None)
                 profile_value = getattr(profile_type, profile, _PROFILE_NUMBERS[profile])
-                self.manager = offload.profile(pipeline, profile_value, **settings)
+                self.manager = offload.profile(manager_components, profile_value, **settings)
             else:
-                self.manager = offload.all(pipeline, **settings)
+                self.manager = offload.all(manager_components, **settings)
         except Exception:
             self.release()
             raise
 
-        self.component_names = tuple(getattr(pipeline, "components", {}).keys())
+        self.component_names = tuple(manager_components)
         self.lora_components = _find_lora_components(pipeline)
         logger.info("Reference MMGP residency manager active for native pipeline (%s)", ", ".join(self.component_names))
         return True
@@ -319,3 +347,8 @@ def release(pipeline=None):
 
 def release_all():
     release()
+
+
+def active_pipeline():
+    """Return the currently managed native pipeline for generic cache/export code."""
+    return _active._pipeline() if _active is not None else None

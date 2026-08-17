@@ -134,7 +134,7 @@ if memory_management.ck_enabled():
 
 
 def get_attn_precision(attn_precision: torch.dtype, current_dtype: torch.dtype) -> torch.dtype:
-    memory_management.force_upcast_attention_dtype().get(current_dtype, attn_precision)
+    return memory_management.force_upcast_attention_dtype().get(current_dtype, attn_precision)
 
 
 def exists(val) -> bool:
@@ -206,9 +206,11 @@ def _pack_attention_inputs(q, k, v, q_lens=None, k_lens=None):
     key_length = k.shape[1]
     q_lens = _attention_lengths(q_lens, batch, query_length, q.device)
     k_lens = _attention_lengths(k_lens, batch, key_length, k.device)
-    q_packed = torch.cat([q[i, : int(q_lens[i])] for i in range(batch)], dim=0)
-    k_packed = torch.cat([k[i, : int(k_lens[i])] for i in range(batch)], dim=0)
-    v_packed = torch.cat([v[i, : int(k_lens[i])] for i in range(batch)], dim=0)
+    q_positions = torch.arange(query_length, device=q.device).unsqueeze(0)
+    k_positions = torch.arange(key_length, device=k.device).unsqueeze(0)
+    q_packed = q[q_positions < q_lens.unsqueeze(1)]
+    k_packed = k[k_positions < k_lens.unsqueeze(1)]
+    v_packed = v[k_positions < k_lens.unsqueeze(1)]
     cu_q = torch.cat([torch.zeros(1, dtype=torch.int32, device=q.device), q_lens.cumsum(0, dtype=torch.int32)])
     cu_k = torch.cat([torch.zeros(1, dtype=torch.int32, device=k.device), k_lens.cumsum(0, dtype=torch.int32)])
     return q_packed, k_packed, v_packed, cu_q, cu_k, int(q_lens.max()), int(k_lens.max()), q_lens
@@ -217,10 +219,8 @@ def _pack_attention_inputs(q, k, v, q_lens=None, k_lens=None):
 def _unpack_attention_output(output, q_lens, batch, query_length):
     heads, dim_head = output.shape[-2:]
     result = torch.zeros((batch, query_length, heads, dim_head), dtype=output.dtype, device=output.device)
-    offset = 0
-    for index, length in enumerate(q_lens.tolist()):
-        result[index, :length] = output[offset : offset + length]
-        offset += length
+    positions = torch.arange(query_length, device=result.device).unsqueeze(0)
+    result[positions < q_lens.to(device=result.device).unsqueeze(1)] = output
     return result
 
 
@@ -480,7 +480,8 @@ def attention_sage_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_r
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if memory_management.MMGP_RUNTIME_ACTIVE:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -557,7 +558,8 @@ def attention_sage3(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if memory_management.MMGP_RUNTIME_ACTIVE:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -633,7 +635,8 @@ def attention_flash_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if memory_management.MMGP_RUNTIME_ACTIVE:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
     qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
     if qkv is None:
         return attention_flash(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
@@ -712,7 +715,8 @@ def attention_radial(q, k, v, heads, mask=None, attn_precision=None, skip_reshap
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    q, k, v = operations.match_attention_dtypes(q, k, v)
+    if memory_management.MMGP_RUNTIME_ACTIVE:
+        q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
     qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)

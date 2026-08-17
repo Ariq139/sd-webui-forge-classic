@@ -163,7 +163,7 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
         if mmgp_active:
             configure_attention(_pipeline, attention_backend, device, logger)
             if not mmgp_native.attach(_pipeline, compile_enabled=compile_enabled):
-                configure_pipeline(_pipeline, device, offload, attention_backend, False, logger)
+                configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
         else:
             configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
         configure_prompt_cache(_pipeline, prompt_cache, logger)

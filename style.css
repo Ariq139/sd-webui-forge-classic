@@ -1453,6 +1453,16 @@ footer {
     margin: 0 0.5em 0 auto;
 }
 
+.input-accordion-extra-row {
+    align-items: center;
+    gap: 0.5em;
+    min-width: 0;
+}
+
+#txt2img_hr-extra .gradio-dropdown {
+    min-width: 160px;
+}
+
 div.accordions>div.input-accordion {
     min-width: fit-content !important;
 }

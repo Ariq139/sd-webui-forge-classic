@@ -159,7 +159,7 @@ class StreamingStateDict(MutableMapping):
 
 def open_streaming_state_dict(path: str):
     """Open a safetensors file lazily when the optional MMGP path is active."""
-    if not (memory_management.mmgp_enabled() and memory_management.feature_enabled("enabled")):
+    if not memory_management.mmgp_runtime_enabled():
         return None
     if os.path.splitext(str(path))[1].lower() not in {".safetensors", ".sft"}:
         return None
@@ -272,6 +272,14 @@ class _StreamingForgeCheckpoint:
         source.loader = None
         source._values.clear()
 
+    def _integrated_text_adapter_prefixes(self):
+        prefixes = getattr(self.guess, "unet_key_prefix", ()) or ()
+        return tuple(
+            prefix
+            for prefix in prefixes
+            if any(key.startswith(prefix + "llm_adapter.") for key in self.keys)
+        )
+
     def _merge_streaming_additional(self, path):
         source = open_streaming_state_dict(path)
         if source is None:
@@ -372,11 +380,12 @@ class _StreamingForgeCheckpoint:
 
     def _materialize_prefixes(self, prefixes):
         prefixes = tuple(prefixes or ())
+        adapter_prefixes = self._integrated_text_adapter_prefixes()
         result = {}
         for key in self.keys:
             prefix = next((prefix for prefix in prefixes if key.startswith(prefix)), None)
             if prefix is not None:
-                if self.guess.huggingface_repo == "circlestone-labs/Anima" and key.startswith(prefix + "llm_adapter."):
+                if prefix in adapter_prefixes and key.startswith(prefix + "llm_adapter."):
                     continue
                 result[key[len(prefix) :]] = self.get_tensor(key)
         return result
@@ -392,11 +401,9 @@ class _StreamingForgeCheckpoint:
                 text_state[key] = self.get_tensor(key)
 
         self._text_state = self.guess.process_clip_state_dict(text_state) if text_state else {}
-        if self.guess.huggingface_repo == "circlestone-labs/Anima":
-            unet_prefix = tuple(getattr(self.guess, "unet_key_prefix", ()) or ())
+        for prefix in self._integrated_text_adapter_prefixes():
             for key in self.keys:
-                prefix = next((prefix for prefix in unet_prefix if key.startswith(prefix + "llm_adapter.")), None)
-                if prefix is not None:
+                if key.startswith(prefix + "llm_adapter."):
                     self._text_state[key[len(prefix) :]] = self.get_tensor(key)
         return self._text_state
 
@@ -422,7 +429,7 @@ class _StreamingForgeCheckpoint:
                     for key in list(text_state):
                         if key.startswith(prefix):
                             del text_state[key]
-                    if self.guess.huggingface_repo == "circlestone-labs/Anima":
+                    if self._integrated_text_adapter_prefixes():
                         selected.update({key: value for key, value in text_state.items() if key.startswith("llm_adapter.")})
                     return selected
 
@@ -431,7 +438,7 @@ class _StreamingForgeCheckpoint:
 
 def open_forge_checkpoint(path: str, additional_state_dicts=None):
     """Open a classic checkpoint through the low-RAM path when it is safe."""
-    if not (memory_management.mmgp_enabled() and memory_management.feature_enabled("enabled")):
+    if not memory_management.mmgp_runtime_enabled():
         return None
     try:
         return _StreamingForgeCheckpoint(path, additional_state_dicts=additional_state_dicts)
@@ -442,26 +449,23 @@ def open_forge_checkpoint(path: str, additional_state_dicts=None):
         return None
 
 
-def quantization_type():
+def quantization_type(name: str | None = None):
     from optimum import quanto
-    from modules.shared import opts
 
-    name = str(getattr(opts, "forge_memory_quantization_type", "qint8"))
+    if name is None:
+        from modules.shared import opts
+        from modules_forge.mmgp_profiles import get_mmgp_quantization
+
+        _quantize, name = get_mmgp_quantization(opts)
     return getattr(quanto, name, quanto.qint8)
 
 
-_MODULE_COMPONENTS = {
-    "audio_vae",
-    "controlnet",
-    "connectors",
-    "image_encoder",
-    "prompt_enhancer_head",
-    "text_encoder",
-    "text_encoder_2",
-    "transformer",
-    "unconditional_transformer",
-    "vae",
-    "vocoder",
+_NON_MODEL_COMPONENTS = {
+    "feature_extractor",
+    "image_processor",
+    "processor",
+    "safety_checker",
+    "scheduler",
 }
 _WEIGHT_EXTENSIONS = {".bin", ".ckpt", ".pt", ".safetensors", ".sft"}
 
@@ -474,11 +478,44 @@ def _read_json(path: Path):
         return None
 
 
-def _component_names(model_path: str) -> list[str]:
+def _component_file_map(model_path: str) -> dict[str, list[str]]:
     root = Path(model_path)
     model_index = _read_json(root / "model_index.json") or {}
     names = [name for name in model_index if not name.startswith("_")]
-    return [name for name in names if name in _MODULE_COMPONENTS and (root / name).is_dir()]
+    result = {}
+    for name in names:
+        lowered = str(name).lower()
+        component_path = root / name
+        files = _weight_files(component_path) if component_path.is_dir() else []
+        if (
+            lowered in _NON_MODEL_COMPONENTS
+            or lowered.startswith("tokenizer")
+            or lowered.endswith("_tokenizer")
+            or not component_path.is_dir()
+            or not (component_path / "config.json").is_file()
+            or not files
+        ):
+            continue
+        result[name] = files
+    return result
+
+
+def _component_names(model_path: str) -> list[str]:
+    return list(_component_file_map(model_path))
+
+
+def component_names(model_path: str) -> list[str]:
+    """Return native component names for one loader-attempt decision."""
+    if not (memory_management.mmgp_runtime_enabled() and os.path.isdir(model_path)):
+        return []
+    return list(component_files(model_path))
+
+
+def component_files(model_path: str) -> dict[str, list[str]]:
+    """Return the validated component index used by the native loader."""
+    if not (memory_management.mmgp_runtime_enabled() and os.path.isdir(model_path)):
+        return {}
+    return _component_file_map(model_path)
 
 
 def _weight_files(component_path: Path) -> list[str]:
@@ -517,43 +554,63 @@ def _model_class(component_path: Path):
     raise MMGPLoaderUnavailable(f"Could not resolve a model class for {component_path}")
 
 
-def _component_kind(name: str) -> str:
-    name = name.lower()
-    if "text" in name or "encoder" in name:
-        return "text_encoder"
-    if "vae" in name or "vocoder" in name or "decoder" in name:
-        return "vae"
-    if "control" in name:
+def component_kind(name: str, model=None) -> str:
+    """Classify a module without treating every unknown component as a denoiser."""
+    identifiers = [str(name).lower()]
+    if model is not None:
+        model_class = model if isinstance(model, type) else model.__class__
+        identifiers.append(model_class.__name__.lower())
+    identifier = " ".join(identifiers)
+
+    if any(token in identifier for token in ("controlnet", "control_net")):
         return "controlnet"
-    return "unet"
+    if any(token in identifier for token in ("image_encoder", "vision", "audio_encoder", "feature_extractor")):
+        return "auxiliary"
+    if any(token in identifier for token in ("vae", "autoencoder", "vocoder", "decoder")):
+        return "vae"
+    if any(token in identifier for token in ("text_encoder", "tokenizer", "clip", "t5", "llama", "gemma", "qwen")):
+        return "text_encoder"
+    if any(token in identifier for token in ("transformer", "unet", "denoiser", "diffusion_model", "diffusion", "prior")):
+        return "unet"
+    return "auxiliary"
 
 
 def has_llm_adapter(model) -> bool:
     """Return whether a text encoder embeds an LLM adapter module."""
-    return bool(model and any("llmadapter" in module.__class__.__name__.lower() for module in model.modules()))
+    return bool(model and not isinstance(model, type) and any("llmadapter" in module.__class__.__name__.lower() for module in model.modules()))
+
+
+_LARGE_TEXT_ENCODER_MARKERS = ("t5", "umt5", "llama", "llm", "gemma", "qwen", "mistral", "phi")
+
+
+def is_large_text_encoder(model, name: str = "") -> bool:
+    """Match MMGP's large language-encoder quantization scope, not CLIP."""
+    if component_kind(name, model) != "text_encoder" or has_llm_adapter(model):
+        return False
+
+    model_class = model if isinstance(model, type) else model.__class__
+    identifiers = {
+        str(name).lower(),
+        model_class.__name__.lower(),
+        getattr(model_class, "__module__", "").lower(),
+    }
+    return any(marker in identifier for marker in _LARGE_TEXT_ENCODER_MARKERS for identifier in identifiers)
 
 
 def _can_quantize_forge_component(model, name: str, quantize: bool) -> bool:
-    if not quantize or name == "transformer":
-        return False
-
-    if _component_kind(name) != "text_encoder":
-        return False
-
-    # Forge-managed text encoders with an embedded adapter use a mixed-dtype
-    # attention path that MMGP's Quanto router cannot safely quantize.
-    return not has_llm_adapter(model)
+    return bool(quantize and is_large_text_encoder(model, name))
 
 
-def _component_options(name: str, dtype: torch.dtype) -> dict:
+def _component_options(name: str, dtype: torch.dtype, model=None) -> dict:
     from modules.shared import opts
+    from modules_forge.mmgp_profiles import get_mmgp_quantization
 
-    quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
-    kind = _component_kind(name)
+    quantize, _quantization_type = get_mmgp_quantization(opts)
+    kind = component_kind(name, model)
     pinned = bool(memory_management.feature_enabled("pinned_memory") and kind in memory_management.MEMORY_PINNED_COMPONENTS)
     return {
-        "do_quantize": quantize and (name == "transformer" or kind == "text_encoder"),
-        "quantizationType": quantization_type(),
+        "do_quantize": quantize and (kind == "unet" or is_large_text_encoder(model, name)),
+        "quantizationType": quantization_type(_quantization_type),
         "pinToMemory": pinned,
         "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
         "default_dtype": dtype,
@@ -561,12 +618,12 @@ def _component_options(name: str, dtype: torch.dtype) -> dict:
     }
 
 
-def load_component(model_path: str, name: str, dtype: torch.dtype):
+def load_component(model_path: str, name: str, dtype: torch.dtype, files: list[str] | None = None):
     component_path = Path(model_path) / name
     if not component_path.is_dir():
         raise MMGPLoaderUnavailable(f"Missing component directory: {component_path}")
 
-    files = _weight_files(component_path)
+    files = _weight_files(component_path) if files is None else files
     if not files:
         raise MMGPLoaderUnavailable(f"No supported weight files found in {component_path}")
 
@@ -587,7 +644,7 @@ def load_component(model_path: str, name: str, dtype: torch.dtype):
             load_files,
             modelClass=model_class,
             forcedConfigPath=str(config_path),
-            **_component_options(name, dtype),
+            **_component_options(name, dtype, model_class),
         )
     except Exception:
         if cached is None:
@@ -598,41 +655,41 @@ def load_component(model_path: str, name: str, dtype: torch.dtype):
             files,
             modelClass=model_class,
             forcedConfigPath=str(config_path),
-            **_component_options(name, dtype),
+            **_component_options(name, dtype, model_class),
         )
 
 
-def load_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype):
+def load_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, component_names: list[str] | dict[str, list[str]] | None = None):
     """Load a native Diffusers pipeline through MMGP component loading.
 
     Every component must have a resolvable config and supported weight files.
     A caller should catch ``MMGPLoaderUnavailable`` and use its normal loader.
     """
-    names = _component_names(model_path)
+    if isinstance(component_names, dict):
+        file_map = component_names
+        names = list(component_names)
+    else:
+        file_map = _component_file_map(model_path) if component_names is None else {}
+        names = list(file_map) if component_names is None else component_names
     if not names:
         raise MMGPLoaderUnavailable(f"No supported Diffusers components found in {model_path}")
 
     loaded = {}
+    component_files = {
+        name: file_map.get(name) or _weight_files(Path(model_path) / name)
+        for name in names
+        if not (name in pipeline_kwargs and isinstance(pipeline_kwargs[name], torch.nn.Module))
+    }
     try:
-        for name in names:
-            if name in pipeline_kwargs and isinstance(pipeline_kwargs[name], torch.nn.Module):
-                continue
-            loaded[name] = load_component(model_path, name, dtype)
+        for name, files in component_files.items():
+            loaded[name] = load_component(model_path, name, dtype, files=files)
 
         kwargs = dict(pipeline_kwargs)
         kwargs.update(loaded)
         pipeline = pipeline_class.from_pretrained(model_path, **kwargs)
         from backend import mmgp_cache
 
-        local_component_files = {}
-        model_root = Path(model_path)
-        if model_root.is_dir():
-            local_component_files = {
-                name: _weight_files(model_root / name)
-                for name in names
-                if not (name in pipeline_kwargs and isinstance(pipeline_kwargs[name], torch.nn.Module))
-            }
-        mmgp_cache.cache_pipeline_components(pipeline, model_path, local_component_files, dtype)
+        mmgp_cache.cache_pipeline_components(pipeline, model_path, component_files, dtype)
         return pipeline
     except Exception:
         for module in loaded.values():
@@ -641,8 +698,9 @@ def load_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype:
         raise
 
 
-def can_attempt(model_path: str) -> bool:
-    return bool(memory_management.mmgp_enabled() and memory_management.feature_enabled("enabled") and os.path.isdir(model_path) and _component_names(model_path))
+def can_attempt(model_path: str, names: list[str] | None = None) -> bool:
+    names = component_names(model_path) if names is None else names
+    return bool(memory_management.mmgp_runtime_enabled() and os.path.isdir(model_path) and names)
 
 
 def load_forge_component(model, state_dict: dict, name: str, ignore_start: str | None = None, ignore_errors=()) -> bool:
@@ -651,25 +709,32 @@ def load_forge_component(model, state_dict: dict, name: str, ignore_start: str |
     Forge still constructs the architecture and owns all format-specific
     conversion. MMGP only receives the already-normalized state dict here.
     """
-    if not (memory_management.mmgp_enabled() and memory_management.feature_enabled("enabled")):
+    if not memory_management.mmgp_runtime_enabled():
         return False
     if not isinstance(state_dict, dict) or not state_dict:
         return False
-    tensor_values = [value for value in state_dict.values() if isinstance(value, torch.Tensor)]
-    if not tensor_values or any(value.dtype not in (torch.float16, torch.bfloat16, torch.float32) for value in tensor_values):
+    tensor_count = 0
+    for value in state_dict.values():
+        if not isinstance(value, torch.Tensor):
+            continue
+        tensor_count += 1
+        if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+    if tensor_count == 0:
         return False
 
     try:
         from mmgp import offload
 
         from modules.shared import opts
+        from modules_forge.mmgp_profiles import get_mmgp_quantization
 
         dtype = getattr(model, "storage_dtype", None)
         if not isinstance(dtype, torch.dtype):
             dtype = next((parameter.dtype for parameter in model.parameters() if parameter.device.type != "meta"), torch.bfloat16)
         dtype = memory_management.mmgp_compute_dtype(model, fallback=dtype)
-        kind = _component_kind(name)
-        quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
+        kind = component_kind(name, model)
+        quantize, _quantization_type = get_mmgp_quantization(opts)
         pinned = bool(memory_management.feature_enabled("pinned_memory") and kind in memory_management.MEMORY_PINNED_COMPONENTS)
         ignored = set(ignore_errors or ())
         filtered_state_dict = {
@@ -693,12 +758,12 @@ def load_forge_component(model, state_dict: dict, name: str, ignore_start: str |
         if missing:
             logger.debug("MMGP state-dict missing %s keys for %s; using Forge loader", len(missing), name)
             return False
-        do_quantize = quantize and (name == "transformer" or _can_quantize_forge_component(model, name, quantize))
+        do_quantize = quantize and (kind == "unet" or _can_quantize_forge_component(model, name, quantize))
         offload.load_model_data(
             model,
             filtered_state_dict,
             do_quantize=do_quantize,
-            quantizationType=quantization_type(),
+            quantizationType=quantization_type(_quantization_type),
             pinToMemory=pinned,
             partialPinning=bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
             default_dtype=dtype,

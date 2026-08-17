@@ -14,7 +14,7 @@ def _quantize_fp8_vae_weights(model: torch.nn.Module, storage_dtype: torch.dtype
     if storage_dtype not in memory_management.FLOAT8_TYPES:
         return 0
 
-    quantized_layers = []
+    quantized_count = 0
     fp8_max = torch.finfo(storage_dtype).max
     supported_layers = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear)
 
@@ -31,18 +31,15 @@ def _quantize_fp8_vae_weights(model: torch.nn.Module, storage_dtype: torch.dtype
             scale = weight_fp32.abs().amax(dim=reduce_dims, keepdim=True)
             scale = torch.where(torch.isfinite(scale) & (scale > 0), scale / fp8_max, torch.ones_like(scale))
             quantized = torch.clamp(weight_fp32 / scale, min=-fp8_max, max=fp8_max).to(storage_dtype)
-
-        quantized_layers.append((layer, quantized, scale))
-
-    for layer, quantized, scale in quantized_layers:
-        layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
+            layer.weight = torch.nn.Parameter(quantized, requires_grad=False)
         if "weight_scale" in layer._buffers:
             layer.weight_scale = scale
         else:
             layer.register_buffer("weight_scale", scale, persistent=True)
         layer.parameters_manual_cast = True
+        quantized_count += 1
 
-    return len(quantized_layers)
+    return quantized_count
 
 
 @torch.inference_mode()

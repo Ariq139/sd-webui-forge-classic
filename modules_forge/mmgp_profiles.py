@@ -7,6 +7,7 @@ MEMORY_SETTING_KEYS = (
     "forge_memory_vae_attention_backend",
     "forge_memory_alternate_quantization",
     "forge_memory_quantization_type",
+    "forge_memory_quantization",
     "forge_memory_compile_enabled",
     "forge_memory_partial_pinning_enabled",
     "forge_memory_budgets_enabled",
@@ -26,6 +27,17 @@ MEMORY_SETTING_KEYS = (
     "forge_memory_keep_text_encoder_loaded",
     "forge_memory_keep_vae_loaded",
     "forge_memory_keep_controlnet_loaded",
+    "forge_memory_residency_components",
+)
+
+MMGP_QUANTIZATION_MODES = ("disabled", "qint8", "qint4", "qfloat8")
+MMGP_COMPONENT_CHOICES = ("unet", "text_encoder", "vae", "controlnet")
+MMGP_LOW_RAM_PROFILES = {"LowRAM_HighVRAM", "LowRAM_LowVRAM", "VerylowRAM_LowVRAM"}
+_LEGACY_RESIDENCY_OPTIONS = (
+    ("unet", "forge_memory_keep_unet_loaded"),
+    ("text_encoder", "forge_memory_keep_text_encoder_loaded"),
+    ("vae", "forge_memory_keep_vae_loaded"),
+    ("controlnet", "forge_memory_keep_controlnet_loaded"),
 )
 
 MMGP_ATTENTION_BACKEND_CHOICES = (
@@ -213,4 +225,51 @@ def get_memory_profile(name):
     """Return a copy so UI edits cannot mutate the shared preset."""
 
     values = MEMORY_PROFILES.get(name)
-    return dict(values) if values is not None else None
+    if values is None:
+        return None
+
+    values = dict(values)
+    values["forge_memory_quantization"] = (
+        values["forge_memory_quantization_type"]
+        if values.get("forge_memory_alternate_quantization", False)
+        else "disabled"
+    )
+    values["forge_memory_residency_components"] = [
+        component for component, option in _LEGACY_RESIDENCY_OPTIONS if values.get(option, False)
+    ]
+    return values
+
+
+def get_mmgp_quantization(options):
+    """Return the merged quantization toggle and type, with legacy fallback."""
+
+    data = getattr(options, "data", {}) or {}
+    mode = data.get("forge_memory_quantization")
+    if mode in MMGP_QUANTIZATION_MODES:
+        return mode != "disabled", ("qint8" if mode == "disabled" else mode)
+
+    return (
+        bool(getattr(options, "forge_memory_alternate_quantization", False)),
+        str(getattr(options, "forge_memory_quantization_type", "qint8")),
+    )
+
+
+def extra_text_encoder_quantization_enabled(options) -> bool:
+    """Match MMGP's extra text-encoder quantization scope for named profiles."""
+    quantize, _quantization_type = get_mmgp_quantization(options)
+    if not quantize:
+        return False
+
+    profile = str(getattr(options, "forge_memory_profile", "Custom") or "Custom")
+    return profile == "Custom" or profile in MMGP_LOW_RAM_PROFILES
+
+
+def get_mmgp_residency_components(options):
+    """Return the merged residency selection, with legacy fallback."""
+
+    data = getattr(options, "data", {}) or {}
+    if "forge_memory_residency_components" in data:
+        selected = set(data.get("forge_memory_residency_components") or ())
+        return [component for component in MMGP_COMPONENT_CHOICES if component in selected]
+
+    return [component for component, option in _LEGACY_RESIDENCY_OPTIONS if getattr(options, option, False)]

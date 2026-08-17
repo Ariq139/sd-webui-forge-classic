@@ -13,9 +13,11 @@ OFFLOAD_CHOICES = ("none", "model", "group", "sequential")
 def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
     from backend import mmgp_loader
 
-    if mmgp_loader.can_attempt(model_path):
+    component_files = mmgp_loader.component_files(model_path)
+    component_names = list(component_files)
+    if mmgp_loader.can_attempt(model_path, component_names):
         try:
-            pipeline = mmgp_loader.load_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype)
+            pipeline = mmgp_loader.load_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype, component_names=component_files)
             logger.info("%s native pipeline loaded through MMGP's low-RAM component loader", label)
             return pipeline
         except mmgp_loader.MMGPLoaderUnavailable:

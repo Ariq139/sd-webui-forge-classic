@@ -47,11 +47,22 @@ class AlternateMMGP:
         self.manager = None
         self.modules = {}
         self.patchers = {}
+        self.managed_model_ids = frozenset()
         self.signatures = None
         self.failed_signature = None
 
     def _engine(self):
         return self.engine_ref()
+
+    @staticmethod
+    def _component_kind(name, model, patcher=None):
+        component = getattr(patcher, "memory_component", "auto") if patcher is not None else "auto"
+        if component and component != "auto":
+            return component
+        patcher_name = patcher.__class__.__name__ if patcher is not None else ""
+        if "control" in patcher_name.lower():
+            return "controlnet"
+        return mmgp_loader.component_kind(name, model)
 
     def _get_modules_and_patchers(self):
         engine = self._engine()
@@ -100,8 +111,7 @@ class AlternateMMGP:
     def handles(self, models):
         if not models:
             return False
-        managed_ids = {id(patcher.model) for patcher in self.patchers.values()}
-        return all(id(getattr(model, "model", None)) in managed_ids for model in models)
+        return all(id(getattr(model, "model", None)) in self.managed_model_ids for model in models)
 
     def _release(self):
         manager = self.manager
@@ -109,6 +119,7 @@ class AlternateMMGP:
         self.manager = None
         self.modules = {}
         self.patchers = {}
+        self.managed_model_ids = frozenset()
         self.signatures = None
 
         try:
@@ -169,46 +180,47 @@ class AlternateMMGP:
             patcher.model_patches_to(cpu)
             patcher.patch_model(device_to=cpu, force_patch_weights=True)
 
-    def _settings(self):
+    def _settings(self, current_modules=None, current_patchers=None):
         from modules.shared import opts
+        from modules_forge.mmgp_profiles import extra_text_encoder_quantization_enabled, get_mmgp_quantization
 
-        current_modules, _ = self._get_modules_and_patchers()
+        if current_modules is None:
+            current_modules, current_patchers = self._get_modules_and_patchers()
+        patchers = self.patchers if current_patchers is None else current_patchers
+        component_kinds = {
+            name: self._component_kind(name, model, patchers.get(name))
+            for name, model in current_modules.items()
+        }
         use_budgets = memory_management.feature_enabled("budgets")
         use_pinned_memory = memory_management.feature_enabled("pinned_memory")
         use_residency_hints = memory_management.feature_enabled("residency_hints")
         budgets = {}
         if use_budgets:
-            for component, module_id in (("unet", "transformer"), ("text_encoder", "text_encoder"), ("vae", "vae")):
+            for name, component in component_kinds.items():
                 value = memory_management.MEMORY_BUDGETS_BYTES.get(component, 0)
                 if value > 0:
-                    budgets[module_id] = value / (1024 * 1024)
-            controlnet_budget = memory_management.MEMORY_BUDGETS_BYTES.get("controlnet", 0)
-            if controlnet_budget > 0:
-                budgets.update({key: controlnet_budget / (1024 * 1024) for key in current_modules if key.startswith("extra_")})
+                    budgets[name] = value / (1024 * 1024)
 
         pinned = []
         if use_pinned_memory:
-            for component, module_id in (("unet", "transformer"), ("text_encoder", "text_encoder"), ("vae", "vae")):
-                if component in memory_management.MEMORY_PINNED_COMPONENTS:
-                    pinned.append(module_id)
-            if "controlnet" in memory_management.MEMORY_PINNED_COMPONENTS:
-                pinned.extend(key for key in current_modules if key.startswith("extra_"))
+            pinned.extend(
+                name for name, component in component_kinds.items()
+                if component in memory_management.MEMORY_PINNED_COMPONENTS
+            )
 
         profile = getattr(opts, "forge_memory_profile", "Custom")
-        quantize = bool(getattr(opts, "forge_memory_alternate_quantization", False))
-        engine = self._engine()
-        forge_unet = getattr(getattr(engine, "forge_objects", None), "unet", None)
-        convert_dtype = memory_management.mmgp_compute_dtype(getattr(forge_unet, "model", None))
+        quantize, _quantization_type = get_mmgp_quantization(opts)
+        convert_dtype = memory_management.mmgp_compute_dtype(current_modules.get("transformer"))
         extra_models_to_quantize = []
-        if quantize and profile in {"LowRAM_HighVRAM", "LowRAM_LowVRAM", "VerylowRAM_LowVRAM"}:
-            text_encoder = current_modules.get("text_encoder")
-            module_names = {getattr(module, "__module__", "").lower() for module in text_encoder.modules()} if text_encoder else set()
-            if not mmgp_loader.has_llm_adapter(text_encoder) and any(any(marker in module_name for marker in ("t5", "llama", "llm")) for module_name in module_names):
-                extra_models_to_quantize.append("text_encoder")
+        if extra_text_encoder_quantization_enabled(opts):
+            for name, text_encoder in current_modules.items():
+                if name != "transformer" and mmgp_loader.is_large_text_encoder(text_encoder, name):
+                    extra_models_to_quantize.append(name)
         preferred = set(memory_management.MEMORY_RESIDENCY_COMPONENTS) if use_residency_hints else set()
-        component_ids = {"unet": "transformer", "text_encoder": "text_encoder", "vae": "vae"}
-        preferred_ids = {component_ids[name] for name in preferred if name in component_ids}
-        preferred_ids.update(key for key in current_modules if key.startswith("extra_") and "controlnet" in preferred)
+        preferred_ids = {
+            name for name, component in component_kinds.items()
+            if component in preferred
+        }
         cotenants = None
         if preferred_ids:
             cotenants = {
@@ -221,10 +233,10 @@ class AlternateMMGP:
             "pinnedPEFTLora": bool(pinned and getattr(opts, "forge_memory_pinned_memory_enabled", False)),
             "budgets": budgets or None,
             "workingVRAM": memory_management.MEMORY_WORKING_VRAM_BYTES / (1024 * 1024) or None,
-            "asyncTransfers": memory_management.async_transfers_enabled(),
+            "asyncTransfers": memory_management.mmgp_async_transfers_enabled(),
             "quantizeTransformer": quantize,
             "extraModelsToQuantize": extra_models_to_quantize,
-            "quantizationType": mmgp_loader.quantization_type(),
+            "quantizationType": mmgp_loader.quantization_type(_quantization_type),
             "partialPinning": bool(getattr(opts, "forge_memory_partial_pinning_enabled", False)),
             "perc_reserved_mem_max": memory_management.MEMORY_PINNED_MEMORY_PERCENT / 100.0 if use_pinned_memory else 0,
             "compile": bool(getattr(opts, "forge_memory_compile_enabled", False)),
@@ -234,7 +246,7 @@ class AlternateMMGP:
             "verboseLevel": 0,
         }
 
-    def _build(self):
+    def _build(self, modules=None, patchers=None):
         global _warned_unavailable
 
         try:
@@ -245,16 +257,18 @@ class AlternateMMGP:
                 _warned_unavailable = True
             return False
 
-        modules, patchers = self._get_modules_and_patchers()
+        if modules is None or patchers is None:
+            modules, patchers = self._get_modules_and_patchers()
         if "transformer" not in modules:
             return False
 
         self._release()
         self.modules = modules
         self.patchers = patchers
+        self.managed_model_ids = frozenset(id(patcher.model) for patcher in patchers.values())
         try:
             self._prepare_patchers(patchers)
-            settings = self._settings()
+            settings = self._settings(modules, patchers)
             profile = settings.pop("profile")
             if profile in _PROFILE_NUMBERS:
                 profile_type = getattr(offload, "profile_type", None)
@@ -276,16 +290,16 @@ class AlternateMMGP:
             return False
 
         current_modules, current_patchers = self._get_modules_and_patchers()
-        current_patch_ids = {id(patcher.model) for patcher in current_patchers.values()}
+        signature = self._signature(current_patchers)
+        current_patch_ids = {model_id for _key, model_id, _uuid in signature}
         if not all(id(getattr(model, "model", None)) in current_patch_ids for model in models):
             self.suspend()
             return False
-        signature = self._signature(current_patchers)
         if self.manager is None and signature == self.failed_signature:
             return False
         if self.manager is None or signature != self.signatures or set(current_modules) != set(self.modules):
             try:
-                built = self._build()
+                built = self._build(current_modules, current_patchers)
             except Exception as error:
                 self.failed_signature = signature
                 logger.warning(
@@ -307,7 +321,7 @@ class AlternateMMGP:
 def get_manager_for_models(models):
     global _active
 
-    if not memory_management.mmgp_enabled() or not memory_management.feature_enabled("enabled"):
+    if not memory_management.mmgp_runtime_enabled():
         if _active is not None:
             _active.suspend()
             _active = None

@@ -22,8 +22,14 @@ MMGP_UI_SETTING_KEYS = {
     "forge_memory_cache_directory",
     *MEMORY_SETTING_KEYS,
 }
+MMGP_MODE_SETTING_KEYS = {"forge_memory_profile", *MEMORY_SETTING_KEYS}
 MMGP_DEPENDENT_SETTING_KEYS = tuple(key for key in MMGP_UI_SETTING_KEYS if key != "forge_memory_management_enabled")
 MMGP_BACKEND_SETTING_KEYS = {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"}
+MMGP_ADVANCED_SETTING_KEYS = {
+    "forge_memory_persistent_cache_enabled",
+    "forge_memory_cache_directory",
+    *(set(MEMORY_SETTING_KEYS) - {"forge_memory_management_enabled"}),
+}
 
 
 def get_value_for_setting(key):
@@ -116,6 +122,8 @@ class UiSettings:
 
     def run_settings(self, *args):
         changed = []
+        memory_changed = False
+        memory_mode_changed = False
 
         for key, value, comp in zip(opts.data_labels.keys(), args, self.components):
             assert comp == self.dummy_component or opts.same_type(value, opts.data_labels[key].default), f"Bad value for setting {key}: {value}; expecting {type(opts.data_labels[key].default).__name__}"
@@ -128,8 +136,19 @@ class UiSettings:
             if key in ("sd_model_checkpoint", "sd_vae"):
                 continue
 
-            if opts.set(key, value):
+            if opts.set(key, value, run_callbacks=key not in MMGP_MODE_SETTING_KEYS):
                 changed.append(key)
+                if key in MMGP_MODE_SETTING_KEYS:
+                    memory_changed = True
+                    memory_mode_changed |= key in {"forge_memory_management_enabled", "forge_memory_profile"}
+
+        if memory_changed:
+            from modules.initialize_util import apply_memory_mode, configure_memory_features
+
+            if memory_mode_changed:
+                apply_memory_mode()
+            else:
+                configure_memory_features()
 
         try:
             opts.save(shared.config_filename)
@@ -186,6 +205,7 @@ class UiSettings:
             previous_section = None
             current_tab = None
             current_row = None
+            mmgp_advanced = None
             with gr.Tabs(elem_id="settings"):
                 for i, (k, item) in enumerate(opts.data_labels.items()):
                     section_must_be_skipped = item.section[0] is None
@@ -193,6 +213,9 @@ class UiSettings:
                     if previous_section != item.section and not section_must_be_skipped:
                         elem_id, text = item.section
 
+                        if mmgp_advanced is not None:
+                            mmgp_advanced.__exit__()
+                            mmgp_advanced = None
                         if current_tab is not None:
                             current_row.__exit__()
                             current_tab.__exit__()
@@ -206,6 +229,14 @@ class UiSettings:
 
                         previous_section = item.section
 
+                    is_mmgp_advanced = item.section[0] == "memory-management" and k in MMGP_ADVANCED_SETTING_KEYS
+                    if mmgp_advanced is not None and not is_mmgp_advanced:
+                        mmgp_advanced.__exit__()
+                        mmgp_advanced = None
+                    if is_mmgp_advanced and mmgp_advanced is None:
+                        mmgp_advanced = gr.Accordion("Advanced MMGP controls", open=False, elem_id="settings_mmgp_advanced")
+                        mmgp_advanced.__enter__()
+
                     if k in self.quicksettings_names and not shared.cmd_opts.freeze_settings:
                         self.quicksettings_list.append((i, k, item))
                         self.components.append(dummy_component)
@@ -217,6 +248,8 @@ class UiSettings:
                         self.components.append(component)
 
                 if current_tab is not None:
+                    if mmgp_advanced is not None:
+                        mmgp_advanced.__exit__()
                     current_row.__exit__()
                     current_tab.__exit__()
 

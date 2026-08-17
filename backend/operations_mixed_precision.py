@@ -175,10 +175,13 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
             scales = {
                 "scale": scale,
                 "s_channel": pop_scale("weight_s_channel"),
+                "correction": pop_scale("weight_correction"),
                 "codebook": pop_scale("weight_codebook"),
                 "group_size": int(layer_conf.get("group_size", params_conf.get("group_size", 16))),
                 "convrot_groupsize": int(layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))),
             }
+            if scales["s_channel"] is None:
+                raise ValueError(f"Missing W4A8 channel scale for layer {layer_name}")
         else:
             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
 
@@ -231,6 +234,20 @@ def _quantized_weight_state_dict(module: torch.nn.Module, sd: dict[str, torch.Te
             linear_dtype = getattr(params, "linear_dtype", "int4")
             if linear_dtype != "int4":
                 quant_conf["linear_dtype"] = linear_dtype
+        elif module.quant_format == "asym_w4a8_int8":
+            params = getattr(module.weight, "_params", None)
+            if params is not None:
+                quant_conf["group_size"] = getattr(params, "group_size", 16)
+                quant_conf["convrot_groupsize"] = getattr(params, "convrot_groupsize", 256)
+            for name, attribute in (
+                ("weight_s_rel", "scale"),
+                ("weight_s_channel", "s_channel"),
+                ("weight_correction", "correction"),
+                ("weight_codebook", "codebook"),
+            ):
+                value = getattr(params, attribute, None)
+                if value is not None:
+                    sd[f"{prefix}{name}"] = value
         if extra_quant_conf:
             quant_conf.update(extra_quant_conf)
         sd[f"{prefix}comfy_quant"] = torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8)
@@ -338,12 +355,18 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 weight_key = f"{prefix}weight"
                 layer_conf = state_dict.pop(f"{prefix}comfy_quant", None)
                 if layer_conf is not None:
-                    layer_conf = json.loads(layer_conf.numpy().tobytes())
+                    if isinstance(layer_conf, torch.Tensor):
+                        layer_conf = json.loads(layer_conf.detach().cpu().numpy().tobytes())
+                    elif isinstance(layer_conf, (bytes, bytearray)):
+                        layer_conf = json.loads(layer_conf)
+                    if not isinstance(layer_conf, dict):
+                        layer_conf = {}
 
-                quant_format = layer_conf.get("format") if layer_conf is not None else None
+                quant_format = _normalize_quant_format(layer_conf.get("format")) if layer_conf is not None else None
                 manually_loaded_keys = []
 
-                if quant_format in ("float8_e4m3fn", "float8_e5m2", "int8_tensorwise") and weight_key in state_dict:
+                embedding_quant_formats = {"float8_e4m3fn", "float8_e5m2", "int8_tensorwise", "nvfp4", "asym_w4a8_int8"}
+                if quant_format in embedding_quant_formats and weight_key in state_dict:
                     self.quant_format = quant_format
                     qconfig = QUANT_ALGOS[quant_format]
                     self.layout_type = qconfig["comfy_tensor_layout"]
@@ -351,19 +374,59 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     weight = state_dict.pop(weight_key)
                     manually_loaded_keys.append(weight_key)
 
-                    scale_key = f"{prefix}weight_scale"
-                    scale = state_dict.pop(scale_key, None)
-                    if scale is not None:
-                        scale = scale.float()
-                        manually_loaded_keys.append(scale_key)
+                    scales = {}
+                    for scale_name in ("weight_scale", "weight_scale_2"):
+                        scale_key = f"{prefix}{scale_name}"
+                        scale = state_dict.pop(scale_key, None)
+                        if scale is not None:
+                            if quant_format == "nvfp4" and scale_name == "weight_scale":
+                                scale = scale.view(torch.float8_e4m3fn)
+                            else:
+                                scale = scale.float()
+                            scales[scale_name] = scale
+                            manually_loaded_keys.append(scale_key)
 
                     extra = {}
+                    if quant_format == "nvfp4":
+                        scales = {"scale": scales.get("weight_scale_2"), "block_scale": scales.get("weight_scale")}
+                    elif quant_format == "asym_w4a8_int8":
+                        relative_key = f"{prefix}weight_s_rel"
+                        relative_scale = state_dict.pop(relative_key, None)
+                        if relative_scale is not None:
+                            relative_scale = relative_scale.view(torch.float8_e4m3fn) if relative_scale.dtype == torch.uint8 else relative_scale
+                            manually_loaded_keys.append(relative_key)
+                        scales = {"scale": relative_scale}
+                    else:
+                        scales = {"scale": scales.get("weight_scale")}
+                    if quant_format == "asym_w4a8_int8":
+                        for param_name, scale_name in (
+                            ("s_channel", "weight_s_channel"),
+                            ("correction", "weight_correction"),
+                            ("codebook", "weight_codebook"),
+                        ):
+                            param_key = f"{prefix}{scale_name}"
+                            value = state_dict.pop(param_key, None)
+                            scales[param_name] = value
+                            if value is not None:
+                                manually_loaded_keys.append(param_key)
+                        params_conf = layer_conf.get("params", {})
+                        if not isinstance(params_conf, dict):
+                            params_conf = {}
+                        extra["group_size"] = int(layer_conf.get("group_size", params_conf.get("group_size", 16)))
+                        extra["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
+                        if scales["scale"] is None or scales.get("s_channel") is None:
+                            raise ValueError("Missing W4A8 embedding scales")
+                    elif quant_format == "nvfp4" and (scales["scale"] is None or scales["block_scale"] is None):
+                        raise ValueError("Missing NVFP4 embedding scales")
                     if quant_format == "int8_tensorwise" and layer_conf.get("convrot", False):
                         extra["convrot"] = True
                         extra["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", 256))
 
+                    parameter_values = {key: value for key, value in scales.items() if value is not None}
+                    if quant_format in {"float8_e4m3fn", "float8_e5m2", "int8_tensorwise"} and "scale" not in parameter_values:
+                        parameter_values["scale"] = torch.ones((), dtype=torch.float32)
                     params = layout_cls.Params(
-                        scale=scale if scale is not None else torch.ones((), dtype=torch.float32),
+                        **parameter_values,
                         orig_dtype=MixedPrecisionOps._compute_dtype,
                         orig_shape=(self.num_embeddings, self.embedding_dim),
                         **extra,
@@ -398,6 +461,10 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     with main_stream_worker(qdata, None, signal):
                         if self.quant_format == "int8_tensorwise":
                             return get_layout_class(self.layout_type).dequantize_embedding(qdata, params, input)
+
+                        if self.quant_format in {"nvfp4", "asym_w4a8_int8"}:
+                            qdata = get_layout_class(self.layout_type).dequantize(qdata, params)
+                            scale = None
 
                         x = torch.nn.functional.embedding(input, qdata, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse)
 
