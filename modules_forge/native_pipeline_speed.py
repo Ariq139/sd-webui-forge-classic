@@ -1,9 +1,123 @@
 import logging
 import threading
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from functools import wraps
+from pathlib import Path
 
 import torch
+
+
+class _LazySafetensorStateDict(MutableMapping):
+    def __init__(self, files):
+        from safetensors import safe_open
+
+        self._readers = [safe_open(str(path), framework="pt", device="cpu") for path in files]
+        self._keys = []
+        self._key_set = set()
+        self._sources = {}
+        self._values = {}
+        for reader in self._readers:
+            for key in reader.keys():
+                if key not in self._key_set:
+                    self._keys.append(key)
+                    self._key_set.add(key)
+                self._sources.setdefault(key, reader)
+
+    def __getitem__(self, key):
+        if key not in self._sources and key not in self._values:
+            raise KeyError(key)
+        if key not in self._values:
+            self._values[key] = self._sources[key].get_tensor(key)
+        return self._values[key]
+
+    def __setitem__(self, key, value):
+        if key not in self._key_set:
+            self._keys.append(key)
+            self._key_set.add(key)
+        self._values[key] = value
+        self._sources.pop(key, None)
+
+    def __delitem__(self, key):
+        if key not in self._sources and key not in self._values:
+            raise KeyError(key)
+        self._sources.pop(key, None)
+        self._values.pop(key, None)
+        self._keys.remove(key)
+        self._key_set.remove(key)
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def close(self):
+        for reader in self._readers:
+            close = getattr(reader, "close", None)
+            if close is not None:
+                close()
+            else:
+                reader.__exit__(None, None, None)
+        self._readers.clear()
+        self._keys.clear()
+        self._key_set.clear()
+        self._sources.clear()
+        self._values.clear()
+
+
+def _load_native_quantized_component(model_path: str, component_name: str, dtype: torch.dtype, logger):
+    """Build a Diffusers component with Forge's native quantized operations."""
+    from backend import mmgp_loader
+    from backend.state_dict import convert_quantization, detect_quantization, load_state_dict
+
+    component_path = Path(model_path) / component_name
+    files = mmgp_loader._weight_files(component_path)
+    if not files or not all(str(path).lower().endswith((".safetensors", ".sft")) for path in files):
+        return None
+
+    lazy_state_dict = _LazySafetensorStateDict(files)
+    special_keys = set(lazy_state_dict)
+    if not any(key.endswith((".comfy_quant", ".weight_scale_2", "scaled_fp8")) for key in special_keys):
+        lazy_state_dict.close()
+        return None
+
+    try:
+        state_dict, _ = convert_quantization(lazy_state_dict, {})
+        quant_config = detect_quantization(state_dict, is_unet=component_name in {"transformer", "unet"})
+        if quant_config is None:
+            return None
+
+        config = mmgp_loader._read_json(component_path / "config.json")
+        try:
+            model_class = mmgp_loader._model_class(component_path)
+        except mmgp_loader.MMGPLoaderUnavailable:
+            model_class = None
+        if not config or model_class is None:
+            return None
+
+        from backend.operations import using_forge_operations
+
+        try:
+            from transformers.initialization import no_init_weights
+        except ImportError:
+            from transformers.modeling_utils import no_init_weights
+
+        with no_init_weights():
+            with using_forge_operations(
+                device=torch.device("cpu"),
+                dtype=dtype,
+                manual_cast_enabled=True,
+                extra_dtype=dict(quant_config),
+            ):
+                model = model_class.from_config(config)
+
+        load_state_dict(model, state_dict, log_name=f"Native {component_name}")
+        model.eval()
+        logger.info("Loaded native quantized component %s with Forge operations", component_name)
+        return model
+    finally:
+        lazy_state_dict.close()
 
 
 ATTENTION_BACKEND_CHOICES = ("automatic", "native", "sage", "flash")
@@ -13,9 +127,14 @@ OFFLOAD_CHOICES = ("none", "model", "group", "sequential")
 def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
     from backend import mmgp_loader
 
+    pipeline_kwargs = dict(pipeline_kwargs)
+    native_quantized = _load_native_quantized_component(model_path, "transformer", dtype, logger)
+    if native_quantized is not None:
+        pipeline_kwargs["transformer"] = native_quantized
+
     component_files = mmgp_loader.component_files(model_path)
     component_names = list(component_files)
-    if mmgp_loader.can_attempt(model_path, component_names):
+    if native_quantized is None and mmgp_loader.can_attempt(model_path, component_names):
         try:
             pipeline = mmgp_loader.load_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype, component_names=component_files)
             logger.info("%s native pipeline loaded through MMGP's low-RAM component loader", label)

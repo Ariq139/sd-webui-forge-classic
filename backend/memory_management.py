@@ -840,6 +840,12 @@ def unet_offload_device():
 
 def unet_initial_load_device(parameters: int, dtype: torch.dtype) -> torch.device:
     torch_dev = get_torch_device()
+    # Let MMGP take ownership after the model is constructed.  Placing a
+    # large transformer on CUDA here can OOM before MMGP has installed its
+    # residency manager.
+    if mmgp_runtime_enabled():
+        return cpu
+
     if vram_state in (VRAMState.HIGH_VRAM, VRAMState.SHARED):
         return torch_dev
 

@@ -333,6 +333,17 @@ def configure_prompt_loras(pipeline, prompt: str) -> tuple[str, str | None]:
     """Configure native prompt LoRAs, or preserve the prompt when inactive."""
     if not enabled() or _active is None or _active._pipeline() is not pipeline:
         return prompt, None
+
+    try:
+        from modules.shared import opts
+
+        if not getattr(opts, "forge_memory_dynamic_lora_enabled", True):
+            # Clear adapters that were loaded before the setting was disabled.
+            _active.configure_prompt_loras("")
+            return prompt, None
+    except Exception:
+        logger.debug("Could not read the native dynamic LoRA setting", exc_info=True)
+
     return _active.configure_prompt_loras(prompt)
 
 

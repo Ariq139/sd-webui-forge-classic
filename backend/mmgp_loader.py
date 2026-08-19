@@ -351,7 +351,7 @@ class _StreamingForgeCheckpoint:
             if reason:
                 self.close()
                 raise MMGPLoaderUnavailable(reason)
-            replace_state_dict(self.state, extra, self.guess, str(path))
+            replace_state_dict(self.state, extra, self.guess, str(path), metadata=metadata)
             del extra
             memory_management.soft_empty_cache()
         self.keys = tuple(self.state.keys())

@@ -410,7 +410,7 @@ class ForgeOperations:
 # region GGUF
 
 
-from backend.operations_gguf import dequantize_tensor
+from backend.operations_gguf import dequantize_tensor, try_llamacpp_cuda_embedding, try_llamacpp_cuda_linear
 
 
 class ForgeOperationsGGUF(ForgeOperations):
@@ -446,12 +446,21 @@ class ForgeOperationsGGUF(ForgeOperations):
             return self
 
         def forward(self, x):
-            if self.bias is not None and self.bias.dtype != x.dtype:
-                self.bias = utils.tensor2parameter(dequantize_tensor(self.bias).to(x.dtype))
-            if self.weight is not None and self.weight.dtype != x.dtype and getattr(self.weight, "gguf_cls", None) is None:
-                self.weight = utils.tensor2parameter(self.weight.to(x.dtype))
-
-            weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_bias_dtype=True)
+            if getattr(self.weight, "gguf_cls", None) is not None:
+                weight, bias, signal = weights_manual_cast(self, x, weight_fn=lambda value: value, skip_bias_dtype=True)
+                fast_output = try_llamacpp_cuda_linear(weight, x, bias)
+                if fast_output is not None:
+                    with main_stream_worker(weight, bias, signal):
+                        return fast_output
+                weight = dequantize_tensor(weight).to(x.dtype)
+                if bias is not None:
+                    bias = dequantize_tensor(bias).to(x.dtype)
+            else:
+                if self.bias is not None and self.bias.dtype != x.dtype:
+                    self.bias = utils.tensor2parameter(dequantize_tensor(self.bias).to(x.dtype))
+                if self.weight is not None and self.weight.dtype != x.dtype:
+                    self.weight = utils.tensor2parameter(self.weight.to(x.dtype))
+                weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_bias_dtype=True)
             with main_stream_worker(weight, bias, signal):
                 return torch.nn.functional.linear(x, weight, bias)
 
@@ -536,7 +545,15 @@ class ForgeOperationsGGUF(ForgeOperations):
             return None
 
         def forward(self, x):
-            weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_weight_dtype=True, skip_bias_dtype=True)
+            if getattr(self.weight, "gguf_cls", None) is not None:
+                weight, bias, signal = weights_manual_cast(self, x, weight_fn=lambda value: value, skip_weight_dtype=True, skip_bias_dtype=True)
+                fast_output = try_llamacpp_cuda_embedding(weight, x, self._dtype)
+                if fast_output is not None:
+                    with main_stream_worker(weight, bias, signal):
+                        return fast_output
+                weight = dequantize_tensor(weight)
+            else:
+                weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_weight_dtype=True, skip_bias_dtype=True)
             with main_stream_worker(weight, bias, signal):
                 o = torch.nn.functional.embedding(x, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse)
                 return o.to(dtype=self._dtype)
