@@ -12,6 +12,7 @@ import torch
 
 from backend.args import args as cmd_args
 from backend.logging import setup_logger
+from backend import memory_management
 from backend.utils import get_attr, set_attr_raw
 from modules import scripts
 
@@ -80,6 +81,21 @@ class TorchCompileForForge(scripts.Script):
         return [preset]
 
     def process_batch(self, p, preset: str, **kwargs):
+        if memory_management.mmgp_runtime_enabled():
+            # MMGP must own compilation when its optional runtime is active.
+            # Remove a wrapper left by an earlier non-MMGP generation before
+            # returning, so changing the runtime mode cannot leave both paths
+            # attached to the same KModel.
+            sd_model = getattr(p, "sd_model", None)
+            forge_objects = getattr(sd_model, "forge_objects", None)
+            unet = getattr(forge_objects, "unet", None)
+            kmodel: "KModel | None" = getattr(unet, "model", None)
+            if kmodel is not None:
+                self._remove_compile_wrapper(kmodel)
+            if preset not in ("Automatic", "Disable"):
+                logger.warning("Torch Compile Integrated is disabled while MMGP is active; use MMGP PyTorch compilation instead")
+            return
+
         if preset == "Automatic":
             return
 
