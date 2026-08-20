@@ -9,28 +9,6 @@ from modules.paths_internal import data_path, default_output_dir
 from modules.shared_cmd_options import cmd_opts
 from modules_forge import presets as forge_presets
 from modules_forge import shared_options as forge_shared_options
-from modules_forge.mmgp_profiles import (
-    MEMORY_PROFILE_CHOICES,
-    MMGP_ATTENTION_BACKEND_CHOICES,
-    MMGP_COMPONENT_CHOICES,
-    MMGP_QUANTIZATION_MODES,
-    MMGP_VAE_ATTENTION_BACKEND_CHOICES,
-)
-
-
-def mmgp_attention_choices():
-    from backend.memory_management import mmgp_attention_backend_choices
-
-    supported = set(mmgp_attention_backend_choices())
-    return {"choices": tuple(choice for choice in MMGP_ATTENTION_BACKEND_CHOICES if choice in supported)}
-
-
-def mmgp_vae_attention_choices():
-    from backend.memory_management import xformers_enabled_vae
-
-    choices = [choice for choice in MMGP_VAE_ATTENTION_BACKEND_CHOICES if choice != "xformers" or xformers_enabled_vae()]
-    return {"choices": tuple(choices)}
-
 options_templates = {}
 hide_dirs = shared.hide_dirs
 
@@ -228,44 +206,8 @@ options_templates.update(
     options_section(
         ("memory-management", "Memory Management", "system"),
         {
-            "forge_memory_management_enabled": OptionInfo(False, "Enable MMGP memory management").info("requires --mmgp at launch"),
-            "forge_memory_management_explanation": OptionHTML("""
-Optional MMGP controls for Forge. They are disabled unless <b>--mmgp</b> is present at launch and this switch is enabled.<br>
-Without both switches, Forge's normal memory manager remains in control. CPU and explicit component-device options remain authoritative.<br>
-Choose a profile for a starting configuration, or choose <b>Custom</b> to tune the advanced controls. Profile RAM / VRAM values are guidance, not hard caps.<br>
-Automatic attention keeps Forge's normal priority. Explicit backends and advanced loading controls are available below when needed.<br>
-Reference: <a href="https://github.com/deepbeepmeep/mmgp" target="_blank">MMGP by deepbeepmeep</a>.
-            """),
             "forge_oom_retry_enabled": OptionInfo(True, "Retry once after out-of-memory").info("clears model allocations before retrying"),
-            "forge_memory_dynamic_lora_enabled": OptionInfo(True, "Use dynamic LoRA loading").info("can reduce VRAM use but may slow generation"),
-            "forge_memory_persistent_cache_enabled": OptionInfo(False, "Use persistent component cache").info("disabled by default"),
-            "forge_memory_cache_directory": OptionInfo("models/MMGP-cache", "Component cache directory", gr.Textbox).info("relative to the Forge directory"),
-            "forge_memory_profile": OptionInfo("Custom", "Memory profile", gr.Dropdown, {"choices": MEMORY_PROFILE_CHOICES}).info("fills the advanced controls below"),
-            "forge_memory_attention_backend": OptionInfo("automatic", "Attention backend", gr.Dropdown, mmgp_attention_choices).info("Automatic keeps Forge's normal priority"),
-            "forge_memory_vae_attention_backend": OptionInfo("automatic", "VAE attention backend", gr.Dropdown, mmgp_vae_attention_choices).info("Automatic keeps Forge's normal VAE priority"),
-            "forge_memory_quantization": OptionInfo("disabled", "Quantization", gr.Dropdown, {"choices": MMGP_QUANTIZATION_MODES}).info("disabled, or select the MMGP format to use"),
-            "forge_memory_alternate_quantization": OptionInfo(False, "Legacy alternate quantization", gr.Checkbox, {"visible": False}),
-            "forge_memory_quantization_type": OptionInfo("qint8", "Legacy quantization type", gr.Dropdown, {"choices": MMGP_QUANTIZATION_MODES[1:], "visible": False}),
-            "forge_memory_compile_enabled": OptionInfo(False, "PyTorch compilation").info("requires a compatible compiler setup"),
-            "forge_memory_partial_pinning_enabled": OptionInfo(False, "Partial RAM pinning").info("pins selected blocks when full pinning is too large"),
-            "forge_memory_budgets_enabled": OptionInfo(False, "Per-component VRAM budgets").info("limits diffusion model, text encoder, VAE, and ControlNet memory"),
-            "forge_memory_pinned_memory_enabled": OptionInfo(False, "Pinned CPU memory").info("may speed transfers but uses more RAM"),
-            "forge_memory_async_transfers_enabled": OptionInfo(False, "Asynchronous transfers").info("overlaps weight movement when supported"),
-            "forge_memory_residency_hints_enabled": OptionInfo(False, "Residency hints").info("keeps selected components resident when possible"),
-            "forge_memory_working_vram_mb": OptionInfo(0, "Working VRAM (MB)", gr.Number, {"minimum": 0, "maximum": 262144, "precision": 0}).info("minimum free VRAM; 0 = automatic"),
-            "forge_memory_unet_budget_mb": OptionInfo(0, "Diffusion model budget (MB)", gr.Number, {"minimum": 0, "maximum": 262144, "precision": 0}).info("0 = unlimited"),
-            "forge_memory_text_encoder_budget_mb": OptionInfo(0, "Text encoder budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = unlimited"),
-            "forge_memory_vae_budget_mb": OptionInfo(0, "VAE budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = unlimited"),
-            "forge_memory_controlnet_budget_mb": OptionInfo(0, "ControlNet budget (MB)", gr.Number, {"minimum": 0, "maximum": 65536, "precision": 0}).info("0 = unlimited"),
-            "forge_memory_pinned_memory_percent": OptionInfo(45, "Pinned RAM limit (%)", gr.Slider, {"minimum": 10, "maximum": 90, "step": 5}).info("Windows default: 45%"),
-            "forge_memory_vram_safety_percent": OptionInfo(80, "VRAM safety limit (%)", gr.Slider, {"minimum": 50, "maximum": 95, "step": 5}).info("default: 80%"),
-            "forge_memory_async_streams": OptionInfo(2, "Transfer streams", gr.Slider, {"minimum": 1, "maximum": 8, "step": 1}).info("more streams use more memory"),
-            "forge_memory_pinned_components": OptionInfo(["unet", "text_encoder", "vae", "controlnet"], "Pinned components", ui_components.DropdownMulti, lambda: {"choices": ["unet", "text_encoder", "vae", "controlnet"]}).info("choose components eligible for pinning"),
-            "forge_memory_residency_components": OptionInfo([], "Resident components", ui_components.DropdownMulti, lambda: {"choices": MMGP_COMPONENT_CHOICES}).info("keep selected components loaded when possible"),
-            "forge_memory_keep_unet_loaded": OptionInfo(False, "Legacy diffusion model residency", gr.Checkbox, {"visible": False}),
-            "forge_memory_keep_text_encoder_loaded": OptionInfo(False, "Legacy text encoder residency", gr.Checkbox, {"visible": False}),
-            "forge_memory_keep_vae_loaded": OptionInfo(False, "Legacy VAE residency", gr.Checkbox, {"visible": False}),
-            "forge_memory_keep_controlnet_loaded": OptionInfo(False, "Legacy ControlNet residency", gr.Checkbox, {"visible": False}),
+            "forge_attention_dtype_alignment_enabled": OptionInfo(False, "Enable mixed-dtype attention alignment").info("converts mismatched Q/K/V dtypes to prevent attention dtype mismatch errors"),
         },
     )
 )

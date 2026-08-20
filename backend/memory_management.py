@@ -21,7 +21,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import gc
 import importlib
-import importlib.metadata
 import logging
 import os
 import platform
@@ -46,28 +45,6 @@ logger = logging.getLogger("memory_management")
 setup_logger(logger)
 
 cpu = torch.device("cpu")
-
-
-# Optional controls for the alternate MMGP manager.
-# Reference: https://github.com/deepbeepmeep/mmgp
-MEMORY_FEATURES = {
-    "enabled": False,
-    "budgets": False,
-    "pinned_memory": False,
-    "async_transfers": False,
-    "residency_hints": False,
-}
-MEMORY_BUDGETS_BYTES: dict[str, int] = {}
-MEMORY_RESIDENCY_COMPONENTS: set[str] = set()
-MEMORY_PINNED_COMPONENTS: set[str] = set()
-MEMORY_WORKING_VRAM_BYTES = 0
-MEMORY_PINNED_MEMORY_PERCENT = 45.0
-MEMORY_ASYNC_STREAMS = 2
-MEMORY_VRAM_SAFETY_PERCENT = 80.0
-MMGP_ATTENTION_BACKEND = "automatic"
-MMGP_VAE_ATTENTION_BACKEND = "automatic"
-MMGP_RUNTIME_ACTIVE = False
-MEMORY_RUNTIME_SIGNATURE = None
 
 
 class VRAMState(Enum):
@@ -385,9 +362,6 @@ if cpu_state is not CPUState.GPU:
 if cpu_state is CPUState.MPS:
     vram_state = VRAMState.SHARED
 
-FORGE_VRAM_STATE = vram_state
-FORGE_SET_VRAM_TO = set_vram_to
-
 logger.info(f"VRAM State: {vram_state.name}")
 
 DISABLE_SMART_MEMORY = args.disable_smart_memory
@@ -586,9 +560,7 @@ def extra_reserved_memory() -> float:
 
 
 def minimum_inference_memory() -> float:
-    base_memory = (1024 * 1024 * 1024) * 0.8
-    working_memory = MEMORY_WORKING_VRAM_BYTES if feature_enabled("enabled") else 0
-    return max(base_memory, working_memory) + extra_reserved_memory()
+    return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
 
 def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = []):
@@ -600,23 +572,16 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     cleanup_models_gc()
     unloaded_model = []
     can_unload = []
-    hinted_can_unload = []
     unloaded_models = []
-    use_residency_hints = feature_enabled("residency_hints")
 
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
-                candidate = (-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i)
-                if use_residency_hints and memory_component_for_model(shift_model.model) in MEMORY_RESIDENCY_COMPONENTS:
-                    hinted_can_unload.append(candidate)
-                else:
-                    can_unload.append(candidate)
+                can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
 
-    # Residency hints are preferences, not hard pins.
-    for x in sorted(can_unload) + sorted(hinted_can_unload):
+    for x in sorted(can_unload):
         i = x[-1]
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
@@ -642,16 +607,6 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
 
 
 def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False):
-    if mmgp_runtime_enabled():
-        try:
-            from backend.mmgp_alternate import get_manager_for_models
-
-            alternate_manager = get_manager_for_models(models)
-            if alternate_manager is not None and alternate_manager.load(models):
-                return
-        except Exception:
-            logger.exception("Reference MMGP setup failed; falling back to Forge memory management")
-
     execution_start_time = time.perf_counter()
     cleanup_models_gc(target=models)
 
@@ -734,13 +689,6 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        # Forge's VRAM flags remain authoritative; budgets only cap loaded weights.
-        # Activation/workspace memory remains protected separately.
-        component_budget = memory_budget_for_model(model)
-        if component_budget > 0 and not is_device_cpu(torch_dev):
-            if lowvram_model_memory == 0 or lowvram_model_memory > component_budget:
-                lowvram_model_memory = component_budget
-
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
         current_loaded_models.insert(0, loaded_model)
 
@@ -806,31 +754,6 @@ def dtype_size(dtype: torch.dtype) -> int:
     return getattr(dtype, "itemsize", 4)
 
 
-def mmgp_compute_dtype(model=None, fallback: torch.dtype = None) -> torch.dtype:
-    """Choose the low-precision dtype already used by a model for MMGP leftovers."""
-    supported = (torch.float16, torch.bfloat16, torch.float32)
-
-    for attribute in ("computation_dtype", "_model_dtype", "storage_dtype", "dtype"):
-        value = getattr(model, attribute, None) if model is not None else None
-        if value in supported:
-            return value
-
-    counts = {dtype: 0 for dtype in supported}
-    if model is not None and hasattr(model, "named_parameters"):
-        for parameter in model.parameters():
-            if parameter.dtype in counts:
-                counts[parameter.dtype] += parameter.numel()
-
-    for value in (torch.float16, torch.bfloat16, torch.float32):
-        if counts[value] == max(counts.values()) and counts[value] > 0:
-            return value
-
-    if fallback in supported:
-        return fallback
-    device = get_torch_device()
-    return torch.bfloat16 if should_use_bf16(device) else torch.float16
-
-
 def unet_offload_device():
     if vram_state is VRAMState.HIGH_VRAM:
         return get_torch_device()
@@ -840,12 +763,6 @@ def unet_offload_device():
 
 def unet_initial_load_device(parameters: int, dtype: torch.dtype) -> torch.device:
     torch_dev = get_torch_device()
-    # Let MMGP take ownership after the model is constructed.  Placing a
-    # large transformer on CUDA here can OOM before MMGP has installed its
-    # residency manager.
-    if mmgp_runtime_enabled():
-        return cpu
-
     if vram_state in (VRAMState.HIGH_VRAM, VRAMState.SHARED):
         return torch_dev
 
@@ -940,13 +857,13 @@ def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, su
 
 
 def text_encoder_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
+    return get_torch_device() if args.gpu_only else cpu
 
 
 def text_encoder_device() -> torch.device:
     if args.text_enc_device is not None:
         return torch.device(args.text_enc_device)
-    if args.gpu_only and not mmgp_runtime_enabled():
+    if args.gpu_only:
         return get_torch_device()
     if args.cpu_text_enc:
         return cpu
@@ -990,7 +907,7 @@ def text_encoder_dtype(device=None) -> torch.dtype:
 
 
 def intermediate_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
+    return get_torch_device() if args.gpu_only else cpu
 
 
 def vae_device() -> torch.device:
@@ -1000,7 +917,7 @@ def vae_device() -> torch.device:
 
 
 def vae_offload_device() -> torch.device:
-    return get_torch_device() if args.gpu_only and not mmgp_runtime_enabled() else cpu
+    return get_torch_device() if args.gpu_only else cpu
 
 
 def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
@@ -1165,44 +1082,6 @@ def ck_enabled() -> bool:
         return callable(is_available) and callable(int8_attention) and bool(is_available())
     except Exception:
         return False
-
-
-def mmgp_attention_backend_choices() -> tuple[str, ...]:
-    """Return attention choices that are installed and usable on this host."""
-    choices = ["automatic", "sdpa"]
-    if ck_enabled():
-        choices.append("ck")
-    try:
-        capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-        triton_available = importlib.util.find_spec("triton") is not None
-    except Exception:
-        capability = (0, 0)
-        triton_available = False
-
-    if sage_enabled() and triton_available and capability[0] >= 7:
-        choices.append("sage")
-    try:
-        sage2_package = importlib.metadata.version("sageattention").startswith("2")
-    except importlib.metadata.PackageNotFoundError:
-        sage2_package = False
-    if sage_enabled() and sage2_package and triton_available and capability[0] >= 8:
-        choices.append("sage2")
-        if importlib.util.find_spec("spas_sage_attn") is not None:
-            choices.append("radial")
-    if sage_enabled() and triton_available and capability[0] >= 10:
-        if importlib.util.find_spec("sageattn3") is not None or importlib.util.find_spec("sageattn_blackwell") is not None:
-            choices.append("sage3")
-    if flash_enabled():
-        choices.append("flash")
-        try:
-            import flash_attn_interface  # noqa: F401
-        except Exception:
-            pass
-        else:
-            choices.append("flash3")
-    if xformers_enabled():
-        choices.append("xformers")
-    return tuple(choices)
 
 
 def pytorch_attention_enabled() -> bool:
@@ -1513,18 +1392,6 @@ def unload_model(model: "ModelPatcher") -> bool:
 
 
 def unload_all_models():
-    try:
-        from backend.mmgp_alternate import release as release_alternate_mmgp
-
-        release_alternate_mmgp()
-    except ImportError:
-        pass
-    try:
-        from backend.mmgp_native import release_all as release_native_mmgp
-
-        release_native_mmgp()
-    except ImportError:
-        pass
     free_memory(1e30, get_torch_device())
 
 
@@ -1556,10 +1423,32 @@ def current_stream(device: torch.device):
 stream_counters: dict[torch.device, int] = {}
 
 
+def async_transfers_enabled() -> bool:
+    return args.cuda_stream is not None
+
+
+ATTENTION_DTYPE_ALIGNMENT_ENABLED = False
+
+
+def set_attention_dtype_alignment():
+    global ATTENTION_DTYPE_ALIGNMENT_ENABLED
+
+    try:
+        from modules import shared
+
+        ATTENTION_DTYPE_ALIGNMENT_ENABLED = bool(getattr(shared.opts, "forge_attention_dtype_alignment_enabled", False))
+    except Exception:
+        ATTENTION_DTYPE_ALIGNMENT_ENABLED = False
+
+
+def attention_dtype_alignment_enabled() -> bool:
+    return ATTENTION_DTYPE_ALIGNMENT_ENABLED
+
+
 def get_offload_stream(device: torch.device):
     if device is None or not (is_device_cuda(device) or is_device_xpu(device)):
         return None
-    if NUM_STREAMS == 0 or not async_transfers_enabled():
+    if NUM_STREAMS == 0:
         return None
     if torch.compiler.is_compiling():
         return None
@@ -1639,12 +1528,9 @@ def discard_cuda_async_error():
         pass
 
 
-def pin_memory(tensor, component: str = "auto"):
+def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY
     if not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0:
-        return False
-
-    if feature_enabled("pinned_memory") and MEMORY_PINNED_COMPONENTS and component not in MEMORY_PINNED_COMPONENTS:
         return False
 
     if type(tensor).__name__ != PINNING_ALLOWED_TYPES:
@@ -1708,216 +1594,6 @@ def unpin_memory(tensor):
         discard_cuda_async_error()
 
     return False
-
-
-def feature_enabled(feature: str) -> bool:
-    """Return whether an optional memory feature is currently active."""
-    features = MEMORY_FEATURES
-    return bool(features.get("enabled", False) and features.get(feature, False))
-
-
-def mmgp_enabled() -> bool:
-    """Whether optional MMGP runtime is active."""
-    return MMGP_RUNTIME_ACTIVE
-
-
-def mmgp_runtime_enabled() -> bool:
-    """Whether MMGP was requested and its master switch is active."""
-    return bool(MMGP_RUNTIME_ACTIVE and MEMORY_FEATURES.get("enabled", False))
-
-
-def mmgp_flag_present() -> bool:
-    """Whether the user requested the optional MMGP path at launch."""
-    return bool(getattr(args, "mmgp", False))
-
-
-def mmgp_attention_backend() -> str:
-    """Return the optional attention backend without changing Forge defaults."""
-    return MMGP_ATTENTION_BACKEND if mmgp_runtime_enabled() else "automatic"
-
-
-def mmgp_vae_attention_backend() -> str:
-    """Return the optional VAE attention backend without changing Forge defaults."""
-    return MMGP_VAE_ATTENTION_BACKEND if mmgp_runtime_enabled() else "automatic"
-
-
-def async_transfers_enabled() -> bool:
-    """Keep the existing CLI stream option working independently of UI settings."""
-    return bool(args.cuda_stream is not None or feature_enabled("async_transfers"))
-
-
-def mmgp_async_transfers_enabled() -> bool:
-    """Return whether the optional MMGP manager may use asynchronous transfers."""
-    return bool(mmgp_runtime_enabled() and feature_enabled("async_transfers"))
-
-
-def memory_component_for_model(model) -> str:
-    return getattr(model, "memory_component", "auto")
-
-
-def memory_budget_for_model(model) -> int:
-    if not feature_enabled("budgets"):
-        return 0
-    budget = max(0, int(MEMORY_BUDGETS_BYTES.get(memory_component_for_model(model), 0)))
-    if budget <= 0:
-        return 0
-
-    # Keep explicit budgets below working-memory headroom.
-    safe_budget = total_vram * (MEMORY_VRAM_SAFETY_PERCENT / 100.0) * 1024 * 1024
-    if MEMORY_WORKING_VRAM_BYTES > 0:
-        safe_budget = min(safe_budget, total_vram * 1024 * 1024 - MEMORY_WORKING_VRAM_BYTES)
-    if safe_budget > 0:
-        budget = min(budget, int(safe_budget))
-    return max(1, budget)
-
-
-def residency_hint_enabled(model) -> bool:
-    return feature_enabled("residency_hints") and memory_component_for_model(model) in MEMORY_RESIDENCY_COMPONENTS
-
-
-def _setting_number(value, default):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def configure_memory_features(
-    *,
-    profile: str = "Custom",
-    enabled: bool = False,
-    attention_backend: str = "automatic",
-    vae_attention_backend: str = "automatic",
-    budgets: bool = False,
-    pinned_memory: bool = False,
-    async_transfers: bool = False,
-    residency_hints: bool = False,
-    model_budgets_mb: dict[str, int | float] | None = None,
-    working_vram_mb: int | float = 0,
-    pinned_memory_percent: int | float = 45,
-    vram_safety_percent: int | float = 80,
-    async_streams: int = 2,
-    pinned_components: set[str] | list[str] | tuple[str, ...] = (),
-    residency_components: set[str] | list[str] | tuple[str, ...] = (),
-    compile_enabled: bool = False,
-    partial_pinning: bool = False,
-    alternate_quantization: bool = False,
-    quantization_type: str = "qint8",
-):
-    """Apply optional MMGP settings; Forge remains the fallback manager."""
-    global MEMORY_FEATURES
-    global MEMORY_BUDGETS_BYTES
-    global MEMORY_RESIDENCY_COMPONENTS
-    global MEMORY_PINNED_COMPONENTS
-    global MEMORY_WORKING_VRAM_BYTES
-    global MEMORY_PINNED_MEMORY_PERCENT
-    global MEMORY_ASYNC_STREAMS
-    global MEMORY_VRAM_SAFETY_PERCENT
-    global MMGP_ATTENTION_BACKEND
-    global MMGP_VAE_ATTENTION_BACKEND
-    global MMGP_RUNTIME_ACTIVE
-    global MEMORY_RUNTIME_SIGNATURE
-    global NUM_STREAMS
-    global PINNING_ENABLED
-    global MAX_PINNED_MEMORY
-    global vram_state
-    global set_vram_to
-
-    # Saved settings are inactive without --mmgp.
-    effective_enabled = bool(enabled and mmgp_flag_present())
-    MMGP_RUNTIME_ACTIVE = effective_enabled
-    cli_attention = str(getattr(args, "mmgp_attention", "automatic") or "automatic").strip().lower()
-    requested_attention = attention_backend if cli_attention == "automatic" else cli_attention
-    requested_attention = str(requested_attention or "automatic").strip().lower()
-    if requested_attention not in {"automatic", "sdpa", "ck", "sage", "sage2", "sage3", "flash", "flash3", "radial", "xformers"}:
-        requested_attention = "automatic"
-    MMGP_ATTENTION_BACKEND = requested_attention if effective_enabled else "automatic"
-    requested_vae_attention = str(vae_attention_backend or "automatic").strip().lower()
-    if requested_vae_attention not in {"automatic", "sdpa", "xformers", "slice"}:
-        requested_vae_attention = "automatic"
-    MMGP_VAE_ATTENTION_BACKEND = requested_vae_attention if effective_enabled else "automatic"
-    MEMORY_FEATURES = {
-        "enabled": effective_enabled,
-        "budgets": effective_enabled and bool(budgets),
-        "pinned_memory": effective_enabled and bool(pinned_memory),
-        "async_transfers": effective_enabled and bool(async_transfers),
-        "residency_hints": effective_enabled and bool(residency_hints),
-    }
-    if effective_enabled and cpu_state is CPUState.GPU:
-        vram_state = VRAMState.NORMAL_VRAM
-        set_vram_to = VRAMState.NORMAL_VRAM
-        logger.debug("MMGP enabled: overriding Forge VRAM mode flags")
-    else:
-        vram_state = FORGE_VRAM_STATE
-        set_vram_to = FORGE_SET_VRAM_TO
-    MEMORY_BUDGETS_BYTES = {}
-    if effective_enabled:
-        for component, value in (model_budgets_mb or {}).items():
-            value = _setting_number(value, 0)
-            if value > 0:
-                MEMORY_BUDGETS_BYTES[component] = int(value * 1024 * 1024)
-    MEMORY_RESIDENCY_COMPONENTS = set(residency_components or ()) if effective_enabled else set()
-    MEMORY_PINNED_COMPONENTS = set(pinned_components or ()) if effective_enabled else set()
-    MEMORY_WORKING_VRAM_BYTES = max(0, int(_setting_number(working_vram_mb, 0) * 1024 * 1024)) if effective_enabled else 0
-    MEMORY_PINNED_MEMORY_PERCENT = min(90.0, max(10.0, _setting_number(pinned_memory_percent, 45))) if effective_enabled else 45.0
-    MEMORY_VRAM_SAFETY_PERCENT = min(95.0, max(50.0, _setting_number(vram_safety_percent, 80))) if effective_enabled else 80.0
-    MEMORY_ASYNC_STREAMS = min(8, max(1, int(_setting_number(async_streams, 2)))) if effective_enabled else 2
-
-    requested_streams = MEMORY_ASYNC_STREAMS if feature_enabled("async_transfers") else 0
-    if args.cuda_stream is not None:
-        requested_streams = max(requested_streams, int(args.cuda_stream))
-    if requested_streams != NUM_STREAMS:
-        NUM_STREAMS = requested_streams
-        stream_counters.clear()
-
-    PINNING_ENABLED = bool(args.pin_shared_memory or feature_enabled("pinned_memory"))
-    if PINNING_ENABLED and (is_nvidia() or is_amd()):
-        pinned_percent = MEMORY_PINNED_MEMORY_PERCENT if feature_enabled("pinned_memory") else (45.0 if WINDOWS else 95.0)
-        MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * (pinned_percent / 100.0)
-    elif not args.pin_shared_memory:
-        MAX_PINNED_MEMORY = -1
-
-    previous_signature = MEMORY_RUNTIME_SIGNATURE
-    runtime_signature = (
-        effective_enabled,
-        feature_enabled("budgets"),
-        tuple(sorted(MEMORY_BUDGETS_BYTES.items())) if feature_enabled("budgets") else (),
-        MEMORY_WORKING_VRAM_BYTES if feature_enabled("enabled") else 0,
-        feature_enabled("pinned_memory"),
-        feature_enabled("async_transfers"),
-        feature_enabled("residency_hints"),
-        tuple(sorted(MEMORY_PINNED_COMPONENTS)) if feature_enabled("pinned_memory") else (),
-        tuple(sorted(MEMORY_RESIDENCY_COMPONENTS)) if feature_enabled("residency_hints") else (),
-        MEMORY_PINNED_MEMORY_PERCENT if feature_enabled("pinned_memory") else 0,
-        MEMORY_VRAM_SAFETY_PERCENT if feature_enabled("enabled") else 0,
-        NUM_STREAMS,
-        PINNING_ENABLED,
-        bool(compile_enabled) if effective_enabled else False,
-        bool(partial_pinning) if effective_enabled else False,
-        bool(alternate_quantization) if effective_enabled else False,
-        str(quantization_type) if effective_enabled and alternate_quantization else "",
-        MMGP_ATTENTION_BACKEND if effective_enabled else "automatic",
-        MMGP_VAE_ATTENTION_BACKEND if effective_enabled else "automatic",
-        str(profile or "Custom") if effective_enabled else "Custom",
-    )
-    mode_changed = previous_signature is not None and runtime_signature != previous_signature
-    if mode_changed:
-        logger.info("Memory-management mode changed; unloading models before applying the new mode")
-        unload_all_models()
-        soft_empty_cache()
-    MEMORY_RUNTIME_SIGNATURE = runtime_signature
-
-    # Settings changes can call this repeatedly, so keep this at debug level.
-    logger.debug(
-        "Optional memory features: enabled=%s budgets=%s pinned=%s async=%s residency=%s streams=%s",
-        MEMORY_FEATURES["enabled"],
-        feature_enabled("budgets"),
-        feature_enabled("pinned_memory"),
-        async_transfers_enabled(),
-        feature_enabled("residency_hints"),
-        NUM_STREAMS,
-    )
-    return mode_changed
 
 
 # region Conv3d

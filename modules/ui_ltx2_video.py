@@ -7,7 +7,7 @@ import uuid
 import gradio as gr
 import torch
 
-from backend import memory_management, mmgp_native
+from backend import memory_management
 from modules import paths, shared
 from modules_forge import main_thread
 from modules_forge.native_models import is_compatible_model, resolve_model_path
@@ -15,7 +15,6 @@ from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
     configure_pipeline,
-    configure_attention,
     configure_prompt_cache,
     configure_vae_tiling,
     load_native_pipeline,
@@ -252,8 +251,7 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
     prunavaed_path = _resolve_prunavaed_path(prunavaed_path)
     device = _device()
     dtype = _default_dtype(precision)
-    mmgp_active = mmgp_native.enabled()
-    key = (model_path, prunavaed_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), bool(image_mode), mmgp_active, memory_management.MEMORY_RUNTIME_SIGNATURE)
+    key = (model_path, prunavaed_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), bool(image_mode))
 
     with _pipeline_lock:
         if _pipeline is not None and _pipeline_key == key:
@@ -273,12 +271,7 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
 
         pipeline_class = LTX2ImageToVideoPipeline if image_mode else LTX2Pipeline
         _pipeline = load_native_pipeline(pipeline_class, model_path, pipeline_kwargs, dtype, logger, "LTX-2")
-        if mmgp_active:
-            configure_attention(_pipeline, attention_backend, device, logger)
-            if not mmgp_native.attach(_pipeline, compile_enabled=compile_enabled):
-                configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
-        else:
-            configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
+        configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
         configure_prompt_cache(_pipeline, prompt_cache, logger)
         _pipeline_key = key
         return _pipeline
@@ -293,7 +286,6 @@ def unload():
             return
 
         if _pipeline is not None:
-            mmgp_native.release(_pipeline)
             try:
                 _pipeline.to("cpu")
             except Exception:
@@ -372,9 +364,6 @@ def generate(
             return None, "LTX-2.3 requires at least 9 frames."
 
         pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None)
-        prompt, lora_warning = mmgp_native.configure_prompt_loras(pipe, prompt)
-        if lora_warning:
-            logger.warning(lora_warning)
         configure_vae_tiling(
             pipe.vae,
             resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),

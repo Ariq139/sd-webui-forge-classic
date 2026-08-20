@@ -583,8 +583,7 @@ class Attention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
-        if memory_management.MMGP_RUNTIME_ACTIVE:
-            query_states, key_states, value_states = match_attention_dtypes(query_states, key_states, value_states)
+        query_states, key_states, value_states = match_attention_dtypes(query_states, key_states, value_states)
         attn_output = scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()

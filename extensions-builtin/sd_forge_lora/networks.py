@@ -24,10 +24,7 @@ ANIMA_BLOCK_MAPPING = (0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 
 
 
 def load_lora_state_dict(filename):
-    """Use lazy safetensors reads for the optional MMGP path."""
-    from backend import mmgp_loader
-
-    return mmgp_loader.open_streaming_state_dict(filename) or load_torch_file(filename, safe_load=True)
+    return load_torch_file(filename, safe_load=True)
 
 
 def process_anima(lora: dict[str, torch.Tensor], blocks: int):

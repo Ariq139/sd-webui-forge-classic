@@ -287,7 +287,7 @@ class ControlNet(ControlBase):
         super().__init__(device)
         self.control_model = control_model
         self.load_device = load_device
-        self.control_model_wrapped = ModelPatcher(self.control_model, load_device=load_device, offload_device=memory_management.unet_offload_device(), memory_component="controlnet")
+        self.control_model_wrapped = ModelPatcher(self.control_model, load_device=load_device, offload_device=memory_management.unet_offload_device())
         self.global_average_pooling = global_average_pooling
         self.model_sampling_current = None
         self.manual_cast_dtype = manual_cast_dtype

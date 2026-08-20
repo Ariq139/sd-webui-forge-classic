@@ -175,64 +175,6 @@ def reserve_memory():
     set_reserved_memory(opts.setting_allocated_vram)
 
 
-def configure_memory_features():
-    from backend.memory_management import configure_memory_features as apply_memory_features
-    from modules.shared import opts
-    from modules_forge.mmgp_profiles import get_mmgp_quantization, get_mmgp_residency_components
-
-    quantize, quantization_type = get_mmgp_quantization(opts)
-
-    # Import MMGP before any model is loaded so its low-RAM safetensors hooks
-    # are available, but keep the normal Forge path untouched unless both
-    # --mmgp and the UI master switch are active.
-    from backend.memory_management import mmgp_flag_present
-    if mmgp_flag_present() and getattr(opts, "forge_memory_management_enabled", False):
-        try:
-            from mmgp import offload  # noqa: F401
-        except Exception:
-            pass
-
-    return apply_memory_features(
-        profile=getattr(opts, "forge_memory_profile", "Custom"),
-        enabled=getattr(opts, "forge_memory_management_enabled", False),
-        attention_backend=getattr(opts, "forge_memory_attention_backend", "automatic"),
-        vae_attention_backend=getattr(opts, "forge_memory_vae_attention_backend", "automatic"),
-        budgets=getattr(opts, "forge_memory_budgets_enabled", False),
-        pinned_memory=getattr(opts, "forge_memory_pinned_memory_enabled", False),
-        async_transfers=getattr(opts, "forge_memory_async_transfers_enabled", False),
-        residency_hints=getattr(opts, "forge_memory_residency_hints_enabled", False),
-        model_budgets_mb={
-            "unet": getattr(opts, "forge_memory_unet_budget_mb", 0),
-            "text_encoder": getattr(opts, "forge_memory_text_encoder_budget_mb", 0),
-            "vae": getattr(opts, "forge_memory_vae_budget_mb", 0),
-            "controlnet": getattr(opts, "forge_memory_controlnet_budget_mb", 0),
-        },
-        working_vram_mb=getattr(opts, "forge_memory_working_vram_mb", 0),
-        pinned_memory_percent=getattr(opts, "forge_memory_pinned_memory_percent", 45),
-        vram_safety_percent=getattr(opts, "forge_memory_vram_safety_percent", 80),
-        async_streams=getattr(opts, "forge_memory_async_streams", 2),
-        pinned_components=getattr(opts, "forge_memory_pinned_components", []),
-        residency_components=get_mmgp_residency_components(opts),
-        compile_enabled=getattr(opts, "forge_memory_compile_enabled", False),
-        partial_pinning=getattr(opts, "forge_memory_partial_pinning_enabled", False),
-        alternate_quantization=quantize,
-        quantization_type=quantization_type,
-    )
-
-
-def apply_memory_mode():
-    """Apply saved memory settings and clear models once after a mode change."""
-    mode_changed = configure_memory_features()
-    # Rebuild the model after a mode change so MMGP-prepared modules cannot
-    # remain in the normal Forge path.
-    from modules import sd_models
-    from modules_forge.main_entry import refresh_model_loading_parameters
-
-    if mode_changed:
-        sd_models.unload_model_weights()
-    refresh_model_loading_parameters()
-
-
 def clear_references():
     from backend.args import dynamic_args
 
@@ -241,27 +183,13 @@ def clear_references():
 
 def configure_opts_onchange():
     from modules import shared, ui_tempdir
-    from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS
+    from backend import memory_management
 
     shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
     shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
     shared.opts.onchange("setting_allocated_vram", reserve_memory)
-    for key in MEMORY_SETTING_KEYS:
-        if key == "forge_memory_management_enabled":
-            continue
-        shared.opts.onchange(key, configure_memory_features, call=False)
-    from modules_forge.main_entry import refresh_model_loading_parameters
-
-    def configure_memory_mode():
-        apply_memory_mode()
-
-    # The master switch must reconfigure the memory backend before refreshing
-    # model-loading flags; otherwise changing only this setting leaves loaded
-    # models under the previous residency mode.
-    shared.opts.onchange("forge_memory_management_enabled", configure_memory_mode, call=False)
-    shared.opts.onchange("forge_memory_profile", configure_memory_mode, call=False)
-    shared.opts.onchange("forge_memory_dynamic_lora_enabled", refresh_model_loading_parameters, call=False)
-    configure_memory_features()
+    shared.opts.onchange("forge_attention_dtype_alignment_enabled", memory_management.set_attention_dtype_alignment)
+    memory_management.set_attention_dtype_alignment()
     shared.opts.onchange("klein_no_reference", clear_references)
     shared.opts.onchange("anima_do_reference", clear_references)
     shared.opts.onchange("krea2_do_reference", clear_references)

@@ -2,8 +2,6 @@
 
 import logging
 import math
-from contextlib import contextmanager
-from contextvars import ContextVar
 
 import torch
 from einops import rearrange, repeat
@@ -377,10 +375,8 @@ def attention_xformers(q, k, v, heads, mask=None, attn_precision=None, skip_resh
 
 
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
     output_dtype = v.dtype
-    if mmgp_active:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
 
     if skip_reshape:
         b, _, _, dim_head = q.shape
@@ -413,16 +409,14 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
 
             out[i : i + SDP_BATCH_LIMIT] = operations.scaled_dot_product_attention(q[i : i + SDP_BATCH_LIMIT], k[i : i + SDP_BATCH_LIMIT], v[i : i + SDP_BATCH_LIMIT], attn_mask=m, dropout_p=0.0, is_causal=False, **sdpa_extra).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
 
-    return out.to(output_dtype) if mmgp_active and out.dtype != output_dtype else out
+    return out.to(output_dtype) if out.dtype != output_dtype else out
 
 
 @torch.compiler.disable
 def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     in_dtype = v.dtype
-    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
     sage_kernel = kwargs.pop("_sage_kernel", sageattn)
-    if mmgp_active:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -480,8 +474,7 @@ def attention_sage_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_r
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    if memory_management.MMGP_RUNTIME_ACTIVE:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -558,8 +551,7 @@ def attention_sage3(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    if memory_management.MMGP_RUNTIME_ACTIVE:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
 
@@ -584,10 +576,8 @@ def attention_sage3(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
 @torch.compiler.disable
 def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-    mmgp_active = memory_management.MMGP_RUNTIME_ACTIVE
     output_dtype = v.dtype
-    if mmgp_active:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
 
     if skip_reshape:
         b, _, _, dim_head = q.shape
@@ -625,7 +615,7 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     if not skip_output_reshape:
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
-    return out.to(output_dtype) if mmgp_active and out.dtype != output_dtype else out
+    return out.to(output_dtype) if out.dtype != output_dtype else out
 
 
 @torch.compiler.disable
@@ -635,8 +625,7 @@ def attention_flash_varlen(q, k, v, heads, mask=None, attn_precision=None, skip_
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    if memory_management.MMGP_RUNTIME_ACTIVE:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
     qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
     if qkv is None:
         return attention_flash(original_q, original_k, original_v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
@@ -715,8 +704,7 @@ def attention_radial(q, k, v, heads, mask=None, attn_precision=None, skip_reshap
 
     original_q, original_k, original_v = q, k, v
     output_dtype = v.dtype
-    if memory_management.MMGP_RUNTIME_ACTIVE:
-        q, k, v = operations.match_attention_dtypes(q, k, v)
+    q, k, v = operations.match_attention_dtypes(q, k, v)
     if torch.float32 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
     qkv = _reshape_qkv_to_nhd(q, k, v, heads, skip_reshape)
@@ -770,95 +758,7 @@ else:
     _automatic_attention_function = attention_basic
 
 
-def _resolve_mmgp_attention_backend(requested):
-    requested = str(requested or "automatic").strip().lower()
-    if requested == "ck" and memory_management.ck_enabled():
-        return attention_comfy_kitchen_int8
-    if requested == "sdpa":
-        return attention_pytorch
-    if requested == "sage2" and memory_management.sage_enabled() and SAGE2_ATTN is not None:
-        return attention_sage2
-    if requested == "sage" and memory_management.sage_enabled():
-        return attention_sage_varlen if SAGE_VARLEN_ATTN is not None else attention_sage
-    if requested == "sage3" and memory_management.sage_enabled() and SAGE3_ATTN is not None:
-        return attention_sage3
-    if requested == "flash" and memory_management.flash_enabled():
-        return attention_flash_varlen if FLASH_ATTN_VARLEN is not None else attention_flash
-    if requested == "flash3" and FLASH_ATTN3_VARLEN is not None and memory_management.flash_enabled():
-        return attention_flash3_varlen
-    if requested == "radial" and RADIAL_ATTN is not None and memory_management.sage_enabled():
-        return attention_radial
-    if requested == "xformers" and memory_management.xformers_enabled():
-        return attention_xformers
-    return _automatic_attention_function
-
-
-_attention_backend_cache = {}
-_attention_backend_warnings = set()
-
-
-def _get_mmgp_attention_backend(requested):
-    requested = str(requested or "automatic").strip().lower()
-    if requested not in _attention_backend_cache:
-        function = _resolve_mmgp_attention_backend(requested)
-        _attention_backend_cache[requested] = function
-        if requested != "automatic" and function is _automatic_attention_function and requested not in _attention_backend_warnings:
-            logger.warning("MMGP attention backend %s is unavailable; using Forge's automatic attention priority", requested)
-            _attention_backend_warnings.add(requested)
-    return _attention_backend_cache[requested]
-
-
-_last_attention_backend = memory_management.mmgp_attention_backend()
-_active_attention_function = _get_mmgp_attention_backend(_last_attention_backend)
-
-
-def _dispatch_attention(*args, **kwargs):
-    global _last_attention_backend, _active_attention_function
-    if not memory_management.MMGP_RUNTIME_ACTIVE and _ATTENTION_OVERRIDE.get() is None:
-        return _automatic_attention_function(*args, **kwargs)
-
-    requested = _ATTENTION_OVERRIDE.get()
-    if requested is None:
-        requested = kwargs.get("force_attention")
-    if requested is None:
-        transformer_options = kwargs.get("transformer_options") or {}
-        requested = transformer_options.get("attention_backend") or transformer_options.get("force_attention")
-    requested = str(requested or memory_management.mmgp_attention_backend()).strip().lower()
-    if requested in {"auto", "automatic", "sol"}:
-        requested = "automatic"
-    if requested != _last_attention_backend:
-        _last_attention_backend = requested
-        _active_attention_function = _get_mmgp_attention_backend(requested)
-    return _active_attention_function(*args, **kwargs)
-
-
-attention_function = _dispatch_attention
-
-
-_ATTENTION_OVERRIDE: ContextVar[str | None] = ContextVar("forge_attention_override", default=None)
-
-
-@contextmanager
-def attention_shared_state(default_attention=None):
-    """Temporarily provide a per-generation attention default."""
-    token = None
-    if _ATTENTION_OVERRIDE.get() is None:
-        token = _ATTENTION_OVERRIDE.set(default_attention or "automatic")
-    try:
-        yield
-    finally:
-        if token is not None:
-            _ATTENTION_OVERRIDE.reset(token)
-
-
-@contextmanager
-def attention_config_shared_state(attention_backend=None):
-    """Temporarily force one attention backend for the current execution context."""
-    token = _ATTENTION_OVERRIDE.set(str(attention_backend or "automatic").strip().lower())
-    try:
-        yield _ATTENTION_OVERRIDE.get()
-    finally:
-        _ATTENTION_OVERRIDE.reset(token)
+attention_function = _automatic_attention_function
 
 
 # region VAE
@@ -979,52 +879,4 @@ else:
     logger.info("Using Slice Attention for VAE")
 
 
-_VAE_ATTENTION_OVERRIDE: ContextVar[str | None] = ContextVar("forge_vae_attention_override", default=None)
-_last_vae_attention_backend = memory_management.mmgp_vae_attention_backend()
-_vae_attention_backend_cache = {}
-
-
-def _resolve_mmgp_vae_attention_backend(requested):
-    requested = str(requested or "automatic").strip().lower()
-    if requested == "sdpa":
-        return pytorch_attention_vae
-    if requested == "xformers" and memory_management.xformers_enabled_vae():
-        return xformers_attention_vae
-    if requested == "slice":
-        return normal_attention_vae
-    return _automatic_vae_attention_function
-
-
-_vae_attention_backend_cache[_last_vae_attention_backend] = _resolve_mmgp_vae_attention_backend(_last_vae_attention_backend)
-_active_vae_attention_function = _vae_attention_backend_cache[_last_vae_attention_backend]
-
-
-def _dispatch_vae_attention(*args, **kwargs):
-    global _last_vae_attention_backend, _active_vae_attention_function
-    if not memory_management.MMGP_RUNTIME_ACTIVE and _VAE_ATTENTION_OVERRIDE.get() is None:
-        return _automatic_vae_attention_function(*args, **kwargs)
-
-    requested = str(_VAE_ATTENTION_OVERRIDE.get() or memory_management.mmgp_vae_attention_backend()).strip().lower()
-    if requested in {"auto", "automatic"}:
-        requested = "automatic"
-    if requested != _last_vae_attention_backend:
-        _last_vae_attention_backend = requested
-        if requested not in _vae_attention_backend_cache:
-            _vae_attention_backend_cache[requested] = _resolve_mmgp_vae_attention_backend(requested)
-        _active_vae_attention_function = _vae_attention_backend_cache[requested]
-        if requested != "automatic" and _active_vae_attention_function is _automatic_vae_attention_function:
-            logger.warning("MMGP VAE attention backend %s is unavailable; using Forge's automatic VAE attention priority", requested)
-    return _active_vae_attention_function(*args, **kwargs)
-
-
-attention_function_vae = _dispatch_vae_attention
-
-
-@contextmanager
-def vae_attention_config_shared_state(attention_backend=None):
-    """Temporarily force one VAE attention backend for the current execution context."""
-    token = _VAE_ATTENTION_OVERRIDE.set(str(attention_backend or "automatic").strip().lower())
-    try:
-        yield _VAE_ATTENTION_OVERRIDE.get()
-    finally:
-        _VAE_ATTENTION_OVERRIDE.reset(token)
+attention_function_vae = _automatic_vae_attention_function

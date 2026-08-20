@@ -11,25 +11,8 @@ from modules.shared import opts
 from modules.ui_components import FormRow
 from modules.ui_gradio_extensions import reload_javascript
 from modules_forge import main_entry
-from modules_forge.mmgp_profiles import MEMORY_SETTING_KEYS, get_memory_profile
 
 CURRENT_ROW: gr.Row = None
-MMGP_UI_SETTING_KEYS = {
-    "forge_memory_profile",
-    "forge_memory_attention_backend",
-    "forge_memory_dynamic_lora_enabled",
-    "forge_memory_persistent_cache_enabled",
-    "forge_memory_cache_directory",
-    *MEMORY_SETTING_KEYS,
-}
-MMGP_MODE_SETTING_KEYS = {"forge_memory_profile", *MEMORY_SETTING_KEYS}
-MMGP_DEPENDENT_SETTING_KEYS = tuple(key for key in MMGP_UI_SETTING_KEYS if key != "forge_memory_management_enabled")
-MMGP_BACKEND_SETTING_KEYS = {"forge_memory_attention_backend", "forge_memory_vae_attention_backend"}
-MMGP_ADVANCED_SETTING_KEYS = {
-    "forge_memory_persistent_cache_enabled",
-    "forge_memory_cache_directory",
-    *(set(MEMORY_SETTING_KEYS) - {"forge_memory_management_enabled"}),
-}
 
 
 def get_value_for_setting(key):
@@ -38,20 +21,12 @@ def get_value_for_setting(key):
     info = opts.data_labels[key]
     args = info.component_args() if callable(info.component_args) else info.component_args or {}
     args = {k: v for k, v in args.items() if k not in {"precision"}}
-    if key in MMGP_BACKEND_SETTING_KEYS and value not in args.get("choices", ()):
-        value = "automatic"
-
     return gr.update(value=value, **args)
 
 
 def create_setting_component(key, is_quicksettings=False):
     def fun():
         value = opts.data[key] if key in opts.data else opts.data_labels[key].default
-        if key in MMGP_BACKEND_SETTING_KEYS:
-            info = opts.data_labels[key]
-            choices_args = info.component_args() if callable(info.component_args) else info.component_args or {}
-            if value not in choices_args.get("choices", ()):
-                value = "automatic"
         return value
 
     info = opts.data_labels[key]
@@ -59,12 +34,6 @@ def create_setting_component(key, is_quicksettings=False):
 
     args = info.component_args() if callable(info.component_args) else info.component_args
     args = dict(args or {})
-
-    # Disable MMGP controls unless --mmgp and the UI master switch are active.
-    if key in MMGP_UI_SETTING_KEYS:
-        args["interactive"] = bool(shared.cmd_opts.mmgp)
-        if key != "forge_memory_management_enabled":
-            args["interactive"] = args["interactive"] and bool(getattr(opts, "forge_memory_management_enabled", False))
 
     if info.component is not None:
         comp = info.component
@@ -122,8 +91,6 @@ class UiSettings:
 
     def run_settings(self, *args):
         changed = []
-        memory_changed = False
-        memory_mode_changed = False
 
         for key, value, comp in zip(opts.data_labels.keys(), args, self.components):
             assert comp == self.dummy_component or opts.same_type(value, opts.data_labels[key].default), f"Bad value for setting {key}: {value}; expecting {type(opts.data_labels[key].default).__name__}"
@@ -136,19 +103,8 @@ class UiSettings:
             if key in ("sd_model_checkpoint", "sd_vae"):
                 continue
 
-            if opts.set(key, value, run_callbacks=key not in MMGP_MODE_SETTING_KEYS):
+            if opts.set(key, value):
                 changed.append(key)
-                if key in MMGP_MODE_SETTING_KEYS:
-                    memory_changed = True
-                    memory_mode_changed |= key in {"forge_memory_management_enabled", "forge_memory_profile"}
-
-        if memory_changed:
-            from modules.initialize_util import apply_memory_mode, configure_memory_features
-
-            if memory_mode_changed:
-                apply_memory_mode()
-            else:
-                configure_memory_features()
 
         try:
             opts.save(shared.config_filename)
@@ -205,7 +161,6 @@ class UiSettings:
             previous_section = None
             current_tab = None
             current_row = None
-            mmgp_advanced = None
             with gr.Tabs(elem_id="settings"):
                 for i, (k, item) in enumerate(opts.data_labels.items()):
                     section_must_be_skipped = item.section[0] is None
@@ -213,9 +168,6 @@ class UiSettings:
                     if previous_section != item.section and not section_must_be_skipped:
                         elem_id, text = item.section
 
-                        if mmgp_advanced is not None:
-                            mmgp_advanced.__exit__()
-                            mmgp_advanced = None
                         if current_tab is not None:
                             current_row.__exit__()
                             current_tab.__exit__()
@@ -229,14 +181,6 @@ class UiSettings:
 
                         previous_section = item.section
 
-                    is_mmgp_advanced = item.section[0] == "memory-management" and k in MMGP_ADVANCED_SETTING_KEYS
-                    if mmgp_advanced is not None and not is_mmgp_advanced:
-                        mmgp_advanced.__exit__()
-                        mmgp_advanced = None
-                    if is_mmgp_advanced and mmgp_advanced is None:
-                        mmgp_advanced = gr.Accordion("Advanced MMGP controls", open=False, elem_id="settings_mmgp_advanced")
-                        mmgp_advanced.__enter__()
-
                     if k in self.quicksettings_names and not shared.cmd_opts.freeze_settings:
                         self.quicksettings_list.append((i, k, item))
                         self.components.append(dummy_component)
@@ -248,8 +192,6 @@ class UiSettings:
                         self.components.append(component)
 
                 if current_tab is not None:
-                    if mmgp_advanced is not None:
-                        mmgp_advanced.__exit__()
                     current_row.__exit__()
                     current_tab.__exit__()
 
@@ -277,10 +219,6 @@ class UiSettings:
                     with gr.Row():
                         calculate_all_checkpoint_hash = gr.Button(value="Calculate hash for all checkpoint", elem_id="calculate_all_checkpoint_hash")
                         calculate_all_checkpoint_hash_threads = gr.Number(value=1, label="Number of parallel calculations", elem_id="calculate_all_checkpoint_hash_threads", precision=0, minimum=1)
-                    with gr.Row():
-                        mmgp_export_directory = gr.Textbox(value="", label="MMGP export directory (blank = configured cache/exports)", elem_id="mmgp_export_directory")
-                        mmgp_export_models = gr.Button(value="Export loaded MMGP models", elem_id="mmgp_export_models", interactive=bool(shared.cmd_opts.mmgp))
-                        mmgp_cache_status = gr.Button(value="MMGP cache status", elem_id="mmgp_cache_status", interactive=bool(shared.cmd_opts.mmgp))
 
                 with gr.TabItem("Licenses", id="licenses", elem_id="settings_tab_licenses") as license_tab:
                     gr.HTML(shared.html("licenses.html"), elem_id="licenses")
@@ -300,43 +238,6 @@ class UiSettings:
                 ]
             )
             gr.Textbox(value=json.dumps(settings_tab_metadata), elem_id="settings_nav_data", visible=False)
-
-            profile_component = self.component_dict.get("forge_memory_profile")
-            profile_outputs = [self.component_dict[key] for key in MEMORY_SETTING_KEYS if key in self.component_dict]
-
-            if profile_component is not None and profile_outputs:
-                def apply_memory_profile(profile):
-                    values = get_memory_profile(profile)
-                    if values is None:
-                        return [gr.skip()] * len(profile_outputs)
-                    return [values[key] for key in MEMORY_SETTING_KEYS if key in self.component_dict]
-
-                profile_component.change(
-                    fn=apply_memory_profile,
-                    inputs=[profile_component],
-                    outputs=profile_outputs,
-                    queue=False,
-                    show_progress=False,
-                )
-
-            mmgp_master = self.component_dict.get("forge_memory_management_enabled")
-            mmgp_dependents = [
-                self.component_dict[key]
-                for key in MMGP_DEPENDENT_SETTING_KEYS
-                if key in self.component_dict
-            ]
-            if mmgp_master is not None and mmgp_dependents:
-                def update_mmgp_controls(enabled):
-                    interactive = bool(enabled and shared.cmd_opts.mmgp)
-                    return [gr.update(interactive=interactive) for _ in mmgp_dependents]
-
-                mmgp_master.change(
-                    fn=update_mmgp_controls,
-                    inputs=[mmgp_master],
-                    outputs=mmgp_dependents,
-                    queue=False,
-                    show_progress=False,
-                )
 
             def call_func_and_return_text(func, text):
                 def handler():
@@ -399,21 +300,6 @@ class UiSettings:
             calculate_all_checkpoint_hash.click(
                 fn=calculate_all_checkpoint_hash_fn,
                 inputs=[calculate_all_checkpoint_hash_threads],
-            )
-
-            from backend import mmgp_cache
-
-            mmgp_export_models.click(
-                fn=mmgp_cache.export_loaded_models,
-                inputs=[mmgp_export_directory],
-                outputs=[self.result],
-                show_progress="full",
-            )
-            mmgp_cache_status.click(
-                fn=mmgp_cache.status,
-                inputs=[],
-                outputs=[self.result],
-                show_progress=False,
             )
 
         self.interface = settings_interface

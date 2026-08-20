@@ -213,7 +213,7 @@ class VAE:
                 memory_management.logger.warning("FP8 VAE storage was unavailable; using %s instead: %s", self.vae_dtype, e)
         self.output_device = memory_management.intermediate_device()
 
-        self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device, memory_component="vae")
+        self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
         self.is_wan = is_wan
 
     def clone(self):

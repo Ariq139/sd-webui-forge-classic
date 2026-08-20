@@ -1,7 +1,6 @@
 GitPython==3.1.58
 Pillow==11.3.0
 accelerate==1.14.0
-mmgp==3.7.12
 optimum-quanto==0.2.7
 audioop-lts==0.2.2;python_version>="3.13"
 av==18.0.0

@@ -311,10 +311,7 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
         logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
 
-    from backend.memory_management import mmgp_runtime_enabled
-
-    mmgp_dynamic_lora = bool(getattr(shared.opts, "forge_memory_dynamic_lora_enabled", True) and mmgp_runtime_enabled())
-    online_lora = lora_fp16 or mmgp_dynamic_lora
+    online_lora = lora_fp16
     parameters_changed = model_data.forge_loading_parameters != loading_parameters
     lora_mode_changed = dynamic_args.online_lora != online_lora
     model_data.forge_loading_parameters = loading_parameters
@@ -322,7 +319,7 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
     if not parameters_changed and not lora_mode_changed:
         return
 
-    logger.info(f"Patch LoRAs on-the-fly: {online_lora} (fp16={lora_fp16}, mmgp_dynamic={mmgp_dynamic_lora})")
+    logger.info(f"Patch LoRAs on-the-fly: {online_lora} (fp16={lora_fp16})")
     if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
         logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
 

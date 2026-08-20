@@ -57,7 +57,7 @@ class ClipVisionModel:
                 self.model = CLIPVisionModelWithProjection(config)
 
         self.model.to(self.offload_device, self.dtype)
-        self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device, memory_component="text_encoder")
+        self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device)
 
     def load_sd(self, sd):
         return self.model.load_state_dict(sd, strict=False)

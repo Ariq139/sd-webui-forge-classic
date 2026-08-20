@@ -17,16 +17,6 @@ def initialize():
     except FileNotFoundError:
         pass
 
-    from modules_forge.mmgp_profiles import get_mmgp_quantization, get_mmgp_residency_components
-
-    # Populate merged MMGP settings from older config keys before the settings
-    # UI is built, so applying an unrelated setting cannot reset them.
-    if "forge_memory_quantization" not in shared.opts.data:
-        quantize, quantization_type = get_mmgp_quantization(shared.opts)
-        shared.opts.data["forge_memory_quantization"] = quantization_type if quantize else "disabled"
-    if "forge_memory_residency_components" not in shared.opts.data:
-        shared.opts.data["forge_memory_residency_components"] = get_mmgp_residency_components(shared.opts)
-
     from modules import devices
     shared.device = devices.device
 

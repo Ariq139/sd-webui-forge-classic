@@ -30,7 +30,7 @@ def repeat_kv_for_gqa(k: torch.Tensor, v: torch.Tensor, query_heads: int, head_d
 
 
 def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not memory_management.MMGP_RUNTIME_ACTIVE:
+    if not memory_management.attention_dtype_alignment_enabled():
         return q, k, v
     if q.dtype == k.dtype == v.dtype:
         return q, k, v
@@ -47,14 +47,24 @@ def match_attention_dtypes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
     return tuple(t if t.dtype == target_dtype else t.to(target_dtype) for t in (q, k, v))
 
 
+def _attention_dtype_hint(error: RuntimeError) -> RuntimeError:
+    message = str(error)
+    lowered = message.lower()
+    if "dtype" in lowered and all(term in lowered for term in ("query", "key", "value")):
+        message += " Enable Settings > Memory Management > Enable mixed-dtype attention alignment to convert mismatched Q/K/V dtypes."
+    return RuntimeError(message)
+
+
 def scaled_dot_product_attention(q, k, v, *args, **kwargs):
-    if memory_management.MMGP_RUNTIME_ACTIVE:
-        q, k, v = match_attention_dtypes(q, k, v)
+    q, k, v = match_attention_dtypes(q, k, v)
     attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
     if kwargs.get("enable_gqa", False) and attn_mask is not None:
         k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
         kwargs["enable_gqa"] = False
-    return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
+    try:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
+    except RuntimeError as error:
+        raise _attention_dtype_hint(error) from error
 
 
 try:
@@ -70,8 +80,7 @@ try:
             ]
 
             def scaled_dot_product_attention(q, k, v, *args, **kwargs):
-                if memory_management.MMGP_RUNTIME_ACTIVE:
-                    q, k, v = match_attention_dtypes(q, k, v)
+                q, k, v = match_attention_dtypes(q, k, v)
                 attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
                 if kwargs.get("enable_gqa", False) and attn_mask is not None and not memory_management.is_nvidia():
                     k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
@@ -85,7 +94,10 @@ try:
                         if not supports_native_gqa:
                             k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
                             kwargs["enable_gqa"] = False
-                    return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
+                    try:
+                        return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
+                    except RuntimeError as error:
+                        raise _attention_dtype_hint(error) from error
 
 except Exception:
     pass

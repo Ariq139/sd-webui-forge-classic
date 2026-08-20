@@ -14,9 +14,9 @@ class UnetPatcher(ModelPatcher):
     def from_model(cls, model, diffusers_scheduler, config, *, k_predictor=None):
         model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, config=config)
         if isinstance(model.diffusion_model, NunchakuModelMixin):
-            return NunchakuPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device, memory_component="unet")
+            return NunchakuPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device)
         else:
-            return UnetPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device, memory_component="unet")
+            return UnetPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,7 +53,7 @@ class UnetPatcher(ModelPatcher):
         if cast_to_unet_dtype:
             m.to(self.model.diffusion_model.dtype)
 
-        patcher = ModelPatcher(model=m, load_device=self.load_device, offload_device=self.offload_device, memory_component="unet")
+        patcher = ModelPatcher(model=m, load_device=self.load_device, offload_device=self.offload_device)
         self.add_extra_model_patcher_during_sampling(patcher)
         return patcher
 
