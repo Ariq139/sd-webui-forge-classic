@@ -1,11 +1,13 @@
 import logging
 import os.path
+import sys
 
 import gradio as gr
 import torch
 from gradio.context import Context
 from rich import print_json
 
+from backend import memory_management
 from backend.args import dynamic_args
 from backend.logging import setup_logger
 from modules import (
@@ -27,6 +29,7 @@ ui_forge_preset: gr.Radio
 ui_checkpoint: gr.Dropdown
 ui_vae: gr.Dropdown
 ui_forge_unet_dtype: gr.Radio
+ui_forge_vram_mode: gr.Dropdown
 native_tabs: dict[str, gr.TabItem] = {}
 
 forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
@@ -94,8 +97,57 @@ def valid_module_values(values, choices: list[tuple[str, str]]) -> list[str]:
     return [os.path.basename(value) for value in values or [] if os.path.basename(value) in valid]
 
 
+def vram_mode_update():
+    locked_mode = memory_management.commandline_vram_mode()
+    mode = locked_mode or memory_management.normalize_vram_mode(getattr(shared.opts, "forge_vram_mode", "Automatic"))
+    if locked_mode is None:
+        memory_management.set_vram_mode(mode)
+    return gr.update(value=mode, choices=memory_management.vram_mode_choices(), interactive=locked_mode is None)
+
+
+def unload_for_vram_mode_change():
+    """Unload Forge and native pipelines before changing placement policy."""
+    from modules import sd_models
+
+    try:
+        sd_models.unload_model_weights()
+    except Exception:
+        logger.debug("Forge model cleanup during VRAM mode change failed", exc_info=True)
+
+    for module_name in ("modules.ui_ltx2_video", "modules.ui_ideogram"):
+        try:
+            module = sys.modules.get(module_name)
+            if module is not None:
+                module.unload()
+        except Exception:
+            logger.debug("Native pipeline cleanup during VRAM mode change failed for %s", module_name, exc_info=True)
+
+    memory_management.unload_all_models()
+    memory_management.soft_empty_cache(force=True)
+    processing.need_global_unload = True
+
+
+def vram_mode_change(mode: str, save: bool = True) -> bool:
+    locked_mode = memory_management.commandline_vram_mode()
+    if locked_mode is not None:
+        return False
+
+    mode = memory_management.normalize_vram_mode(mode)
+    if save and getattr(shared.opts, "forge_vram_mode", "Automatic") != mode:
+        shared.opts.set("forge_vram_mode", mode)
+        shared.opts.save(shared.config_filename)
+
+    if memory_management.vram_mode_state(mode) is memory_management.vram_state:
+        return True
+
+    logger.info("Unloading models before applying VRAM mode: %s", mode)
+    unload_for_vram_mode_change()
+    memory_management.set_vram_mode(mode)
+    return True
+
+
 def make_checkpoint_manager_ui():
-    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype
+    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_vram_mode
 
     if shared.opts.sd_model_checkpoint in [None, "None", "none", ""]:
         if len(sd_models.checkpoints_list) == 0:
@@ -169,9 +221,21 @@ def make_checkpoint_manager_ui():
         elem_id="forge_ui_dtype",
     )
 
+    initial_vram_mode = memory_management.commandline_vram_mode() or memory_management.normalize_vram_mode(getattr(shared.opts, "forge_vram_mode", "Automatic"))
+    ui_forge_vram_mode = gr.Dropdown(
+        label="VRAM Mode",
+        value=initial_vram_mode,
+        choices=memory_management.vram_mode_choices(),
+        interactive=memory_management.commandline_vram_mode() is None,
+        elem_id="forge_vram_mode",
+    )
+    if memory_management.commandline_vram_mode() is None:
+        memory_management.set_vram_mode(initial_vram_mode)
+
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
     ui_forge_unet_dtype.input(dtype_change, inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
+    ui_forge_vram_mode.change(vram_mode_change, inputs=[ui_forge_vram_mode], queue=False, show_progress=False)
 
 
 def checkpoint_label(preset: str) -> str:
@@ -491,6 +555,7 @@ def forge_main_entry():
         ui_checkpoint,
         ui_vae,
         ui_forge_unet_dtype,
+        ui_forge_vram_mode,
         ui_txt2img_steps,
         ui_txt2img_hr_steps,
         ui_img2img_steps,
@@ -635,7 +700,7 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
         i2i_batch_count_args["value"] = 1
 
     return [
-        # ui_checkpoint, ui_vae, ui_forge_unet_dtype
+        # ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_vram_mode
         gr.update(
             value=checkpoint_value_for_preset(preset, checkpoint_list),
             choices=checkpoint_list,
@@ -644,6 +709,7 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
         ),
         module_dropdown_update(preset),
         gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic"), visible=not native_pipeline, interactive=not native_pipeline),
+        vram_mode_update(),
         # ui_txt2img_steps, ui_txt2img_hr_steps, ui_img2img_steps
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_step", 20)) > 0 else gr.skip(),
         gr.update(value=v, visible=not native_pipeline, interactive=not native_pipeline) if (v := getattr(shared.opts, f"{preset}_t2i_hr_step", 20)) > 0 else gr.skip(),

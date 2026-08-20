@@ -794,6 +794,29 @@ def manage_model_and_prompt_cache(p: StableDiffusionProcessing):
     need_global_unload = False
 
 
+def _extra_network_signature(prompt: str):
+    """Return a stable signature for the extra networks in one resolved prompt."""
+    _, extra_data = extra_networks.parse_prompt(prompt)
+    return tuple(
+        (name, tuple(tuple(params.items) for params in params_list))
+        for name, params_list in extra_data.items()
+    )
+
+
+def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
+    """Do not apply different per-image LoRA sets to one shared model batch."""
+    if p.disable_extra_networks or p.batch_size <= 1 or len(p.all_prompts or ()) <= 1:
+        return
+
+    signatures = {_extra_network_signature(prompt) for prompt in p.all_prompts}
+    if len(signatures) <= 1:
+        return
+
+    logger.info("Different extra-network selections detected; processing one image per batch.")
+    p.batch_size = 1
+    p.n_iter = len(p.all_prompts)
+
+
 def apply_model_capabilities(p: StableDiffusionProcessing):
     """Normalize stale UI/API values against the loaded model's detected config."""
     capabilities = get_capabilities(getattr(opts, "forge_preset", "sd"), model=p.sd_model)
@@ -957,6 +980,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     # Scripts such as Dynamic Prompts replace all_prompts with the expanded
     # per-image values; keep the original template in prompt_template for grids.
+    _split_batches_for_extra_networks(p)
     infotexts = []
     output_images = []
     generated_prompts = []

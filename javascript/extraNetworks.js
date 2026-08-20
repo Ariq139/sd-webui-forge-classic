@@ -169,10 +169,12 @@ function setupExtraNetworksForTab(tabname) {
             });
             // The controls live inside Gradio's tablist. Stop the tablist
             // handler from stealing focus when the search field is touched.
-            ["mousedown", "mouseup", "click", "touchstart", "touchend"].forEach(function (eventName) {
+            // Capture the pointer/touch events as well: mobile browsers may
+            // dispatch pointer events before the compatibility mouse events.
+            ["pointerdown", "pointerup", "pointercancel", "mousedown", "mouseup", "click", "touchstart", "touchend", "keydown"].forEach(function (eventName) {
                 search.addEventListener(eventName, function (event) {
                     event.stopPropagation();
-                });
+                }, true);
             });
             search.dataset.extraNetworksBound = "true";
         }
@@ -228,6 +230,13 @@ function extraNetworksMovePromptToTab(tabname, id, showPrompt, showNegativePromp
 }
 
 function extraNetworksNormalizeTabNav(tabname) {
+    // Mobile browsers resize the viewport when the keyboard opens. Do not
+    // reparent the controls while a search field owns focus: moving its
+    // ancestor can blur the field and dismiss the keyboard.
+    if (document.activeElement?.matches?.("input[id$='_extra_search']")) {
+        return;
+    }
+
     let extraTabs = gradioApp().getElementById(tabname + "_extra_tabs");
     let tabnav = extraTabs?.querySelector(":scope > .tab-wrapper > [role='tablist']") || extraTabs?.querySelector("[role='tablist']");
     let controls = tabnav?.querySelector(":scope > .extra-networks-controls-div");
@@ -291,6 +300,10 @@ let extraNetworksApplySort = {};
 let activePromptTextarea = {};
 
 window.addEventListener("resize", function () {
+    if (document.activeElement?.matches?.("input[id$='_extra_search']")) {
+        return;
+    }
+
     extraNetworksNormalizeTabNav("txt2img");
     extraNetworksNormalizeTabNav("img2img");
 });
@@ -712,10 +725,16 @@ function extraNetworksControlRefreshOnClick(event, tabname, extra_networks_tabna
      * @param tabname                   The name of the active tab in the sd webui. Ex: txt2img, img2img, etc.
      * @param extra_networks_tabname    The id of the active extraNetworks tab. Ex: lora, checkpoints, etc.
      */
-    let btn_refresh_internal = gradioApp().getElementById(
+    event?.preventDefault();
+    event?.stopPropagation();
+
+    let refresh_component = extraNetworksFindElementById(
         tabname + "_" + extra_networks_tabname + "_extra_refresh_internal",
     );
-    if (btn_refresh_internal) {
+    let btn_refresh_internal = refresh_component?.matches("button")
+        ? refresh_component
+        : refresh_component?.querySelector("button") || refresh_component;
+    if (btn_refresh_internal && typeof btn_refresh_internal.click === "function") {
         // Use a real bubbling click so Gradio's delegated handler sees it.
         btn_refresh_internal.click();
     }

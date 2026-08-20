@@ -62,6 +62,65 @@ class CPUState(Enum):
     MPS = 2
 
 
+VRAM_MODE_CHOICES = ("Automatic", "High VRAM", "Normal VRAM", "Low VRAM", "No VRAM")
+_VRAM_MODE_STATES = {
+    "Automatic": VRAMState.NORMAL_VRAM,
+    "High VRAM": VRAMState.HIGH_VRAM,
+    "Normal VRAM": VRAMState.NORMAL_VRAM,
+    "Low VRAM": VRAMState.LOW_VRAM,
+    "No VRAM": VRAMState.NO_VRAM,
+}
+
+
+def commandline_vram_mode() -> str | None:
+    """Return the immutable VRAM mode selected by an explicit startup flag."""
+    if args.cpu:
+        return "CPU"
+    if args.gpu_only:
+        return "GPU Only"
+    if args.highvram:
+        return "High VRAM"
+    if args.lowvram:
+        return "Low VRAM"
+    if args.novram:
+        return "No VRAM"
+    return None
+
+
+def vram_mode_choices() -> list[str]:
+    locked_mode = commandline_vram_mode()
+    return [locked_mode] if locked_mode is not None else list(VRAM_MODE_CHOICES)
+
+
+def normalize_vram_mode(mode: str | None) -> str:
+    if mode in _VRAM_MODE_STATES:
+        return mode
+    return "Automatic"
+
+
+def vram_mode_state(mode: str | None) -> VRAMState:
+    return _VRAM_MODE_STATES[normalize_vram_mode(mode)]
+
+
+def set_vram_mode(mode: str | None) -> bool:
+    """Apply a UI VRAM mode; explicit startup flags remain authoritative."""
+    global vram_state
+
+    locked_mode = commandline_vram_mode()
+    mode = locked_mode or normalize_vram_mode(mode)
+    if locked_mode is not None:
+        return False
+
+    new_state = vram_mode_state(mode)
+    if vram_state is new_state:
+        return False
+
+    old_state = vram_state
+    vram_state = new_state
+    logger.info("VRAM mode changed: %s -> %s", old_state.name, new_state.name)
+    return True
+
+
 # Determine VRAM State
 lowvram_available = True
 vram_state = VRAMState.NORMAL_VRAM

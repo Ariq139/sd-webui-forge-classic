@@ -9,6 +9,7 @@ def register(options_templates, options_section, OptionInfo):
                 "forge_preset": OptionInfo("sd"),
                 "forge_additional_modules": OptionInfo([]),
                 "forge_unet_storage_dtype": OptionInfo("Automatic"),
+                "forge_vram_mode": OptionInfo("Automatic"),
             },
         )
     )
