@@ -715,7 +715,7 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
 
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_vram_mode
-        gr.update(
+        gr.skip() if checkpoint_override is not None else gr.update(
             value=checkpoint_value_for_preset(preset, checkpoint_list),
             choices=checkpoint_list,
             label=checkpoint_label(preset),
