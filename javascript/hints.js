@@ -5,7 +5,7 @@ const titles = {
     "Schedule Type": "The algorithm used to adjust the magnitude of refinement",
     "Sampling Steps": "The number of times the image is iteratively refined",
 
-    "Batch Count": "How many batches of images to generate (in sequence)",
+    "Batch Count": "How many batches of images to generate (in sequence); set to 0 for infinite generation",
     "Batch Size": "How many images to generate in a single batch (in parallel)",
     "Frames": "How many frames to generate for the video",
 

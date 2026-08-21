@@ -6,7 +6,7 @@ from comfy_kitchen.tensor import (  # noqa
     AsymW4A8Int8Layout,
     QuantizedTensor,
     TensorCoreConvRotW4A4Layout,
-    TensorCoreFP8Layout,
+    TensorCoreFP8Layout as _CKTensorCoreFP8Layout,
     TensorCoreMXFP8Layout,
     TensorCoreNVFP4Layout,
     TensorWiseINT8Layout,
@@ -41,9 +41,52 @@ print(f"Comfy-Kitchen {ver}:", {k: v["available"] and not v["disabled"] for k, v
 # region Registry
 
 
+class _TensorCoreFP8LayoutBase(_CKTensorCoreFP8Layout):
+    """Keep Comfy's E4M3/E5M2 layouts distinct when re-quantizing weights."""
+
+    FP8_DTYPE = None
+
+    @classmethod
+    def quantize(cls, tensor, scale=None, stochastic_rounding=0, inplace_ops=False):
+        if cls.FP8_DTYPE is None:
+            raise NotImplementedError(f"{cls.__name__} must define FP8_DTYPE")
+
+        orig_dtype = tensor.dtype
+        orig_shape = tuple(tensor.shape)
+        if isinstance(scale, str) and scale == "recalculate":
+            scale = torch.amax(tensor.abs()).to(dtype=torch.float32) / torch.finfo(cls.FP8_DTYPE).max
+            if tensor.dtype not in (torch.float32, torch.bfloat16):
+                tensor_info = torch.finfo(tensor.dtype)
+                scale = 1.0 / torch.clamp(1.0 / scale, min=tensor_info.min, max=tensor_info.max)
+        if scale is None:
+            scale = torch.ones((), device=tensor.device, dtype=torch.float32)
+        elif not isinstance(scale, torch.Tensor):
+            scale = torch.tensor(scale, device=tensor.device, dtype=torch.float32)
+
+        if stochastic_rounding > 0:
+            scaled = tensor * (1.0 / scale).to(tensor.dtype)
+            qdata = globals()["stochastic_rounding"](scaled, dtype=cls.FP8_DTYPE, seed=stochastic_rounding)
+        else:
+            qdata = ck.quantize_per_tensor_fp8(tensor, scale, cls.FP8_DTYPE)
+
+        return qdata, cls.Params(scale=scale.float(), orig_dtype=orig_dtype, orig_shape=orig_shape)
+
+
+class TensorCoreFP8E4M3Layout(_TensorCoreFP8LayoutBase):
+    FP8_DTYPE = torch.float8_e4m3fn
+
+
+class TensorCoreFP8E5M2Layout(_TensorCoreFP8LayoutBase):
+    FP8_DTYPE = torch.float8_e5m2
+
+
+# Backward-compatible default used by older Forge metadata.
+TensorCoreFP8Layout = TensorCoreFP8E4M3Layout
+
+
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
-register_layout_class("TensorCoreFP8E4M3Layout", TensorCoreFP8Layout)
-register_layout_class("TensorCoreFP8E5M2Layout", TensorCoreFP8Layout)
+register_layout_class("TensorCoreFP8E4M3Layout", TensorCoreFP8E4M3Layout)
+register_layout_class("TensorCoreFP8E5M2Layout", TensorCoreFP8E5M2Layout)
 register_layout_class("TensorCoreNVFP4Layout", TensorCoreNVFP4Layout)
 register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
 register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)

@@ -242,7 +242,7 @@ def create_ui():
 
                             if opts.dimensions_and_batch_together:
                                 with gr.Column(elem_id="txt2img_column_batch"):
-                                    batch_count = gr.Slider(minimum=1, maximum=128, step=1, label="Batch Count", value=1, elem_id="txt2img_batch_count")
+                                    batch_count = gr.Slider(minimum=0, maximum=128, step=1, label="Batch Count", info="Set to 0 for infinite generation.", value=1, elem_id="txt2img_batch_count")
                                     batch_size = gr.Slider(minimum=1, maximum=8, step=1, label="Batch Size", value=1, elem_id="txt2img_batch_size")
 
                     elif category == "cfg":
@@ -319,7 +319,7 @@ def create_ui():
                     elif category == "batch":
                         if not opts.dimensions_and_batch_together:
                             with FormRow(elem_id="txt2img_column_batch"):
-                                batch_count = gr.Slider(minimum=1, maximum=128, step=1, label="Batch Count", value=1, elem_id="txt2img_batch_count")
+                                batch_count = gr.Slider(minimum=0, maximum=128, step=1, label="Batch Count", info="Set to 0 for infinite generation.", value=1, elem_id="txt2img_batch_count")
                                 batch_size = gr.Slider(minimum=1, maximum=8, step=1, label="Batch Size", value=1, elem_id="txt2img_batch_size")
                                 batch_size.do_not_save_to_config = True
 
@@ -646,7 +646,7 @@ def create_ui():
 
                             if opts.dimensions_and_batch_together:
                                 with gr.Column(elem_id="img2img_column_batch"):
-                                    batch_count = gr.Slider(minimum=1, maximum=128, step=1, label="Batch Count", value=1, elem_id="img2img_batch_count")
+                                    batch_count = gr.Slider(minimum=0, maximum=128, step=1, label="Batch Count", info="Set to 0 for infinite generation.", value=1, elem_id="img2img_batch_count")
                                     batch_size = gr.Slider(minimum=1, maximum=8, step=1, label="Batch Size", value=1, elem_id="img2img_batch_size")
 
                     elif category == "denoising":
@@ -667,7 +667,7 @@ def create_ui():
                     elif category == "batch":
                         if not opts.dimensions_and_batch_together:
                             with FormRow(elem_id="img2img_column_batch"):
-                                batch_count = gr.Slider(minimum=1, maximum=128, step=1, label="Batch Count", value=1, elem_id="img2img_batch_count")
+                                batch_count = gr.Slider(minimum=0, maximum=128, step=1, label="Batch Count", info="Set to 0 for infinite generation.", value=1, elem_id="img2img_batch_count")
                                 batch_size = gr.Slider(minimum=1, maximum=8, step=1, label="Batch Size", value=1, elem_id="img2img_batch_size")
                                 batch_size.do_not_save_to_config = True
 

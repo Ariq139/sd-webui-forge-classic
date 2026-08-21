@@ -135,8 +135,59 @@ def _ensure_nvfp4_markers(state_dict: dict[str, torch.Tensor]) -> bool:
     return found
 
 
+def _ensure_quantization_markers(state_dict: dict[str, torch.Tensor]) -> bool:
+    """Recover markers from common native quantized tensor signatures."""
+    found = _ensure_nvfp4_markers(state_dict)
+    fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    mxfp8_scale_dtype = getattr(torch, "float8_e8m0fnu", None)
+
+    for weight_key in list(state_dict):
+        if not weight_key.endswith(".weight"):
+            continue
+
+        weight = state_dict.get(weight_key)
+        if not isinstance(weight, torch.Tensor):
+            continue
+
+        layer = weight_key[: -len("weight")]
+        marker_key = f"{layer}comfy_quant"
+        if marker_key in state_dict:
+            continue
+
+        scale = state_dict.get(f"{layer}weight_scale")
+        scale_2 = state_dict.get(f"{layer}weight_scale_2")
+        relative_scale = state_dict.get(f"{layer}weight_s_rel")
+        channel_scale = state_dict.get(f"{layer}weight_s_channel")
+        quant_format = None
+
+        if weight.dtype == torch.uint8 and weight.ndim == 2 and scale_2 is not None and scale is not None:
+            quant_format = "nvfp4"
+        elif weight.dtype == torch.int8 and relative_scale is not None and channel_scale is not None:
+            quant_format = "asym_w4a8_int8"
+        elif mxfp8_scale_dtype is not None and isinstance(scale, torch.Tensor) and scale.dtype == mxfp8_scale_dtype:
+            quant_format = "mxfp8"
+        elif weight.dtype == torch.float8_e4m3fn and isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8 and scale.ndim == 2:
+            quant_format = "mxfp8"
+        elif weight.dtype in fp8_dtypes and scale is not None:
+            quant_format = "float8_e5m2" if weight.dtype == torch.float8_e5m2 else "float8_e4m3fn"
+        elif weight.dtype == torch.int8 and scale is not None:
+            quant_format = "int8_tensorwise"
+        elif weight.dtype == torch.uint8 and scale is not None:
+            # Legacy FP8 exporters stored the raw bytes in uint8 tensors.
+            quant_format = "float8_e4m3fn"
+
+        if quant_format is None:
+            continue
+
+        marker = json.dumps({"format": quant_format}).encode("utf-8")
+        state_dict[marker_key] = torch.tensor(list(marker), dtype=torch.uint8)
+        found = True
+
+    return found
+
+
 def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
-    _ensure_nvfp4_markers(state_dict)
+    _ensure_quantization_markers(state_dict)
     if any(k.endswith(".comfy_quant") for k in state_dict):
         return {"mixed_ops": True, "TE": not is_unet}
     return None

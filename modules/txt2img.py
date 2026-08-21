@@ -17,6 +17,13 @@ from modules_forge.presets import get_capabilities
 
 
 def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, negative_prompt: str, prompt_styles, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, height: int, width: int, enable_hr: bool, denoising_strength: float, hr_scale: float, hr_upscaler: str, hr_second_pass_steps: int, hr_resize_x: int, hr_resize_y: int, hr_checkpoint_name: str, hr_additional_modules: list, hr_sampler_name: str, hr_scheduler: str, hr_prompt: str, hr_negative_prompt, hr_cfg: float, hr_distilled_cfg: float, override_settings_texts, *args, force_enable_hr=False):
+    try:
+        n_iter = int(n_iter)
+    except (TypeError, ValueError):
+        n_iter = 1
+    infinite_generation = n_iter == 0
+    n_iter = max(1, n_iter)
+
     capabilities = get_capabilities(
         opts.forge_preset,
         getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
@@ -33,6 +40,7 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
         enable_hr = False
     if not capabilities["txt2img_batch_count"]:
         n_iter = 1
+        infinite_generation = False
     if not capabilities["txt2img_batch_size"]:
         batch_size = 1
 
@@ -49,6 +57,7 @@ def txt2img_create_processing(id_task: str, request: gr.Request, prompt: str, ne
         negative_prompt=negative_prompt,
         batch_size=batch_size,
         n_iter=n_iter,
+        infinite_generation=infinite_generation,
         cfg_scale=cfg_scale,
         distilled_cfg_scale=distilled_cfg_scale,
         width=width,
@@ -111,6 +120,7 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
 
     # txt2img_upscale attribute that signifies this is called by txt2img_upscale
     p.txt2img_upscale = True
+    p.infinite_generation = False
 
     image_info = gallery[gallery_index]
     p.firstpass_image = infotext_utils.image_from_url_text(image_info)
@@ -167,7 +177,7 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
     if opts.forge_preset == "ltx2":
         from modules.ui_ltx2_video import generate_from_preset
 
-        if int(args[4] or 1) > 1:
+        if int(args[4] or 1) != 1:
             status = "LTX-2.3 shared txt2img supports one video per request; set Batch Count to 1."
             return gr.update(value=None, visible=False), gr.update(value=None, visible=False), json.dumps({"infotexts": [status]}), plaintext_to_html(status), ""
 
@@ -194,6 +204,10 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
         )
 
     if opts.forge_preset == "ideogram":
+        if int(args[4] or 1) == 0:
+            status = "Ideogram does not support infinite generation through the shared txt2img page."
+            return gr.update(value=None, visible=False), gr.update(value=None, visible=False), json.dumps({"infotexts": [status]}), plaintext_to_html(status), ""
+
         from modules.ui_ideogram import generate_from_preset
 
         prompt = args[1]

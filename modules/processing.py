@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -159,6 +160,7 @@ class StableDiffusionProcessing:
     scheduler: str = None
     batch_size: int = 1
     n_iter: int = 1
+    infinite_generation: bool = False
     steps: int = 50
     cfg_scale: float = 7.0
     distilled_cfg_scale: float = 3.5
@@ -812,9 +814,55 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     if len(signatures) <= 1:
         return
 
+    if p.infinite_generation:
+        logger.info("Different extra-network selections detected; infinite generation will process one image per batch.")
+        p.batch_size = 1
+        return
+
     logger.info("Different extra-network selections detected; processing one image per batch.")
     p.batch_size = 1
     p.n_iter = len(p.all_prompts)
+
+
+def _prompts_for_infotext(prompts):
+    """Keep expanded prompt choices in metadata without extra-network tags."""
+    return [extra_networks.parse_prompt(prompt or "")[0] for prompt in prompts]
+
+
+def _refresh_infinite_batch(p: StableDiffusionProcessing):
+    """Refresh one prompt batch without building an unbounded prompt list."""
+    prompt_script = getattr(p, "_infinite_prompt_script", None)
+    if prompt_script is not None and hasattr(prompt_script, "process_infinite_batch"):
+        p.all_prompts = [p.prompt]
+        p.all_negative_prompts = [p.negative_prompt]
+        p.n_iter = 1
+        prompt_script.process_infinite_batch(p)
+        _split_batches_for_extra_networks(p)
+
+    base_prompt = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else p.prompt
+    base_negative_prompt = p.negative_prompt[0] if isinstance(p.negative_prompt, list) and p.negative_prompt else p.negative_prompt
+    prompts = list((p.all_prompts or [base_prompt])[: p.batch_size])
+    negative_prompts = list((p.all_negative_prompts or [base_negative_prompt])[: p.batch_size])
+    if not prompts:
+        prompts = [base_prompt]
+    if not negative_prompts:
+        negative_prompts = [base_negative_prompt]
+    while len(prompts) < p.batch_size:
+        prompts.append(prompts[-1])
+    while len(negative_prompts) < p.batch_size:
+        negative_prompts.append(negative_prompts[-1])
+
+    base_seeds = getattr(p, "_infinite_base_seeds", None)
+    base_subseeds = getattr(p, "_infinite_base_subseeds", None)
+    if not base_seeds:
+        base_seeds = list(p.seed) if isinstance(p.seed, list) else [int(p.seed)]
+    if not base_subseeds:
+        base_subseeds = list(p.subseed) if isinstance(p.subseed, list) else [int(p.subseed)]
+    offset = p.iteration * p.batch_size
+    p.all_prompts = prompts
+    p.all_negative_prompts = negative_prompts
+    p.all_seeds = [int(base_seeds[i % len(base_seeds)]) + offset for i in range(p.batch_size)]
+    p.all_subseeds = [int(base_subseeds[i % len(base_subseeds)]) + offset for i in range(p.batch_size)]
 
 
 def apply_model_capabilities(p: StableDiffusionProcessing):
@@ -840,8 +888,10 @@ def apply_model_capabilities(p: StableDiffusionProcessing):
         p.enable_hr = False
     if not capabilities["txt2img_batch_count"] and isinstance(p, StableDiffusionProcessingTxt2Img):
         p.n_iter = 1
+        p.infinite_generation = False
     if not capabilities["img2img_batch_count"] and isinstance(p, StableDiffusionProcessingImg2Img):
         p.n_iter = 1
+        p.infinite_generation = False
     if not capabilities["txt2img_batch_size"] and isinstance(p, StableDiffusionProcessingTxt2Img):
         p.batch_size = 1
     if not capabilities["img2img_batch_size"] and isinstance(p, StableDiffusionProcessingImg2Img):
@@ -959,6 +1009,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     apply_circular_forge(p.sd_model, p.tiling)
     p.sd_model.comments = []
     p.sd_model.extra_generation_params = {}
+    if p.infinite_generation:
+        p.extra_generation_params["Batch count"] = "Infinite"
 
     p.fill_fields_from_opts()
     p.setup_prompts()
@@ -981,6 +1033,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     # Scripts such as Dynamic Prompts replace all_prompts with the expanded
     # per-image values; keep the original template in prompt_template for grids.
     _split_batches_for_extra_networks(p)
+    if p.infinite_generation:
+        p._infinite_base_seeds = list(p.all_seeds)
+        p._infinite_base_subseeds = list(p.all_subseeds)
+    infotext_prompts = _prompts_for_infotext(p.all_prompts)
+    infotext_negative_prompts = _prompts_for_infotext(p.all_negative_prompts)
     infotexts = []
     output_images = []
     generated_prompts = []
@@ -995,11 +1052,22 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             sd_unet.apply_unet()
 
-        if state.job_count == -1:
+        if state.job_count == -1 and not p.infinite_generation:
             state.job_count = p.n_iter
 
-        for n in range(p.n_iter):
+        batch_iterator = itertools.count() if p.infinite_generation else range(p.n_iter)
+        for n in batch_iterator:
             p.iteration = n
+
+            if p.infinite_generation and n:
+                # Infinite runs return the latest batch instead of retaining an unbounded gallery.
+                output_images.clear()
+                infotexts.clear()
+                generated_prompts.clear()
+                generated_negative_prompts.clear()
+                p.extra_result_images.clear()
+                p.latents_after_sampling.clear()
+                p.pixels_after_sampling.clear()
 
             if state.skipped:
                 state.skipped = False
@@ -1011,11 +1079,16 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 # hiresfix quickbutton may not need reload of firstpass model
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
+            if p.infinite_generation:
+                _refresh_infinite_batch(p)
+
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
-            p.prompts = p.all_prompts[n * p.batch_size : (n + 1) * p.batch_size]
-            p.negative_prompts = p.all_negative_prompts[n * p.batch_size : (n + 1) * p.batch_size]
-            p.seeds = p.all_seeds[n * p.batch_size : (n + 1) * p.batch_size]
-            p.subseeds = p.all_subseeds[n * p.batch_size : (n + 1) * p.batch_size]
+            batch_start = 0 if p.infinite_generation else n * p.batch_size
+            batch_end = batch_start + p.batch_size
+            p.prompts = p.all_prompts[batch_start:batch_end]
+            p.negative_prompts = p.all_negative_prompts[batch_start:batch_end]
+            p.seeds = p.all_seeds[batch_start:batch_end]
+            p.subseeds = p.all_subseeds[batch_start:batch_end]
 
             if args.dynamic_args.pid:
                 _shape = (3, p.height, p.width)
@@ -1042,15 +1115,22 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.process_batch(p, batch_number=n, prompts=p.prompts, seeds=p.seeds, subseeds=p.subseeds)
 
             p.setup_conds()
-            batch_prompts = list(p.prompts)
-            batch_negative_prompts = list(p.negative_prompts)
+            if p.infinite_generation:
+                batch_prompts = _prompts_for_infotext(p.prompts)
+                batch_negative_prompts = _prompts_for_infotext(p.negative_prompts)
+            else:
+                batch_end = batch_start + len(p.prompts)
+                batch_prompts = infotext_prompts[batch_start:batch_end]
+                batch_negative_prompts = infotext_negative_prompts[batch_start:batch_end]
 
             p.extra_generation_params.update(p.sd_model.extra_generation_params)
 
             for comment in p.sd_model.comments:
                 p.comment(comment)
 
-            if p.n_iter > 1:
+            if p.infinite_generation:
+                shared.state.job = f"Infinite generation - batch {n+1}"
+            elif p.n_iter > 1:
                 shared.state.job = f"Batch {n+1} out of {p.n_iter}"
 
             sigmas_backup = None
@@ -1113,7 +1193,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             def infotext(index=0, use_main_prompt=False):
                 prompts = batch_prompts
                 negative_prompts = batch_negative_prompts
-                if opts.save_prompt_comments and not prompts_were_expanded and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
+                if not p.infinite_generation and opts.save_prompt_comments and not prompts_were_expanded and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
                     _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     prompts = _prompts
@@ -1420,6 +1500,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                     raise ValueError(f'Could not find upscaler named "{self.hr_upscaler}"')
 
             self.calculate_target_resolution()
+
+            if self.infinite_generation:
+                return
 
             if not state.processing_has_refined_job_count:
                 if state.job_count == -1:

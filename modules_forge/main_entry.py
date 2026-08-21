@@ -551,6 +551,13 @@ def forge_main_entry():
     ui_txt2img_batch_count = get_a1111_ui_component("txt2img", "Batch count")
     ui_img2img_batch_count = get_a1111_ui_component("img2img", "Batch count")
 
+    for batch_count in (ui_txt2img_batch_count, ui_img2img_batch_count):
+        if batch_count is not None:
+            batch_count.minimum = 0
+            batch_count.maximum = 128
+            batch_count.step = 1
+            batch_count.info = "Set to 0 for infinite generation."
+
     output_targets = [
         ui_checkpoint,
         ui_vae,
@@ -688,8 +695,15 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
     hr_cfg = float(hr_cfg) if capabilities["cfg"] else 1.0
     t2i_batch_size_args = {**batch_args_t2i, "visible": capabilities["txt2img_batch_size"], "interactive": capabilities["txt2img_batch_size"]}
     i2i_batch_size_args = {**batch_args_i2i, "visible": capabilities["img2img_batch_size"], "interactive": capabilities["img2img_batch_size"]}
-    t2i_batch_count_args = {"visible": capabilities["txt2img_batch_count"], "interactive": capabilities["txt2img_batch_count"]}
-    i2i_batch_count_args = {"visible": capabilities["img2img_batch_count"], "interactive": capabilities["img2img_batch_count"]}
+    batch_count_args = {
+        "minimum": 0,
+        "maximum": 128,
+        "step": 1,
+        "label": "Batch Count",
+        "info": "Set to 0 for infinite generation.",
+    }
+    t2i_batch_count_args = {**batch_count_args, "visible": capabilities["txt2img_batch_count"], "interactive": capabilities["txt2img_batch_count"]}
+    i2i_batch_count_args = {**batch_count_args, "visible": capabilities["img2img_batch_count"], "interactive": capabilities["img2img_batch_count"]}
     if not capabilities["txt2img_batch_size"]:
         t2i_batch_size_args["value"] = 1
     if not capabilities["img2img_batch_size"]:

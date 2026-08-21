@@ -43,8 +43,16 @@ def _infer_quant_format(weight: torch.Tensor, state_dict: dict[str, torch.Tensor
     """Recover the format used by older/incomplete Comfy quant metadata."""
     scale = state_dict.get(f"{prefix}weight_scale")
     scale_2 = state_dict.get(f"{prefix}weight_scale_2")
-    if scale_2 is not None:
+    relative_scale = state_dict.get(f"{prefix}weight_s_rel")
+    channel_scale = state_dict.get(f"{prefix}weight_s_channel")
+    if weight.dtype == torch.int8 and relative_scale is not None and channel_scale is not None:
+        return "asym_w4a8_int8"
+    if scale_2 is not None and weight.dtype == torch.uint8 and weight.ndim == 2:
         return "nvfp4"
+    if scale is not None and getattr(torch, "float8_e8m0fnu", None) is not None and scale.dtype == torch.float8_e8m0fnu:
+        return "mxfp8"
+    if weight.dtype == torch.float8_e4m3fn and scale is not None and scale.dtype == torch.uint8 and scale.ndim == 2:
+        return "mxfp8"
     if weight.dtype == torch.int8 and scale is not None:
         return "int8_tensorwise"
     if weight.dtype == torch.float8_e4m3fn:
@@ -363,9 +371,11 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         layer_conf = {}
 
                 quant_format = _normalize_quant_format(layer_conf.get("format")) if layer_conf is not None else None
+                if quant_format is None and weight_key in state_dict:
+                    quant_format = _infer_quant_format(state_dict[weight_key], state_dict, prefix)
                 manually_loaded_keys = []
 
-                embedding_quant_formats = {"float8_e4m3fn", "float8_e5m2", "int8_tensorwise", "nvfp4", "asym_w4a8_int8"}
+                embedding_quant_formats = {"float8_e4m3fn", "float8_e5m2", "int8_tensorwise", "nvfp4", "mxfp8", "asym_w4a8_int8"}
                 if quant_format in embedding_quant_formats and weight_key in state_dict:
                     self.quant_format = quant_format
                     qconfig = QUANT_ALGOS[quant_format]
@@ -381,6 +391,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         if scale is not None:
                             if quant_format == "nvfp4" and scale_name == "weight_scale":
                                 scale = scale.view(torch.float8_e4m3fn)
+                            elif quant_format == "mxfp8" and scale_name == "weight_scale":
+                                scale = scale.view(torch.float8_e8m0fnu)
                             else:
                                 scale = scale.float()
                             scales[scale_name] = scale
@@ -398,7 +410,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         scales = {"scale": relative_scale}
                     else:
                         scales = {"scale": scales.get("weight_scale")}
-                    if quant_format == "asym_w4a8_int8":
+                    if quant_format == "mxfp8":
+                        scales = {"scale": scales.get("weight_scale")}
+                    elif quant_format == "asym_w4a8_int8":
                         for param_name, scale_name in (
                             ("s_channel", "weight_s_channel"),
                             ("correction", "weight_correction"),
@@ -409,18 +423,20 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                             scales[param_name] = value
                             if value is not None:
                                 manually_loaded_keys.append(param_key)
-                        params_conf = layer_conf.get("params", {})
+                        params_conf = (layer_conf or {}).get("params", {})
                         if not isinstance(params_conf, dict):
                             params_conf = {}
-                        extra["group_size"] = int(layer_conf.get("group_size", params_conf.get("group_size", 16)))
-                        extra["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
+                        extra["group_size"] = int((layer_conf or {}).get("group_size", params_conf.get("group_size", 16)))
+                        extra["convrot_groupsize"] = int((layer_conf or {}).get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
                         if scales["scale"] is None or scales.get("s_channel") is None:
                             raise ValueError("Missing W4A8 embedding scales")
                     elif quant_format == "nvfp4" and (scales["scale"] is None or scales["block_scale"] is None):
                         raise ValueError("Missing NVFP4 embedding scales")
-                    if quant_format == "int8_tensorwise" and layer_conf.get("convrot", False):
+                    elif quant_format == "mxfp8" and scales["scale"] is None:
+                        raise ValueError("Missing MXFP8 embedding scales")
+                    if quant_format == "int8_tensorwise" and (layer_conf or {}).get("convrot", False):
                         extra["convrot"] = True
-                        extra["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", 256))
+                        extra["convrot_groupsize"] = int((layer_conf or {}).get("convrot_groupsize", 256))
 
                     parameter_values = {key: value for key, value in scales.items() if value is not None}
                     if quant_format in {"float8_e4m3fn", "float8_e5m2", "int8_tensorwise"} and "scale" not in parameter_values:

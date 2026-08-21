@@ -273,7 +273,17 @@ def gguf_sd_loader(path: os.PathLike, handle_prefix: str | None = None, *, is_te
     state_dict = {}
     qtype_counts = {}
 
-    from backend.operations_gguf import ParameterGGUF
+    from backend.operations_gguf import QUANTS_MAPPING, ParameterGGUF
+
+    plain_types = {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}
+    unsupported_types = {
+        tensor.tensor_type
+        for tensor in reader.tensors
+        if tensor.tensor_type not in QUANTS_MAPPING and tensor.tensor_type not in plain_types
+    }
+    if unsupported_types:
+        names = ", ".join(sorted(getattr(value, "name", repr(value)) for value in unsupported_types))
+        raise ValueError(f"Unsupported GGUF quantization type(s): {names}. This loader does not have a compatible dequantizer.")
 
     for tensor in reader.tensors:
         tensor_name = str(tensor.name)
