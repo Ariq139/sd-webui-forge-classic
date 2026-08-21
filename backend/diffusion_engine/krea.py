@@ -26,8 +26,6 @@ class Krea2(ForgeDiffusionEngine):
         clip = CLIP(model_dict={"qwen3vl_4b": huggingface_components["text_encoder"]}, tokenizer_dict={"qwen3vl_4b": huggingface_components["tokenizer"]})
 
         vae = VAE(model=huggingface_components["vae"], is_wan=True)
-        if vae.is_wan:
-            raise ValueError("Krea-2 requires a 2D Qwen Image VAE; select a Qwen/Krea VAE instead of a Wan VAE.")
 
         k_predictor = self._get_predictor()
 
