@@ -1487,6 +1487,9 @@ def async_transfers_enabled() -> bool:
 
 
 ATTENTION_DTYPE_ALIGNMENT_ENABLED = False
+NVFP4_EMBEDDING_ROWWISE_ENABLED = False
+W4A8_EMBEDDING_ROWWISE_ENABLED = False
+W4A16_EMBEDDING_ROWWISE_ENABLED = False
 
 
 def set_attention_dtype_alignment():
@@ -1502,6 +1505,51 @@ def set_attention_dtype_alignment():
 
 def attention_dtype_alignment_enabled() -> bool:
     return ATTENTION_DTYPE_ALIGNMENT_ENABLED
+
+
+def set_nvfp4_embedding_rowwise_enabled():
+    global NVFP4_EMBEDDING_ROWWISE_ENABLED
+
+    try:
+        from modules import shared
+
+        NVFP4_EMBEDDING_ROWWISE_ENABLED = bool(getattr(shared.opts, "forge_nvfp4_embedding_rowwise_enabled", False))
+    except Exception:
+        NVFP4_EMBEDDING_ROWWISE_ENABLED = False
+
+
+def nvfp4_embedding_rowwise_enabled() -> bool:
+    return NVFP4_EMBEDDING_ROWWISE_ENABLED
+
+
+def set_w4a8_embedding_rowwise_enabled():
+    global W4A8_EMBEDDING_ROWWISE_ENABLED
+
+    try:
+        from modules import shared
+
+        W4A8_EMBEDDING_ROWWISE_ENABLED = bool(getattr(shared.opts, "forge_w4a8_embedding_rowwise_enabled", False))
+    except Exception:
+        W4A8_EMBEDDING_ROWWISE_ENABLED = False
+
+
+def w4a8_embedding_rowwise_enabled() -> bool:
+    return W4A8_EMBEDDING_ROWWISE_ENABLED
+
+
+def set_w4a16_embedding_rowwise_enabled():
+    global W4A16_EMBEDDING_ROWWISE_ENABLED
+
+    try:
+        from modules import shared
+
+        W4A16_EMBEDDING_ROWWISE_ENABLED = bool(getattr(shared.opts, "forge_w4a16_embedding_rowwise_enabled", False))
+    except Exception:
+        W4A16_EMBEDDING_ROWWISE_ENABLED = False
+
+
+def w4a16_embedding_rowwise_enabled() -> bool:
+    return W4A16_EMBEDDING_ROWWISE_ENABLED
 
 
 def get_offload_stream(device: torch.device):

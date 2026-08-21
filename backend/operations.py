@@ -51,7 +51,7 @@ def _attention_dtype_hint(error: RuntimeError) -> RuntimeError:
     message = str(error)
     lowered = message.lower()
     if "dtype" in lowered and all(term in lowered for term in ("query", "key", "value")):
-        message += " Enable Settings > Memory Management > Enable mixed-dtype attention alignment to convert mismatched Q/K/V dtypes."
+        message += " Enable Settings > Miscellaneous > Enable mixed-dtype attention alignment to convert mismatched Q/K/V dtypes."
     return RuntimeError(message)
 
 

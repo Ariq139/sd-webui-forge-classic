@@ -156,12 +156,17 @@ def _ensure_quantization_markers(state_dict: dict[str, torch.Tensor]) -> bool:
 
         scale = state_dict.get(f"{layer}weight_scale")
         scale_2 = state_dict.get(f"{layer}weight_scale_2")
+        weight_zero = state_dict.get(f"{layer}weight_zero")
+        if weight_zero is None:
+            weight_zero = state_dict.get(f"{layer}weight_zeros")
         relative_scale = state_dict.get(f"{layer}weight_s_rel")
         channel_scale = state_dict.get(f"{layer}weight_s_channel")
         quant_format = None
 
         if weight.dtype == torch.uint8 and weight.ndim == 2 and scale_2 is not None and scale is not None:
             quant_format = "nvfp4"
+        elif weight.dtype == torch.int8 and scale is not None and weight_zero is not None:
+            quant_format = "awq_w4a16"
         elif weight.dtype == torch.int8 and relative_scale is not None and channel_scale is not None:
             quant_format = "asym_w4a8_int8"
         elif mxfp8_scale_dtype is not None and isinstance(scale, torch.Tensor) and scale.dtype == mxfp8_scale_dtype:

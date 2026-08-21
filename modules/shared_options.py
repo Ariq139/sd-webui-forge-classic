@@ -204,10 +204,13 @@ The file can be viewed in <a href="chrome:tracing">Chrome</a> or on the <a href=
 
 options_templates.update(
     options_section(
-        ("memory-management", "Memory Management", "system"),
+        ("memory-management", "Miscellaneous", "system"),
         {
             "forge_oom_retry_enabled": OptionInfo(True, "Retry once after out-of-memory").info("clears model allocations before retrying"),
             "forge_attention_dtype_alignment_enabled": OptionInfo(False, "Enable mixed-dtype attention alignment").info("converts mismatched Q/K/V dtypes to prevent attention dtype mismatch errors"),
+            "forge_nvfp4_embedding_rowwise_enabled": OptionInfo(False, "Use row-wise NVFP4 embedding lookup").info("experimental; dequantizes only the token rows used by each prompt instead of the entire embedding table"),
+            "forge_w4a8_embedding_rowwise_enabled": OptionInfo(False, "Use row-wise W4A8 embedding lookup").info("experimental; dequantizes only the token rows used by each prompt instead of the entire embedding table"),
+            "forge_w4a16_embedding_rowwise_enabled": OptionInfo(False, "Use row-wise W4A16 embedding lookup").info("experimental; dequantizes only the token rows used by each prompt instead of the entire embedding table"),
         },
     )
 )
