@@ -7,7 +7,7 @@ from comfy_kitchen.tensor import (  # noqa
     QuantizedTensor,
     TensorCoreAWQW4A16Layout,
     TensorCoreConvRotW4A4Layout,
-    TensorCoreFP8Layout as _CKTensorCoreFP8Layout,
+    TensorCoreFP8Layout,
     TensorCoreMXFP8Layout,
     TensorCoreNVFP4Layout,
     TensorWiseINT8Layout,
