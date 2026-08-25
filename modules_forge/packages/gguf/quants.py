@@ -196,7 +196,10 @@ class __Quant(ABC):
             output = cls.dequantize_rows(data)
             return torch.from_numpy(output).to(device=x.device, dtype=x.computation_dtype)
 
-        blocks = cls.dequantize_blocks_pytorch(x.data, cls.block_size, cls.type_size, x)
+        rows = x.data.reshape((-1, x.data.shape[-1])).contiguous().view(torch.uint8)
+        n_blocks = rows.numel() // cls.type_size
+        blocks = rows.reshape((n_blocks, cls.type_size))
+        blocks = cls.dequantize_blocks_pytorch(blocks, cls.block_size, cls.type_size, x)
         return blocks.view(x.shape)
 
     @classmethod
