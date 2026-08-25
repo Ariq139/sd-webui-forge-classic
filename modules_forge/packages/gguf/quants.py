@@ -196,9 +196,10 @@ class __Quant(ABC):
             output = cls.dequantize_rows(data)
             return torch.from_numpy(output).to(device=x.device, dtype=x.computation_dtype)
 
-        rows = x.data.reshape((-1, x.data.shape[-1])).contiguous().view(torch.uint8)
-        n_blocks = rows.numel() // cls.type_size
-        blocks = rows.reshape((n_blocks, cls.type_size))
+        # GGUF baking stores packed bytes, but model movement can leave the
+        # values in a non-byte dtype. Convert the stored byte values instead
+        # of viewing the storage, which would double the block count for fp16.
+        blocks = x.data if x.data.dtype == torch.uint8 else x.data.to(torch.uint8)
         blocks = cls.dequantize_blocks_pytorch(blocks, cls.block_size, cls.type_size, x)
         return blocks.view(x.shape)
 
