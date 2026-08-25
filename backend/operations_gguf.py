@@ -32,6 +32,22 @@ QUANTS_MAPPING: dict[gguf.constants.GGMLQuantizationType, gguf.quants.__Quant] =
     gguf.GGMLQuantizationType.BF16: gguf.BF16,
 }
 
+_TORCH_COMPATIBLE_QTYPES = {None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}
+
+
+class _FallbackGGUFQuant:
+    """Reference dequantizer for GGUF types not known to the fast mapping."""
+
+    def __init__(self, tensor_type):
+        self.tensor_type = tensor_type
+
+    def bake(self, tensor):
+        tensor.baked = True
+
+    def dequantize_pytorch(self, tensor):
+        data = gguf.quants.dequantize(tensor.detach().cpu().numpy(), self.tensor_type)
+        return torch.from_numpy(data).to(device=tensor.device, dtype=tensor.computation_dtype)
+
 logger = logging.getLogger("operations_gguf")
 _CUDA_MODULE = None
 _CUDA_PROBED = False
@@ -103,7 +119,10 @@ class ParameterGGUF(torch.nn.Parameter):
         if no_init:
             return
 
-        self.gguf_cls: "gguf.quants.__Quant" = QUANTS_MAPPING.get(tensor_type, None)
+        if tensor_type in _TORCH_COMPATIBLE_QTYPES:
+            self.gguf_cls = None
+        else:
+            self.gguf_cls = QUANTS_MAPPING.get(tensor_type, _FallbackGGUFQuant(tensor_type))
         self.tensor_type = tensor_type
         self.real_shape: torch.Size = tensor_shape
         self.computation_dtype = torch.float16
