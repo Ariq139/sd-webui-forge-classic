@@ -22,20 +22,24 @@ LORA_CATEGORY_LABELS = {
     "ernie": "Ernie",
     "pid": "PiD",
     "krea": "Krea",
+    "ltx2": "LTX-2",
+    "ideogram": "Ideogram",
     "unknown": "Unknown",
 }
 
 
 LORA_CATEGORY_MARKERS = {
-    "anima": ("anima",),
+    "anima": ("anima", "qwen3 06b", "llm adapter", "lora te layers", "lora unet llm adapter"),
     "klein": ("flux 2", "flux2", "klein"),
     "qwen": ("qwen",),
-    "lumina": ("lumina",),
+    "lumina": ("lumina", "lumina2"),
     "zit": ("z image", "zimage", "zit"),
-    "wan": ("wan",),
+    "wan": ("wan", "wan2", "wan 2"),
     "ernie": ("ernie",),
     "pid": ("pid",),
-    "krea": ("krea",),
+    "krea": ("krea", "krea2", "text fusion", "txtfusion", "txtmlp"),
+    "ltx2": ("ltx 2", "ltx2", "ltx"),
+    "ideogram": ("ideogram",),
     "xl": ("sdxl", "sd xl", "stable diffusion xl", "illustrious", "pony"),
     "flux": ("flux", "flux 1", "flux1"),
     "sd": ("sd 1 5", "sd1 5", "sd15", "sd v1", "sd v2", "sd1", "sd2", "stable diffusion v1", "stable diffusion v2", "stable diffusion 1"),
@@ -51,6 +55,8 @@ LORA_MODULE_MARKERS = {
     "ernie": ("lora ernie",),
     "pid": ("lora pid",),
     "krea": ("lora krea",),
+    "ltx2": ("lora ltx", "ltx lora"),
+    "ideogram": ("lora ideogram",),
     "xl": ("lora sdxl", "lora sd xl"),
     "flux": ("lora flux",),
 }
@@ -68,6 +74,8 @@ LORA_RELATED_CATEGORIES = {
     "ernie": ("Ernie",),
     "pid": ("PiD",),
     "krea": ("Krea",),
+    "ltx2": ("LTX-2",),
+    "ideogram": ("Ideogram",),
 }
 
 
@@ -88,7 +96,7 @@ def _category_from_markers(text, markers):
     return None
 
 
-def infer_lora_category(metadata, name):
+def infer_lora_category(metadata, name, state_keys=None):
     """Infer a display category from metadata."""
     metadata = metadata or {}
 
@@ -96,6 +104,8 @@ def infer_lora_category(metadata, name):
     for version in network.SD_VERSION:
         if explicit == version.casefold() and version != "Unknown":
             return LORA_CATEGORY_LABELS.get(version, version.upper())
+    if category := _category_from_markers(_normalized_text([explicit]), LORA_CATEGORY_MARKERS):
+        return category
 
     module_text = _normalized_text([metadata.get("ss_network_module")])
     if category := _category_from_markers(module_text, LORA_MODULE_MARKERS):
@@ -112,6 +122,10 @@ def infer_lora_category(metadata, name):
 
     if category := _category_from_markers(_normalized_text([name]), LORA_CATEGORY_MARKERS):
         return category
+
+    if state_keys:
+        if category := _category_from_markers(_normalized_text(state_keys), LORA_CATEGORY_MARKERS):
+            return category
 
     return LORA_CATEGORY_LABELS["unknown"]
 
@@ -173,7 +187,10 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
             sd_version = "Unknown"
 
         category_metadata = {**(item.get("metadata") or {}), **(item.get("user_metadata") or {})}
-        item["category"] = infer_lora_category(category_metadata, name)
+        category = infer_lora_category(category_metadata, name)
+        if category == LORA_CATEGORY_LABELS["unknown"]:
+            category = infer_lora_category(category_metadata, name, networks.get_lora_state_keys(lora_on_disk))
+        item["category"] = category
 
         if enable_filter and shared.opts.lora_preset_filter and sd_version not in ("Unknown", shared.opts.forge_preset):
             return None
@@ -193,7 +210,7 @@ class ExtraNetworksPageLora(ui_extra_networks.ExtraNetworksPage):
     def get_category_order(self, prioritize=True):
         all_categories = [
             LORA_CATEGORY_LABELS[key]
-            for key in ("sd", "xl", "flux", "klein", "qwen", "lumina", "zit", "wan", "anima", "ernie", "pid", "krea", "unknown")
+            for key in ("sd", "xl", "flux", "klein", "qwen", "lumina", "zit", "wan", "anima", "ernie", "pid", "krea", "ltx2", "ideogram", "unknown")
         ]
         if not prioritize:
             return all_categories

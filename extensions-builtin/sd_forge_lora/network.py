@@ -12,6 +12,7 @@ class NetworkOnDisk:
         self.name: str = name
         self.filename: os.PathLike = filename
         self.metadata: dict[str, str] = {}
+        self.lora_state_keys: tuple[str, ...] | None = None
         self.is_safetensors: bool = filename.lower().endswith(".safetensors")
 
         def read_metadata():

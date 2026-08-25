@@ -5,10 +5,14 @@ function inputAccordionChecked(id, checked) {
 }
 
 function setupAccordion(accordion) {
+    if (accordion.visibleCheckbox) return;
+
     let labelWrap = accordion.querySelector(".label-wrap");
     let gradioCheckbox = gradioApp().querySelector("#" + accordion.id + "-checkbox input");
-    let extra = gradioApp().querySelector("#" + accordion.id + "-extra");
+    if (!labelWrap || !gradioCheckbox) return;
+
     let span = labelWrap.querySelector("span");
+    if (!span) return;
     let linked = true;
 
     let isOpen = function () {
@@ -29,10 +33,7 @@ function setupAccordion(accordion) {
         attributes: true,
         attributeFilter: ["class"],
     });
-
-    if (extra) {
-        labelWrap.insertBefore(extra, labelWrap.lastElementChild);
-    }
+    accordion.classList.toggle("input-accordion-open", isOpen());
 
     accordion.onChecked = function (checked) {
         if (isOpen() != checked) {
@@ -64,8 +65,25 @@ function setupAccordion(accordion) {
     visibleCheckbox.addEventListener("input", accordion.onVisibleCheckboxChange);
 }
 
-onUiLoaded(function () {
+function setupInputAccordions() {
+    if (typeof gradioApp !== "function") return;
+
     for (let accordion of gradioApp().querySelectorAll(".input-accordion")) {
         setupAccordion(accordion);
     }
+}
+
+// Gradio 5 loads custom scripts asynchronously. Register through the legacy
+// callback when available, but also retry after hydration and watch for late
+// component creation so the accordion is initialized regardless of load order.
+if (typeof onUiLoaded === "function") {
+    onUiLoaded(setupInputAccordions);
+}
+
+setupInputAccordions();
+window.setTimeout(setupInputAccordions, 0);
+
+new MutationObserver(setupInputAccordions).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
 });

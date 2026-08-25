@@ -1471,7 +1471,55 @@ footer {
 }
 
 div.accordions>div.input-accordion {
-    min-width: fit-content !important;
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+}
+
+div.accordions>div.input-accordion .label-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    overflow: hidden;
+    width: 100%;
+}
+
+div.accordions>div.input-accordion .label-wrap>span:first-child {
+    flex: 1 1 auto !important;
+    display: flex;
+    align-items: center;
+    min-width: 0 !important;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+div.accordions>div.input-accordion .label-wrap>.input-accordion-extra {
+    flex: 0 1 auto !important;
+    min-width: 0;
+    margin: 0;
+}
+
+div.accordions>div.input-accordion>div>.column>.input-accordion-extra {
+    flex: 1 1 auto !important;
+    width: 100%;
+    margin: 0;
+}
+
+div.accordions>div.input-accordion:not(.input-accordion-open) .input-accordion-extra {
+    display: none !important;
+}
+
+div.accordions>div.input-accordion .label-wrap>.icon {
+    flex: 0 0 auto;
+}
+
+/* Gradio 5 ignores visible=False on the source checkbox. The synchronized
+   checkbox created by inputAccordion.js is the only one shown to users. */
+div.accordions>div.form>div.gradio-checkbox[id$="-checkbox"] {
+    display: none !important;
+}
+
+div.accordions>div.form:has(> div.gradio-checkbox[id$="-checkbox"]) {
+    display: none !important;
 }
 
 div.accordions>div.gradio-accordion .label-wrap span {
@@ -1481,11 +1529,36 @@ div.accordions>div.gradio-accordion .label-wrap span {
 
 div.accordions {
     gap: 0.5em;
+    flex-wrap: wrap;
 }
 
 div.accordions>div.input-accordion.input-accordion-open {
     flex: 1 auto;
     flex-flow: column;
+}
+
+#txt2img_column_batch .gradio-slider .head,
+#img2img_column_batch .gradio-slider .head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+}
+
+#txt2img_column_batch .gradio-slider .head>.tab-like-container,
+#img2img_column_batch .gradio-slider .head>.tab-like-container {
+    grid-column: 2;
+    grid-row: 1;
+}
+
+@media screen and (max-width: 700px) {
+    div.accordions {
+        flex-direction: column;
+        flex-wrap: nowrap;
+    }
+
+    div.accordions>div.input-accordion {
+        flex-basis: 100% !important;
+    }
 }
 
 /* sticky right hand columns */

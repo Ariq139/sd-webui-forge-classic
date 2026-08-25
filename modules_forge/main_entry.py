@@ -556,7 +556,7 @@ def forge_main_entry():
             batch_count.minimum = 0
             batch_count.maximum = 128
             batch_count.step = 1
-            batch_count.info = "Set to 0 for infinite generation."
+            batch_count.info = "0 = infinite"
 
     output_targets = [
         ui_checkpoint,
@@ -700,7 +700,7 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
         "maximum": 128,
         "step": 1,
         "label": "Batch Count",
-        "info": "Set to 0 for infinite generation.",
+        "info": "0 = infinite",
     }
     t2i_batch_count_args = {**batch_count_args, "visible": capabilities["txt2img_batch_count"], "interactive": capabilities["txt2img_batch_count"]}
     i2i_batch_count_args = {**batch_count_args, "visible": capabilities["img2img_batch_count"], "interactive": capabilities["img2img_batch_count"]}

@@ -16,6 +16,7 @@ from backend.patcher.lora import load_lora, model_lora_keys_clip, model_lora_key
 from backend.state_dict import state_dict_prefix_replace
 from backend.utils import load_torch_file
 from modules import errors, scripts, sd_models, shared
+from modules_forge.lora_detection import detect_lora_state_dict
 
 logger = logging.getLogger("lora")
 setup_logger(logger)
@@ -25,6 +26,26 @@ ANIMA_BLOCK_MAPPING = (0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 
 
 def load_lora_state_dict(filename):
     return load_torch_file(filename, safe_load=True)
+
+
+def get_lora_state_keys(network_on_disk):
+    """Read only safetensors keys for categorization; do not load LoRA weights."""
+    if network_on_disk.lora_state_keys is not None:
+        return network_on_disk.lora_state_keys
+
+    filename = network_on_disk.filename
+    if not str(filename).lower().endswith(".safetensors"):
+        network_on_disk.lora_state_keys = ()
+        return network_on_disk.lora_state_keys
+
+    try:
+        from safetensors import safe_open
+
+        with safe_open(filename, framework="pt", device="cpu") as handle:
+            network_on_disk.lora_state_keys = tuple(handle.keys())
+    except Exception:
+        network_on_disk.lora_state_keys = ()
+    return network_on_disk.lora_state_keys
 
 
 def process_anima(lora: dict[str, torch.Tensor], blocks: int):
@@ -68,6 +89,10 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
 
     model_flag: str = type(model.model).__name__ if model is not None else "default"
 
+    detection = detect_lora_state_dict(lora)
+    if not detection.is_adapter:
+        return model, clip
+
     unet_keys = model_lora_keys_unet(model.model) if model is not None else {}
     clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
 
@@ -78,14 +103,10 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
     lora_unet, lora_unmatch = load_lora(lora_unmatch, unet_keys)
     lora_clip, lora_unmatch = load_lora(lora_unmatch, clip_keys)
 
-    _unmatches = len(lora_unmatch)
-
-    if _unmatches / len(lora) > 0.5:
-        logger.warning(f"[LORA] LoRA mismatch for {model_flag}: {filename}")
+    unmatched_adapter_keys = {item.key for item in detection.adapter_keys} & set(lora_unmatch)
+    matched_adapter_keys = len(detection.adapter_keys) - len(unmatched_adapter_keys)
+    if matched_adapter_keys == 0:
         return model, clip
-
-    if _unmatches > 0:
-        logger.info(f"[LORA] Loading {os.path.basename(filename)} for {model_flag} with {_unmatches} unmatched keys")
 
     if model is not None and len(lora_unet) > 0:
         new_model = model.clone()
@@ -186,7 +207,7 @@ def process_network_files(names: Optional[list[str]] = None):
     candidates = []
 
     for _dir in [shared.cmd_opts.lora_dir, *shared.cmd_opts.lora_dirs]:
-        candidates.extend(shared.walk_files(_dir, allowed_extensions=[".pt", ".ckpt", ".safetensors"]))
+        candidates.extend(shared.walk_files(_dir, allowed_extensions=[".pt", ".pth", ".bin", ".ckpt", ".safetensors"]))
 
     for filename in candidates:
         if os.path.isdir(filename):
