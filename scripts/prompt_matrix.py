@@ -101,14 +101,17 @@ class PromptMatrix(scripts.Script):
 
         processed = process_images(p)
 
-        grid = images.image_grid(processed.images, p.batch_size, rows=1 << ((len(prompt_matrix_parts) - 1) // 2))
-        grid = images.draw_prompt_matrix(grid, processed.images[0].width, processed.images[0].height, prompt_matrix_parts, margin_size)
+        grid = None
+        if opts.return_grid or opts.grid_save:
+            grid = images.image_grid(processed.images, p.batch_size, rows=1 << ((len(prompt_matrix_parts) - 1) // 2))
+            grid = images.draw_prompt_matrix(grid, processed.images[0].width, processed.images[0].height, prompt_matrix_parts, margin_size)
 
-        processed.images.insert(0, grid)
-        processed.index_of_first_image = 1
-        processed.infotexts.insert(0, processed.infotexts[0])
+        if opts.return_grid:
+            processed.images.insert(0, grid)
+            processed.index_of_first_image = 1
+            processed.infotexts.insert(0, processed.infotexts[0])
 
         if opts.grid_save:
-            images.save_image(processed.images[0], p.outpath_grids, "prompt_matrix", extension=opts.grid_format, prompt=original_prompt, seed=processed.seed, grid=True, p=p)
+            images.save_image(grid, p.outpath_grids, "prompt_matrix", extension=opts.grid_format, prompt=original_prompt, seed=processed.seed, grid=True, p=p)
 
         return processed
