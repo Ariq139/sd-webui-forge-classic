@@ -220,9 +220,6 @@ class StableDiffusionProcessing:
     iteration: int = field(default=0, init=False)
     main_prompt: str = field(default=None, init=False)
     main_negative_prompt: str = field(default=None, init=False)
-    prompt_template: str = field(default=None, init=False)
-    negative_prompt_template: str = field(default=None, init=False)
-
     prompts: list = field(default=None, init=False)
     negative_prompts: list = field(default=None, init=False)
     seeds: list = field(default=None, init=False)
@@ -708,8 +705,8 @@ def create_infotext(p: "StableDiffusionProcessing", all_prompts, all_seeds, all_
     token_merging_ratio = p.get_token_merging_ratio()
     token_merging_ratio_hr = p.get_token_merging_ratio(for_hr=True)
 
-    prompt_text = (getattr(p, "prompt_template", None) or p.main_prompt) if use_main_prompt else all_prompts[index]
-    negative_prompt = (getattr(p, "negative_prompt_template", None) or p.main_negative_prompt) if use_main_prompt else all_negative_prompts[index]
+    prompt_text = p.main_prompt if use_main_prompt else all_prompts[index]
+    negative_prompt = p.main_negative_prompt if use_main_prompt else all_negative_prompts[index]
 
     uses_ensd = opts.eta_noise_seed_delta != 0
     if uses_ensd:
@@ -810,8 +807,19 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     if p.disable_extra_networks or p.batch_size <= 1 or len(p.all_prompts or ()) <= 1:
         return
 
-    signatures = {_extra_network_signature(prompt) for prompt in p.all_prompts}
-    if len(signatures) <= 1:
+    signatures = [_extra_network_signature(prompt) for prompt in p.all_prompts]
+    if len(set(signatures)) <= 1:
+        return
+
+    # Different LoRA selections are safe when they already occupy separate
+    # requested batches. Only split the run when a single model batch would
+    # contain more than one selection.
+    has_mixed_batch = any(
+        len(set(signatures[start : start + p.batch_size])) > 1
+        for start in range(0, len(signatures), p.batch_size)
+    )
+    if not has_mixed_batch:
+        logger.info("Different extra-network selections are batch-aligned; keeping the requested batch size.")
         return
 
     if p.infinite_generation:
@@ -822,11 +830,6 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     logger.info("Different extra-network selections detected; processing one image per batch.")
     p.batch_size = 1
     p.n_iter = len(p.all_prompts)
-
-
-def _prompts_for_infotext(prompts):
-    """Keep expanded prompt choices in metadata without extra-network tags."""
-    return [extra_networks.parse_prompt(prompt or "")[0] for prompt in prompts]
 
 
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
@@ -1014,8 +1017,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     p.fill_fields_from_opts()
     p.setup_prompts()
-    p.prompt_template = p.main_prompt
-    p.negative_prompt_template = p.main_negative_prompt
 
     if isinstance(seed, list):
         p.all_seeds = seed
@@ -1030,18 +1031,12 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     if p.scripts is not None:
         p.scripts.process(p)
 
-    # Scripts such as Dynamic Prompts replace all_prompts with the expanded
-    # per-image values; keep the original template in prompt_template for grids.
     _split_batches_for_extra_networks(p)
     if p.infinite_generation:
         p._infinite_base_seeds = list(p.all_seeds)
         p._infinite_base_subseeds = list(p.all_subseeds)
-    infotext_prompts = _prompts_for_infotext(p.all_prompts)
-    infotext_negative_prompts = _prompts_for_infotext(p.all_negative_prompts)
     infotexts = []
     output_images = []
-    generated_prompts = []
-    generated_negative_prompts = []
     with torch.inference_mode():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -1063,8 +1058,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 # Infinite runs return the latest batch instead of retaining an unbounded gallery.
                 output_images.clear()
                 infotexts.clear()
-                generated_prompts.clear()
-                generated_negative_prompts.clear()
                 p.extra_result_images.clear()
                 p.latents_after_sampling.clear()
                 p.pixels_after_sampling.clear()
@@ -1115,14 +1108,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.process_batch(p, batch_number=n, prompts=p.prompts, seeds=p.seeds, subseeds=p.subseeds)
 
             p.setup_conds()
-            if p.infinite_generation:
-                batch_prompts = _prompts_for_infotext(p.prompts)
-                batch_negative_prompts = _prompts_for_infotext(p.negative_prompts)
-            else:
-                batch_end = batch_start + len(p.prompts)
-                batch_prompts = infotext_prompts[batch_start:batch_end]
-                batch_negative_prompts = infotext_negative_prompts[batch_start:batch_end]
-
             p.extra_generation_params.update(p.sd_model.extra_generation_params)
 
             for comment in p.sd_model.comments:
@@ -1139,7 +1124,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sigmas_backup = p.sd_model.forge_objects.unet.model.predictor.sigmas
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
-            samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=batch_prompts)
+            samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)
@@ -1175,31 +1160,24 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if p.scripts is not None:
                 p.scripts.postprocess_batch(p, x_samples_ddim, batch_number=n)
 
-                p.prompts = batch_prompts
-                p.negative_prompts = batch_negative_prompts
+                if p.infinite_generation:
+                    p.prompts = p.all_prompts
+                    p.negative_prompts = p.all_negative_prompts
+                else:
+                    p.prompts = p.all_prompts[n * p.batch_size : (n + 1) * p.batch_size]
+                    p.negative_prompts = p.all_negative_prompts[n * p.batch_size : (n + 1) * p.batch_size]
 
                 batch_params = scripts.PostprocessBatchListArgs(list(x_samples_ddim))
                 p.scripts.postprocess_batch_list(p, batch_params, batch_number=n)
                 x_samples_ddim = batch_params.images
 
-            prompts_were_expanded = (
-                bool(p.all_prompts)
-                and any(prompt != p.prompt_template for prompt in p.all_prompts)
-            ) or (
-                bool(p.all_negative_prompts)
-                and any(prompt != p.negative_prompt_template for prompt in p.all_negative_prompts)
-            )
-
             def infotext(index=0, use_main_prompt=False):
-                prompts = batch_prompts
-                negative_prompts = batch_negative_prompts
-                if not p.infinite_generation and opts.save_prompt_comments and not prompts_were_expanded and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
+                if not p.infinite_generation and opts.save_prompt_comments and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
                     _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
-                    prompts = _prompts
-                    negative_prompts = _negative_prompts
+                    return create_infotext(p, _prompts, p.seeds, p.subseeds, use_main_prompt=False, index=index, all_negative_prompts=_negative_prompts)
 
-                return create_infotext(p, prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=negative_prompts)
+                return create_infotext(p, p.prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=p.negative_prompts)
 
             save_samples = p.save_samples(is_video=_is_video)
             if _is_video:
@@ -1208,10 +1186,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
                 sample_index = i // _times if _is_video else i
-                prompt_index = min(sample_index, len(batch_prompts) - 1)
-                image_prompt = batch_prompts[prompt_index]
-                generated_prompts.append(image_prompt)
-                generated_negative_prompts.append(batch_negative_prompts[prompt_index])
+                prompt_index = min(sample_index, len(p.prompts) - 1)
+                image_prompt = p.prompts[prompt_index]
                 x_sample = x_sample.cpu().numpy()
                 if x_sample.ndim != 3 or x_sample.shape[0] not in (1, 3, 4):
                     raise RuntimeError(
@@ -1329,7 +1305,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 output_images.insert(0, grid)
                 index_of_first_image = 1
             if opts.grid_save:
-                images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], getattr(p, "prompt_template", None) or p.main_prompt, opts.grid_format, info=infotext(use_main_prompt=True), short_filename=not opts.grid_extended_filename, p=p, grid=True)
+                images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(use_main_prompt=True), short_filename=not opts.grid_extended_filename, p=p, grid=True)
 
     if not p.disable_extra_networks and p.extra_network_data:
         extra_networks.deactivate(p, p.extra_network_data)
@@ -1344,8 +1320,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         subseed=p.all_subseeds[0],
         index_of_first_image=index_of_first_image,
         infotexts=infotexts,
-        all_prompts=generated_prompts or p.all_prompts,
-        all_negative_prompts=generated_negative_prompts or p.all_negative_prompts,
         extra_images_list=p.extra_result_images,
     )
 
