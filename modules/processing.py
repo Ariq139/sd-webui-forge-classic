@@ -835,15 +835,45 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
     """Refresh one prompt batch without building an unbounded prompt list."""
     prompt_script = getattr(p, "_infinite_prompt_script", None)
-    if prompt_script is not None and hasattr(prompt_script, "process_infinite_batch"):
-        p.all_prompts = [p.prompt]
-        p.all_negative_prompts = [p.negative_prompt]
-        p.n_iter = 1
-        prompt_script.process_infinite_batch(p)
-        _split_batches_for_extra_networks(p)
-
+    prompt_args = getattr(p, "_infinite_prompt_args", None)
+    prompt_generation_enabled = bool(prompt_script is not None and hasattr(prompt_script, "process_infinite_batch") and prompt_args and prompt_args[0])
     base_prompt = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else p.prompt
     base_negative_prompt = p.negative_prompt[0] if isinstance(p.negative_prompt, list) and p.negative_prompt else p.negative_prompt
+    base_seeds = getattr(p, "_infinite_base_seeds", None)
+    base_subseeds = getattr(p, "_infinite_base_subseeds", None)
+    if not base_seeds:
+        base_seeds = list(p.seed) if isinstance(p.seed, list) else [int(p.seed)]
+    if not base_subseeds:
+        base_subseeds = list(p.subseed) if isinstance(p.subseed, list) else [int(p.subseed)]
+    seed_is_sequence = isinstance(p.seed, list)
+    subseed_is_sequence = isinstance(p.subseed, list)
+
+    prompt_seed_offset = p.iteration * p.batch_size
+    use_fixed_prompt_seed = bool(prompt_args[10]) if prompt_generation_enabled and len(prompt_args) > 10 else False
+    if use_fixed_prompt_seed:
+        prompt_seed_offset = 0
+
+    if prompt_generation_enabled:
+        p.all_prompts = [base_prompt]
+        p.all_negative_prompts = [base_negative_prompt]
+        p.n_iter = 1
+        original_seed = p.seed
+        original_subseed = p.subseed
+        original_all_seeds = p.all_seeds
+        original_all_subseeds = p.all_subseeds
+        try:
+            p.seed = int(base_seeds[0]) + (0 if seed_is_sequence or p.subseed_strength != 0 else prompt_seed_offset)
+            p.subseed = int(base_subseeds[0]) + (0 if subseed_is_sequence else prompt_seed_offset)
+            p.all_seeds = [p.seed]
+            p.all_subseeds = [p.subseed]
+            prompt_script.process_infinite_batch(p)
+        finally:
+            p.seed = original_seed
+            p.subseed = original_subseed
+            p.all_seeds = original_all_seeds
+            p.all_subseeds = original_all_subseeds
+        _split_batches_for_extra_networks(p)
+
     prompts = list((p.all_prompts or [base_prompt])[: p.batch_size])
     negative_prompts = list((p.all_negative_prompts or [base_negative_prompt])[: p.batch_size])
     if not prompts:
@@ -855,17 +885,27 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
     while len(negative_prompts) < p.batch_size:
         negative_prompts.append(negative_prompts[-1])
 
-    base_seeds = getattr(p, "_infinite_base_seeds", None)
-    base_subseeds = getattr(p, "_infinite_base_subseeds", None)
-    if not base_seeds:
-        base_seeds = list(p.seed) if isinstance(p.seed, list) else [int(p.seed)]
-    if not base_subseeds:
-        base_subseeds = list(p.subseed) if isinstance(p.subseed, list) else [int(p.subseed)]
+    if getattr(p, "enable_hr", False):
+        hr_prompt = p.hr_prompt[0] if isinstance(p.hr_prompt, list) and p.hr_prompt else p.hr_prompt
+        hr_negative_prompt = p.hr_negative_prompt[0] if isinstance(p.hr_negative_prompt, list) and p.hr_negative_prompt else p.hr_negative_prompt
+        hr_prompts = list((getattr(p, "all_hr_prompts", None) or [hr_prompt or base_prompt])[: p.batch_size])
+        hr_negative_prompts = list((getattr(p, "all_hr_negative_prompts", None) or [hr_negative_prompt or base_negative_prompt])[: p.batch_size])
+        while len(hr_prompts) < p.batch_size:
+            hr_prompts.append(hr_prompts[-1])
+        while len(hr_negative_prompts) < p.batch_size:
+            hr_negative_prompts.append(hr_negative_prompts[-1])
+        p.all_hr_prompts = hr_prompts
+        p.all_hr_negative_prompts = hr_negative_prompts
+
     offset = p.iteration * p.batch_size
+    if use_fixed_prompt_seed:
+        offset = 0
+    seed_offset = 0 if seed_is_sequence or p.subseed_strength != 0 else offset
+    subseed_offset = 0 if subseed_is_sequence else offset
     p.all_prompts = prompts
     p.all_negative_prompts = negative_prompts
-    p.all_seeds = [int(base_seeds[i % len(base_seeds)]) + offset for i in range(p.batch_size)]
-    p.all_subseeds = [int(base_subseeds[i % len(base_subseeds)]) + offset for i in range(p.batch_size)]
+    p.all_seeds = [int(base_seeds[i % len(base_seeds)]) + seed_offset for i in range(p.batch_size)]
+    p.all_subseeds = [int(base_subseeds[i % len(base_subseeds)]) + subseed_offset for i in range(p.batch_size)]
 
 
 def apply_model_capabilities(p: StableDiffusionProcessing):
@@ -1097,6 +1137,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if len(p.prompts) == 0:
                 break
 
+            batch_prompts = list(p.prompts)
+            batch_negative_prompts = list(p.negative_prompts)
             p.parse_extra_network_prompts()
 
             if not p.disable_extra_networks:
@@ -1161,8 +1203,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.scripts.postprocess_batch(p, x_samples_ddim, batch_number=n)
 
                 if p.infinite_generation:
-                    p.prompts = p.all_prompts
-                    p.negative_prompts = p.all_negative_prompts
+                    p.prompts = batch_prompts
+                    p.negative_prompts = batch_negative_prompts
                 else:
                     p.prompts = p.all_prompts[n * p.batch_size : (n + 1) * p.batch_size]
                     p.negative_prompts = p.all_negative_prompts[n * p.batch_size : (n + 1) * p.batch_size]
@@ -1172,6 +1214,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 x_samples_ddim = batch_params.images
 
             def infotext(index=0, use_main_prompt=False):
+                if p.infinite_generation:
+                    return create_infotext(p, batch_prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=batch_negative_prompts)
+
                 if not p.infinite_generation and opts.save_prompt_comments and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
                     _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
@@ -1186,8 +1231,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
                 sample_index = i // _times if _is_video else i
-                prompt_index = min(sample_index, len(p.prompts) - 1)
-                image_prompt = p.prompts[prompt_index]
+                image_prompts = batch_prompts if p.infinite_generation else p.prompts
+                prompt_index = min(sample_index, len(image_prompts) - 1)
+                image_prompt = image_prompts[prompt_index]
                 x_sample = x_sample.cpu().numpy()
                 if x_sample.ndim != 3 or x_sample.shape[0] not in (1, 3, 4):
                     raise RuntimeError(
@@ -1797,8 +1843,10 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         res = super().parse_extra_network_prompts()
 
         if self.enable_hr:
-            self.hr_prompts = self.all_hr_prompts[self.iteration * self.batch_size : (self.iteration + 1) * self.batch_size]
-            self.hr_negative_prompts = self.all_hr_negative_prompts[self.iteration * self.batch_size : (self.iteration + 1) * self.batch_size]
+            batch_start = 0 if self.infinite_generation else self.iteration * self.batch_size
+            batch_end = batch_start + self.batch_size
+            self.hr_prompts = self.all_hr_prompts[batch_start:batch_end]
+            self.hr_negative_prompts = self.all_hr_negative_prompts[batch_start:batch_end]
 
             self.hr_prompts, self.hr_extra_network_data = extra_networks.parse_prompts(self.hr_prompts)
 
