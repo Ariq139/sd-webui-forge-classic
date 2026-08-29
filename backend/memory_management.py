@@ -1133,14 +1133,14 @@ def flash_enabled() -> bool:
 
 
 def ck_enabled() -> bool:
-    if cpu_state is not CPUState.GPU or not args.use_ck_attention:
+    if cpu_state is not CPUState.GPU:
         return False
     try:
-        is_available = getattr(ck, "int8_attention_is_available", None)
-        int8_attention = getattr(ck, "int8_attention", None)
-        return callable(is_available) and callable(int8_attention) and bool(is_available())
+        CK_IS_AVAILABLE = ck.int8_attention_is_available()
     except Exception:
         return False
+    else:
+        return CK_IS_AVAILABLE and args.use_ck_attention
 
 
 def pytorch_attention_enabled() -> bool:
