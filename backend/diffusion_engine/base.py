@@ -95,7 +95,7 @@ class ForgeDiffusionEngine:
         sample = sample.mul_(2.0).sub_(1.0)
         return sample.to(x)
 
-    def get_prompt_lengths_on_ui(self, prompt):
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
         return 0, 75
 
     def is_webui_legacy_model(self):
