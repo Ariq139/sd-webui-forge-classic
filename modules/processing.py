@@ -833,10 +833,7 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
 
 
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
-    """Refresh one prompt batch without building an unbounded prompt list."""
-    prompt_script = getattr(p, "_infinite_prompt_script", None)
-    prompt_args = getattr(p, "_infinite_prompt_args", None)
-    prompt_generation_enabled = bool(prompt_script is not None and hasattr(prompt_script, "process_infinite_batch") and prompt_args and prompt_args[0])
+    """Refresh one prompt batch through the normal script-processing path."""
     base_prompt = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else p.prompt
     base_negative_prompt = p.negative_prompt[0] if isinstance(p.negative_prompt, list) and p.negative_prompt else p.negative_prompt
     base_seeds = getattr(p, "_infinite_base_seeds", None)
@@ -848,31 +845,34 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
     seed_is_sequence = isinstance(p.seed, list)
     subseed_is_sequence = isinstance(p.subseed, list)
 
-    prompt_seed_offset = p.iteration * p.batch_size
-    use_fixed_prompt_seed = bool(prompt_args[10]) if prompt_generation_enabled and len(prompt_args) > 10 else False
-    if use_fixed_prompt_seed:
-        prompt_seed_offset = 0
+    batch_size = max(1, int(p.batch_size))
+    offset = p.iteration * batch_size
+    seed_offset = 0 if seed_is_sequence or p.subseed_strength != 0 else offset
+    subseed_offset = 0 if subseed_is_sequence else offset
 
-    if prompt_generation_enabled:
-        p.all_prompts = [base_prompt]
-        p.all_negative_prompts = [base_negative_prompt]
-        p.n_iter = 1
-        original_seed = p.seed
-        original_subseed = p.subseed
-        original_all_seeds = p.all_seeds
-        original_all_subseeds = p.all_subseeds
-        try:
-            p.seed = int(base_seeds[0]) + (0 if seed_is_sequence or p.subseed_strength != 0 else prompt_seed_offset)
-            p.subseed = int(base_subseeds[0]) + (0 if subseed_is_sequence else prompt_seed_offset)
-            p.all_seeds = [p.seed]
-            p.all_subseeds = [p.subseed]
-            prompt_script.process_infinite_batch(p)
-        finally:
-            p.seed = original_seed
-            p.subseed = original_subseed
-            p.all_seeds = original_all_seeds
-            p.all_subseeds = original_all_subseeds
-        _split_batches_for_extra_networks(p)
+    # Reset the prompt arrays before rerunning optional processing scripts.
+    # Dynamic Prompts then sees the original template and expands a fresh
+    # batch, while no extension simply keeps the static prompt.
+    p.prompt = base_prompt
+    p.negative_prompt = base_negative_prompt
+    p.all_prompts = [base_prompt]
+    p.all_negative_prompts = [base_negative_prompt]
+    p.n_iter = 1
+    p.seed = int(base_seeds[0]) + seed_offset
+    p.subseed = int(base_subseeds[0]) + subseed_offset
+    p.all_seeds = [
+        int(base_seeds[i % len(base_seeds)]) + seed_offset
+        for i in range(batch_size)
+    ]
+    p.all_subseeds = [
+        int(base_subseeds[i % len(base_subseeds)]) + subseed_offset
+        for i in range(batch_size)
+    ]
+
+    if p.scripts is not None:
+        p.scripts.process(p)
+
+    _split_batches_for_extra_networks(p)
 
     prompts = list((p.all_prompts or [base_prompt])[: p.batch_size])
     negative_prompts = list((p.all_negative_prompts or [base_negative_prompt])[: p.batch_size])
@@ -897,15 +897,10 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
         p.all_hr_prompts = hr_prompts
         p.all_hr_negative_prompts = hr_negative_prompts
 
-    offset = p.iteration * p.batch_size
-    if use_fixed_prompt_seed:
-        offset = 0
-    seed_offset = 0 if seed_is_sequence or p.subseed_strength != 0 else offset
-    subseed_offset = 0 if subseed_is_sequence else offset
     p.all_prompts = prompts
     p.all_negative_prompts = negative_prompts
-    p.all_seeds = [int(base_seeds[i % len(base_seeds)]) + seed_offset for i in range(p.batch_size)]
-    p.all_subseeds = [int(base_subseeds[i % len(base_subseeds)]) + subseed_offset for i in range(p.batch_size)]
+    p.all_seeds = list(p.all_seeds[: p.batch_size])
+    p.all_subseeds = list(p.all_subseeds[: p.batch_size])
 
 
 def apply_model_capabilities(p: StableDiffusionProcessing):
@@ -1112,7 +1107,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 # hiresfix quickbutton may not need reload of firstpass model
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
-            if p.infinite_generation:
+            if p.infinite_generation and n:
                 _refresh_infinite_batch(p)
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
