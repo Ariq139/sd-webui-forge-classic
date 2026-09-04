@@ -183,20 +183,11 @@ def clear_references():
 
 def configure_opts_onchange():
     from modules import shared, ui_tempdir
-    from backend import memory_management
 
     shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
     shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
     shared.opts.onchange("setting_allocated_vram", reserve_memory)
-    shared.opts.onchange("forge_attention_dtype_alignment_enabled", memory_management.set_attention_dtype_alignment)
-    shared.opts.onchange("forge_nvfp4_embedding_rowwise_enabled", memory_management.set_nvfp4_embedding_rowwise_enabled)
-    shared.opts.onchange("forge_w4a8_embedding_rowwise_enabled", memory_management.set_w4a8_embedding_rowwise_enabled)
-    shared.opts.onchange("forge_w4a16_embedding_rowwise_enabled", memory_management.set_w4a16_embedding_rowwise_enabled)
-    memory_management.set_attention_dtype_alignment()
-    memory_management.set_nvfp4_embedding_rowwise_enabled()
-    memory_management.set_w4a8_embedding_rowwise_enabled()
-    memory_management.set_w4a16_embedding_rowwise_enabled()
-    shared.opts.onchange("klein_no_reference", clear_references)
+    shared.opts.onchange("klein_do_reference", clear_references)
     shared.opts.onchange("anima_do_reference", clear_references)
     shared.opts.onchange("krea2_do_reference", clear_references)
     startup_timer.record("opts onchange")

@@ -62,6 +62,13 @@ def process_anima(lora: dict[str, torch.Tensor], blocks: int) -> bool:
 
     lora_blocks: int = count_blocks(lora, "lora_unet_blocks_" + "{}") or count_blocks(lora, "diffusion_model.blocks." + "{}")
 
+    if lora_blocks < 28:
+        if blocks == 28:
+            return True
+        else:
+            logger.warning("Assuming LoRA is for 2B Model...")
+            lora_blocks = 28
+
     if lora_blocks == blocks:
         return True
 
@@ -89,10 +96,11 @@ def process_anima(lora: dict[str, torch.Tensor], blocks: int) -> bool:
         return False
 
     logger.warning(f"Re-Mapping Anima LoRA ({lora_blocks} to {blocks})")
+    prefix = "lora_unet_blocks_" if any(k.startswith("lora_unet_blocks_") for k in keys) else "diffusion_model.blocks."
 
     for i in range(blocks):
-        a = f"lora_unet_blocks_{mapping[i]}"
-        b = f"lora_unet_blocks_{i}"
+        a = f"{prefix}{mapping[i]}"
+        b = f"{prefix}{i}"
 
         for k in keys:
             if a in k:
@@ -106,6 +114,9 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
     if dynamic_args.nunchaku:
         model.model.diffusion_model.loras.append((filename, strength_model))
         return model, clip
+    if dynamic_args.anima:
+        if not process_anima(lora, len(model.model.diffusion_model.blocks)):
+            return model, clip
 
     model_flag: str = type(model.model).__name__ if model is not None else "default"
 
@@ -115,10 +126,6 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
 
     unet_keys = model_lora_keys_unet(model.model) if model is not None else {}
     clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
-
-    if dynamic_args.anima:
-        if not process_anima(lora, len(model.model.diffusion_model.blocks)):
-            return
 
     lora_unmatch = lora
     lora_unet, lora_unmatch = load_lora(lora_unmatch, unet_keys)
