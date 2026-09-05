@@ -208,6 +208,7 @@ options_templates.update(
         ("memory-management", "Miscellaneous", "system"),
         {
             "forge_oom_retry_enabled": OptionInfo(True, "Retry once after out-of-memory").info("clears model allocations before retrying"),
+            "forge_retain_all_latents": OptionInfo(False, "Keep all batch latents for extensions").info("compatibility option for extensions that need earlier batches; increases memory use"),
             "forge_attention_dtype_alignment_enabled": OptionInfo(False, "Enable mixed-dtype attention alignment").info("converts mismatched Q/K/V dtypes to prevent attention dtype mismatch errors"),
             "forge_nvfp4_embedding_rowwise_enabled": OptionInfo(False, "Use row-wise NVFP4 embedding lookup").info("experimental; dequantizes only the token rows used by each prompt instead of the entire embedding table"),
             "forge_w4a8_embedding_rowwise_enabled": OptionInfo(False, "Use row-wise W4A8 embedding lookup").info("experimental; dequantizes only the token rows used by each prompt instead of the entire embedding table"),

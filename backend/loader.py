@@ -1068,7 +1068,7 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
     except ModuleNotFoundError:
         sd, metadata, guess = _load_diffuser(path)
     finally:
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
 
     if getattr(guess, "nunchaku", False) and ("Z-Image" in guess.huggingface_repo or "Qwen" in guess.huggingface_repo):
         import json

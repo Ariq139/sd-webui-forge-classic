@@ -64,7 +64,7 @@ class Wan(ForgeDiffusionEngine):
         # called by ImageStitch
         self.start_image = None
         self.end_image = None
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
 
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
@@ -164,7 +164,7 @@ class Wan(ForgeDiffusionEngine):
         else:
             if b == 1:
                 # img2img
-                sample = self.forge_objects.vae.encode(x.movedim(1, -1))
+                sample = self.forge_objects.vae.encode(x.movedim(1, -1), output_device=x.device)
                 sample = self.forge_objects.vae.first_stage_model.process_in(sample)
                 assert self.forge_objects.unet.model.diffusion_model.in_dim == 16
                 return sample.to(x)

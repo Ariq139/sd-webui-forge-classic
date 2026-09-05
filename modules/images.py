@@ -21,7 +21,7 @@ import pytz
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 from pillow_heif import register_heif_opener
 
-from modules import errors, script_callbacks, sd_samplers, shared
+from modules import batch_planning, errors, script_callbacks, sd_samplers, shared
 from modules.paths_internal import roboto_ttf_file
 from modules.shared import opts
 
@@ -390,8 +390,8 @@ class FilenameGenerator:
     replacements = {
         "basename": lambda self: self.basename or "img",
         "seed": lambda self: self.seed if self.seed is not None else "",
-        "seed_first": lambda self: self.seed if self.p.batch_size == 1 else self.p.all_seeds[0],
-        "seed_last": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if self.p.batch_size == 1 else self.p.all_seeds[-1],
+        "seed_first": lambda self: self.seed if self.effective_batch_size() == 1 else self.p.all_seeds[0],
+        "seed_last": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if self.effective_batch_size() == 1 else self.p.all_seeds[-1],
         "steps": lambda self: self.p and self.p.steps,
         "cfg": lambda self: self.p and self.p.cfg_scale,
         "dcfg": lambda self: self.p and self.p.distilled_cfg_scale,
@@ -415,9 +415,9 @@ class FilenameGenerator:
         "prompt_no_styles": lambda self: self.prompt_no_style(),
         "prompt_spaces": lambda self: sanitize_filename_part(self.prompt, replace_spaces=False),
         "prompt_words": lambda self: self.prompt_words(),
-        "batch_number": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if self.p.batch_size == 1 or self.zip else self.p.batch_index + 1,
-        "batch_size": lambda self: self.p.batch_size,
-        "generation_number": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if (self.p.n_iter == 1 and self.p.batch_size == 1) or self.zip else self.p.iteration * self.p.batch_size + self.p.batch_index + 1,
+        "batch_number": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if self.effective_batch_size() == 1 or self.zip else self.effective_batch_index() + 1,
+        "batch_size": lambda self: self.effective_batch_size(),
+        "generation_number": lambda self: NOTHING_AND_SKIP_PREVIOUS_TEXT if (self.p.n_iter == 1 and self.effective_batch_size() == 1) or self.zip else self.effective_generation_index() + 1,
         "hasprompt": lambda self, *args: self.hasprompt(*args),  # accepts formats:[hasprompt<prompt1|default><prompt2>..]
         "clip_skip": lambda self: opts.data["CLIP_stop_at_last_layers"],
         "denoising": lambda self: self.p.denoising_strength if self.p and self.p.denoising_strength else NOTHING_AND_SKIP_PREVIOUS_TEXT,
@@ -435,6 +435,15 @@ class FilenameGenerator:
         self.image = image
         self.zip = zip
         self.basename = basename
+
+    def effective_batch_size(self):
+        return batch_planning.effective_output_batch_size(self.p)
+
+    def effective_batch_index(self):
+        return batch_planning.effective_output_batch_index(self.p)
+
+    def effective_generation_index(self):
+        return batch_planning.effective_output_generation_index(self.p)
 
     def get_vae_filename(self):
         """Get the name of the VAE file."""

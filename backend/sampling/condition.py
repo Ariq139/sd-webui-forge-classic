@@ -16,14 +16,25 @@ def lcm(a, b):
 
 
 class Condition:
-    def __init__(self, cond):
+    def __init__(self, cond, cache_key=None):
         self.cond = cond
+        self.cache_key = cache_key
 
     def _copy_with(self, cond):
         return self.__class__(cond)
 
-    def process_cond(self, batch_size, device, **kwargs):
-        return self._copy_with(repeat_to_batch_size(self.cond, batch_size).to(device))
+    def process_cond(self, batch_size, device, cache=None, **kwargs):
+        key = None
+        if cache is not None and self.cache_key is not None:
+            key = (self.cache_key, batch_size, device.type, device.index)
+            cached = cache.get(key)
+            if cached is not None:
+                return self._copy_with(cached)
+
+        cond = repeat_to_batch_size(self.cond, batch_size).to(device)
+        if key is not None:
+            cache[key] = cond
+        return self._copy_with(cond)
 
     def can_concat(self, other):
         if self.cond.shape != other.cond.shape:
@@ -38,9 +49,19 @@ class Condition:
 
 
 class ConditionNoiseShape(Condition):
-    def process_cond(self, batch_size, device, area, **kwargs):
+    def process_cond(self, batch_size, device, area, cache=None, **kwargs):
+        key = None
+        if cache is not None and self.cache_key is not None:
+            key = (self.cache_key, batch_size, device.type, device.index, tuple(area))
+            cached = cache.get(key)
+            if cached is not None:
+                return self._copy_with(cached)
+
         data = self.cond[:, :, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
-        return self._copy_with(repeat_to_batch_size(data, batch_size).to(device))
+        cond = repeat_to_batch_size(data, batch_size).to(device)
+        if key is not None:
+            cache[key] = cond
+        return self._copy_with(cond)
 
 
 class ConditionCrossAttn(Condition):
@@ -89,7 +110,7 @@ class ConditionConstant(Condition):
         return self.cond
 
 
-def compile_conditions(cond):
+def compile_conditions(cond, cache_namespace=None):
     if cond is None:
         return None
 
@@ -97,7 +118,7 @@ def compile_conditions(cond):
         result = dict(
             cross_attn=cond,
             model_conds=dict(
-                c_crossattn=ConditionCrossAttn(cond),
+                c_crossattn=ConditionCrossAttn(cond, cache_key=(cache_namespace, "crossattn")),
             ),
         )
         return [
@@ -107,17 +128,24 @@ def compile_conditions(cond):
     cross_attn = cond["crossattn"]
     pooled_output = cond["vector"]
 
-    result = dict(cross_attn=cross_attn, pooled_output=pooled_output, model_conds=dict(c_crossattn=ConditionCrossAttn(cross_attn), y=Condition(pooled_output)))
+    result = dict(
+        cross_attn=cross_attn,
+        pooled_output=pooled_output,
+        model_conds=dict(
+            c_crossattn=ConditionCrossAttn(cross_attn, cache_key=(cache_namespace, "crossattn")),
+            y=Condition(pooled_output, cache_key=(cache_namespace, "vector")),
+        ),
+    )
 
     if "guidance" in cond:
-        result["model_conds"]["guidance"] = Condition(cond["guidance"])
+        result["model_conds"]["guidance"] = Condition(cond["guidance"], cache_key=(cache_namespace, "guidance"))
 
     return [
         result,
     ]
 
 
-def compile_weighted_conditions(cond, weights):
+def compile_weighted_conditions(cond, weights, cache_namespace=None):
     transposed = list(map(list, zip(*weights)))
     results = []
 
@@ -133,7 +161,7 @@ def compile_weighted_conditions(cond, weights):
         else:
             feed = cond[current_indices]
 
-        h = compile_conditions(feed)
+        h = compile_conditions(feed, cache_namespace=(cache_namespace, tuple(current_indices)))
         h[0]["strength"] = current_weight
         results += h
 

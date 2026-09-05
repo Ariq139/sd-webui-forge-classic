@@ -780,7 +780,7 @@ def automatic_memory_management():
     for module in module_list:
         module.cpu()
 
-    memory_management.soft_empty_cache()
+    memory_management.soft_empty_cache(force=True)
     end = time.perf_counter()
 
     memory_management.logger.debug(f"Automatic Memory Management: {len(module_list)} Modules in {(end - start):.2f} seconds")

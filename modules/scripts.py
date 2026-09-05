@@ -67,6 +67,11 @@ class Script:
     args_to = None
     alwayson = False
 
+    requires_all_latents = False
+    """Opt in to request-wide p.latents_after_sampling, including final postprocess.
+    Otherwise only the current batch is retained through per-batch/image callbacks.
+    """
+
     is_txt2img = False
     is_img2img = False
     tabname = None

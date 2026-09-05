@@ -72,20 +72,21 @@ class ForgeDiffusionEngine:
             samples: list[torch.Tensor] = []
             for i in range(x.size(0)):
                 start_image = x[i : i + 1].movedim(1, -1).mul(0.5).add(0.5)
-                sample = self.forge_objects.vae.encode(start_image)
+                sample = self.forge_objects.vae.encode(start_image, output_device=x.device)
                 sample = self.forge_objects.vae.first_stage_model.process_in(sample)
                 samples.append(sample)
             return torch.cat(samples, dim=0).to(x)
         else:
             start_image = x.movedim(1, -1).mul(0.5).add(0.5)
-            sample = self.forge_objects.vae.encode(start_image)
+            sample = self.forge_objects.vae.encode(start_image, output_device=x.device)
             sample = self.forge_objects.vae.first_stage_model.process_in(sample)
             return sample.to(x)
 
     @torch.inference_mode()
-    def decode_first_stage(self, x: torch.Tensor):
+    def decode_first_stage(self, x: torch.Tensor, output_device=None):
+        output_device = x.device if output_device is None else output_device
         sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample)
+        sample = self.forge_objects.vae.decode(sample, output_device=output_device)
         if sample.ndim == 5:
             sample = sample.movedim(-1, (2 if self.is_wan else 1))
         elif sample.ndim == 4:
@@ -93,7 +94,7 @@ class ForgeDiffusionEngine:
         else:
             raise RuntimeError(f"Decoded image has unsupported shape {tuple(sample.shape)}")
         sample = sample.mul_(2.0).sub_(1.0)
-        return sample.to(x)
+        return sample.to(device=output_device, dtype=x.dtype)
 
     def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
         return 0, 75
@@ -118,7 +119,7 @@ class ForgeDiffusionEngine:
     def clear_references(self):
         # called by ImageStitch
         self.ref_latents.clear()
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
 
     def set_shift(self, shift: float):
         if not self.use_shift:

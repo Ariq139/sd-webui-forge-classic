@@ -62,7 +62,7 @@ def initialize_forge():
 
     device = memory_management.get_torch_device()
     torch.zeros((1, 1)).to(device, torch.float32)
-    memory_management.soft_empty_cache()
+    memory_management.soft_empty_cache(force=True)
 
     startup_timer.record("warmup")
 

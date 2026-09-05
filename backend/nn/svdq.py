@@ -764,7 +764,7 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
         else:
             self.offload_manager = None
             gc.collect()
-            soft_empty_cache()
+            soft_empty_cache(force=True)
 
     def load_state_dict(self, sd, *args, **kwargs):
         state_dict = self.state_dict()

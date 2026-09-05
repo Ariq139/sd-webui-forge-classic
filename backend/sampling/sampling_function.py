@@ -21,7 +21,14 @@ from backend.sampling.condition import (
 )
 
 
-def get_area_and_mult(conds, x_in, timestep_in):
+def condition_cache_allowed(model_options):
+    return not any(
+        model_options.get(option)
+        for option in ("conditioning_modifiers", "sampler_pre_cfg_function", "model_function_wrapper")
+    )
+
+
+def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
     area = (x_in.shape[2], x_in.shape[3], 0, 0)
     strength = 1.0
 
@@ -71,7 +78,7 @@ def get_area_and_mult(conds, x_in, timestep_in):
     conditioning = {}
     model_conds = conds["model_conds"]
     for c in model_conds:
-        conditioning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area)
+        conditioning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area, cache=condition_cache)
 
     control = conds.get("control", None)
 
@@ -153,26 +160,26 @@ def compute_cond_indices(cond_or_uncond, sigmas):
     return cond_indices, uncond_indices
 
 
-def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
+def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
     out_cond = torch.zeros_like(x_in)
     out_count = torch.ones_like(x_in) * 1e-37
 
-    out_uncond = torch.zeros_like(x_in)
-    out_uncond_count = torch.ones_like(x_in) * 1e-37
+    out_uncond = torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None
+    out_uncond_count = torch.ones_like(x_in) * 1e-37 if uncond is not None else None
 
     COND = 0
     UNCOND = 1
 
     to_run = []
     for x in cond:
-        p = get_area_and_mult(x, x_in, timestep)
+        p = get_area_and_mult(x, x_in, timestep, condition_cache)
         if p is None:
             continue
 
         to_run += [(p, COND)]
     if uncond is not None:
         for x in uncond:
-            p = get_area_and_mult(x, x_in, timestep)
+            p = get_area_and_mult(x, x_in, timestep, condition_cache)
             if p is None:
                 continue
 
@@ -190,7 +197,7 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
         to_batch = to_batch_temp[:1]
 
         if memory_management.signal_empty_cache:
-            memory_management.soft_empty_cache()
+            memory_management.soft_empty_cache(force=False)
 
         free_memory = memory_management.get_free_memory(x_in.device)
 
@@ -284,12 +291,13 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
 
     out_cond /= out_count
     del out_count
-    out_uncond /= out_uncond_count
+    if out_uncond_count is not None:
+        out_uncond /= out_uncond_count
     del out_uncond_count
     return out_cond, out_uncond
 
 
-def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False):
+def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False, condition_cache=None):
     edit_strength = sum((item["strength"] if "strength" in item else 1) for item in cond)
 
     if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
@@ -300,12 +308,22 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     for fn in model_options.get("sampler_pre_cfg_function", []):
         model, cond, uncond_, x, timestep, model_options = fn(model, cond, uncond_, x, timestep, model_options)
 
-    if getattr(dynamic_args.context_handler, "should_use_context", lambda *args: False)(x):
+    use_context = getattr(dynamic_args.context_handler, "should_use_context", lambda *args: False)(x)
+    direct_cond = (
+        not return_full and cond_scale == 1.0 and edit_strength == 1.0 and uncond_ is None
+        and not use_context
+        and not any(model_options.get(key) for key in (
+            "disable_cfg1_optimization", "sampler_pre_cfg_function", "sampler_cfg_function", "sampler_post_cfg_function",
+        ))
+    )
+    if use_context:
         cond_pred, uncond_pred = dynamic_args.context_handler.execute(calc_cond_uncond_batch, model, [cond, uncond_], x, timestep, model_options)
     else:
-        cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
+        cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options, condition_cache, materialize_uncond=return_full or not direct_cond)
 
-    if "sampler_cfg_function" in model_options:
+    if direct_cond:
+        cfg_result = cond_pred
+    elif "sampler_cfg_function" in model_options:
         args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
     elif not math.isclose(edit_strength, 1.0):
@@ -323,16 +341,18 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     return cfg_result
 
 
-def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra_model_options=None):
+def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra_model_options=None, condition_cache=None, cond_cache_key=None, uncond_cache_key=None, return_full=True):
     unet_patcher = self.inner_model.inner_model.forge_objects.unet
     model = unet_patcher.model
     control = unet_patcher.controlnet_linked_list
     extra_concat_condition = unet_patcher.extra_concat_condition
     x = denoiser_params.x
     timestep = denoiser_params.sigma
-    uncond = compile_conditions(denoiser_params.text_uncond)
-    cond = compile_weighted_conditions(denoiser_params.text_cond, cond_composition)
+    uncond = compile_conditions(denoiser_params.text_uncond, cache_namespace=uncond_cache_key)
+    cond = compile_weighted_conditions(denoiser_params.text_cond, cond_composition, cache_namespace=cond_cache_key)
     model_options = utils.join_dicts(unet_patcher.model_options, extra_model_options)
+    if not condition_cache_allowed(model_options):
+        condition_cache = None
     seed = self.p.seeds[0]
 
     if extra_concat_condition is not None:
@@ -344,9 +364,9 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
         if image_cond_in.shape[0] == x.shape[0] and image_cond_in.shape[2] == x.shape[2] and image_cond_in.shape[3] == x.shape[3]:
             if uncond is not None:
                 for i in range(len(uncond)):
-                    uncond[i]["model_conds"]["c_concat"] = Condition(image_cond_in)
+                    uncond[i]["model_conds"]["c_concat"] = Condition(image_cond_in, cache_key=("image", id(image_cond_in)))
             for i in range(len(cond)):
-                cond[i]["model_conds"]["c_concat"] = Condition(image_cond_in)
+                cond[i]["model_conds"]["c_concat"] = Condition(image_cond_in, cache_key=("image", id(image_cond_in)))
 
     if control is not None:
         for h in cond:
@@ -358,8 +378,7 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     for modifier in model_options.get("conditioning_modifiers", []):
         model, x, timestep, uncond, cond, cond_scale, model_options, seed = modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
 
-    denoised, cond_pred, uncond_pred = sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=True)
-    return denoised, cond_pred, uncond_pred
+    return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache)
 
 
 def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor):
@@ -392,4 +411,4 @@ def sampling_cleanup(unet: "UnetPatcher"):
     for cnet in unet.list_controlnets():
         cnet.cleanup()
 
-    memory_management.soft_empty_cache()
+    memory_management.soft_empty_cache(force=False)

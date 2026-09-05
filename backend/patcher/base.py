@@ -606,11 +606,6 @@ class ModelPatcher:
                 self.unpin_weight(key)
                 self.patch_weight_to_device(key, device_to=device_to)
 
-            if memory_management.is_device_cuda(device_to):
-                torch.cuda.synchronize()
-            elif memory_management.is_device_xpu(device_to):
-                torch.xpu.synchronize()
-
             logger.debug("lowvram: loaded module regularly {} {}".format(n, m))
             m.forge_patched_weights = True
 
@@ -633,6 +628,14 @@ class ModelPatcher:
             if full_load:
                 self.model.to(device_to)
                 mem_counter = self.model_size()
+
+        # Patching copies and kernels run on the caller's current stream. Finish
+        # them once before publishing residency, including transfers above.
+        # Forward-time offload streams retain their own waits in operations.py.
+        if memory_management.is_device_cuda(device_to):
+            torch.cuda.current_stream(device_to).synchronize()
+        elif memory_management.is_device_xpu(device_to):
+            torch.xpu.current_stream(device_to).synchronize()
 
         self.current_device = device_to
         self.model.lowvram_patch_counter += patch_counter

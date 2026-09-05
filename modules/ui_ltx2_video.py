@@ -293,7 +293,7 @@ def unload():
         _pipeline = None
         _pipeline_key = None
         gc.collect()
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
 
 
 def unload_forge_model():

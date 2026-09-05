@@ -503,6 +503,7 @@ class LoadedModel:
         self.currently_used = True
         self.model_finalizer = None
         self._patcher_finalizer = None
+        self._resident_state = None
 
     def _set_model(self, model):
         self._model = weakref.ref(model)
@@ -535,7 +536,24 @@ class LoadedModel:
         else:
             return self.model_memory()
 
-    def model_load(self, lowvram_model_memory=0, force_patch_weights=False):
+    def model_load(self, lowvram_model_memory=0, force_patch_weights=False, force_full_load=False):
+        model = self.model
+        resident_state = (self.device, model.current_device, model.model_dtype(), model.loaded_size(), model.patches_uuid, model.force_cast_weights, vram_state)
+        if (
+            not force_patch_weights and not force_full_load
+            and lowvram_model_memory >= 0
+            and vram_state is not VRAMState.NO_VRAM
+            and self.real_model is not None and self.real_model() is model.model
+            and self._resident_state == resident_state
+            and model.current_device == self.device
+            and model.loaded_size() >= model.model_size()
+            and not model.model.model_lowvram
+            and model.model.current_weight_patches_uuid == model.patches_uuid
+            and not model.object_patches and not model.weight_wrapper_patches
+            and model.model_options == {"transformer_options": {}}
+        ):
+            return model.model
+
         self.model.model_patches_to(self.device)
         self.model.model_patches_to(self.model.model_dtype())
 
@@ -550,8 +568,11 @@ class LoadedModel:
         bake_gguf_model(real_model)
 
         self.real_model = weakref.ref(real_model)
+        if self.model_finalizer is not None:
+            self.model_finalizer.detach()
         self.model_finalizer = weakref.finalize(real_model, cleanup_models)
         self.model_finalizer.atexit = False
+        self._resident_state = (self.device, model.current_device, model.model_dtype(), model.loaded_size(), model.patches_uuid, model.force_cast_weights, vram_state)
         return real_model
 
     def should_reload_model(self, force_patch_weights=False):
@@ -560,13 +581,15 @@ class LoadedModel:
         return False
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
+        self._resident_state = None
         if memory_to_free is not None:
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
                 if freed >= memory_to_free:
                     return False
         self.model.detach(unpatch_weights)
-        self.model_finalizer.detach()
+        if self.model_finalizer is not None:
+            self.model_finalizer.detach()
         self.model_finalizer = None
         self.real_model = None
         return True
@@ -666,12 +689,12 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
         unloaded_models.append(current_loaded_models.pop(i))
 
     if len(unloaded_model) > 0:
-        soft_empty_cache()
+        soft_empty_cache(force=True)
     else:
         if vram_state is not VRAMState.HIGH_VRAM:
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
-                soft_empty_cache()
+                soft_empty_cache(force=True)
     return unloaded_models
 
 
@@ -715,12 +738,13 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
     for loaded_model in models_to_load:
         to_unload = []
         for i in range(len(current_loaded_models)):
-            if loaded_model.model.is_clone(current_loaded_models[i].model):
+            if loaded_model.model is not current_loaded_models[i].model and loaded_model.model.is_clone(current_loaded_models[i].model):
                 to_unload = [i] + to_unload
         for i in to_unload:
             model_to_unload = current_loaded_models.pop(i)
             model_to_unload.model.detach(unpatch_all=False)
-            model_to_unload.model_finalizer.detach()
+            if model_to_unload.model_finalizer is not None:
+                model_to_unload.model_finalizer.detach()
 
     total_memory_required = {}
     for loaded_model in models_to_load:
@@ -728,7 +752,7 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.1 + extra_mem, device)
+            free_memory(total_memory_required[device] * 1.1 + extra_mem, device, keep_loaded=models_to_load)
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
@@ -758,7 +782,9 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights, force_full_load=force_full_load)
+        if loaded_model in current_loaded_models:
+            current_loaded_models.remove(loaded_model)
         current_loaded_models.insert(0, loaded_model)
 
     if (moving_time := time.perf_counter() - execution_start_time) > 0.1:
@@ -801,7 +827,7 @@ def cleanup_models_gc(*, target: list["ModelPatcher"] = []):
         del m
 
     gc.collect()
-    soft_empty_cache()
+    soft_empty_cache(force=True)
 
     for mdl in current_loaded_models:
         if mdl.is_dead():
@@ -811,7 +837,8 @@ def cleanup_models_gc(*, target: list["ModelPatcher"] = []):
 def cleanup_models():
     to_delete = []
     for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
+        real_model = current_loaded_models[i].real_model
+        if real_model is not None and real_model() is None:
             to_delete = [i] + to_delete
 
     for i in to_delete:
@@ -1430,7 +1457,14 @@ def lora_compute_dtype(device: torch.device) -> torch.dtype:
 signal_empty_cache = False
 
 
-def soft_empty_cache(force=False):
+def soft_empty_cache(force=True):
+    global signal_empty_cache
+
+    requested = force or signal_empty_cache
+    signal_empty_cache = False
+    if not requested:
+        return
+
     if cpu_state is CPUState.MPS:
         torch.mps.empty_cache()
     elif is_intel_xpu():
@@ -1440,9 +1474,6 @@ def soft_empty_cache(force=False):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-
-    global signal_empty_cache
-    signal_empty_cache = False
 
 
 def unload_model(model: "ModelPatcher") -> bool:

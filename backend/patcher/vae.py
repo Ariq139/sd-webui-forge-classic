@@ -236,30 +236,35 @@ class VAE:
         n.is_wan = self.is_wan
         return n
 
-    def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
+    def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
+        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=output_device)) / 3.0)
         return output
 
-    def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
+    def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8), output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        return self.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
+        return self.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=output_device))
 
-    def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap=64):
+    def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap=64, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
+        samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=output_device)
+        samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=output_device)
+        samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=output_device)
         samples /= 3.0
         return samples
 
-    def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64)):
+    def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64), output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        return tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
+        return tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=output_device)
 
-    def decode(self, samples_in: torch.Tensor):
+    def decode(self, samples_in: torch.Tensor, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         if memory_management.VAE_ALWAYS_TILED:
-            return self.decode_tiled(samples_in).to(self.output_device)
+            return self.decode_tiled(samples_in, output_device=output_device)
 
         pixel_samples = None
         _tile = False
@@ -273,10 +278,13 @@ class VAE:
 
             for x in range(0, samples_in.shape[0], batch_number):
                 samples = samples_in[x : x + batch_number].to(device=self.device, dtype=self.vae_dtype)
-                out = self.process_output(self.first_stage_model.decode(samples).to(device=self.output_device, dtype=torch.float32, copy=True))
+                out = self.process_output(self.first_stage_model.decode(samples).to(device=output_device, dtype=torch.float32))
                 if pixel_samples is None:
-                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                pixel_samples[x : x + batch_number] = out
+                    if out.shape[0] == samples_in.shape[0]:
+                        pixel_samples = out
+                        break
+                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=output_device, dtype=out.dtype)
+                pixel_samples[x : x + out.shape[0]] = out
         except Exception as e:
             if not memory_management.is_oom(e):
                 raise e
@@ -284,13 +292,17 @@ class VAE:
             _tile = True
 
         if _tile:
-            memory_management.soft_empty_cache()
-            return self.decode_tiled(samples_in).to(self.output_device)
+            pixel_samples = None
+            samples = None
+            out = None
+            memory_management.soft_empty_cache(force=True)
+            return self.decode_tiled(samples_in, output_device=output_device)
 
-        pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
+        pixel_samples = pixel_samples.movedim(1, -1)
         return pixel_samples
 
-    def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
+    def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
 
@@ -301,16 +313,17 @@ class VAE:
         }
 
         if not self.is_wan:
-            output = self.decode_tiled_(samples, **args)
+            output = self.decode_tiled_(samples, output_device=output_device, **args)
         else:
             args["overlap"] = (1, overlap, overlap)
-            output = self.decode_tiled_3d(samples, **args)
+            output = self.decode_tiled_3d(samples, output_device=output_device, **args)
 
         return output.movedim(1, -1)
 
-    def encode(self, pixel_samples: torch.Tensor):
+    def encode(self, pixel_samples: torch.Tensor, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         if memory_management.VAE_ALWAYS_TILED:
-            return self.encode_tiled(pixel_samples)
+            return self.encode_tiled(pixel_samples, output_device=output_device)
 
         _samples = pixel_samples.movedim(-1, 1)
         if self.is_wan and _samples.ndim < 5:
@@ -325,10 +338,13 @@ class VAE:
             samples = None
             for x in range(0, _samples.shape[0], batch_number):
                 pixels_in = self.process_input(_samples[x : x + batch_number]).to(self.vae_dtype).to(self.device)
-                out = self.first_stage_model.encode(pixels_in).to(self.output_device).float()
+                out = self.first_stage_model.encode(pixels_in).to(device=output_device, dtype=torch.float32)
                 if samples is None:
-                    samples = torch.empty((_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                samples[x : x + batch_number] = out
+                    if out.shape[0] == _samples.shape[0]:
+                        samples = out
+                        break
+                    samples = torch.empty((_samples.shape[0],) + tuple(out.shape[1:]), device=output_device, dtype=out.dtype)
+                samples[x : x + out.shape[0]] = out
             _tile = False
         except Exception as e:
             if not memory_management.is_oom(e):
@@ -337,12 +353,16 @@ class VAE:
             _tile = True
 
         if _tile:
-            memory_management.soft_empty_cache()
-            return self.encode_tiled(pixel_samples)
+            samples = None
+            pixels_in = None
+            out = None
+            memory_management.soft_empty_cache(force=True)
+            return self.encode_tiled(pixel_samples, output_device=output_device)
 
         return samples
 
-    def encode_tiled(self, pixel_samples: torch.Tensor, tile_x: int = 512, tile_y: int = 512, overlap: int = 64):
+    def encode_tiled(self, pixel_samples: torch.Tensor, tile_x: int = 512, tile_y: int = 512, overlap: int = 64, output_device=None):
+        output_device = self.output_device if output_device is None else output_device
         pixel_samples = pixel_samples.movedim(-1, 1)
         if self.is_wan:
             pixel_samples = pixel_samples.movedim(1, 0).unsqueeze(0)
@@ -357,13 +377,13 @@ class VAE:
         }
 
         if not self.is_wan:
-            return self.encode_tiled_(pixel_samples, **args)
+            return self.encode_tiled_(pixel_samples, output_device=output_device, **args)
 
         args["tile_t"] = self.upscale_ratio[0](9999)
         args["overlap"] = (1, overlap, overlap)
 
         maximum = self.upscale_ratio[0](self.downscale_ratio[0](pixel_samples.shape[2]))
-        return self.encode_tiled_3d(pixel_samples[:, :, :maximum], **args)
+        return self.encode_tiled_3d(pixel_samples[:, :, :maximum], output_device=output_device, **args)
 
     @staticmethod
     def process_input(image: torch.Tensor):

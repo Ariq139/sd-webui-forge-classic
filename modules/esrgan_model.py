@@ -47,7 +47,7 @@ class UpscalerESRGAN(Upscaler):
             self.scalers.append(scaler_data)
 
     def do_upscale(self, img: Image.Image, selected_model: str):
-        soft_empty_cache()
+        soft_empty_cache(force=True)
 
         try:
             model = self.load_model(selected_model)

@@ -825,7 +825,7 @@ def slice_attention_vae(q, k, v):
                 raise e
 
         logger.warning("Out of Memory Error; retrying with higher steps...")
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
         steps *= 2
 
     return r1
@@ -889,7 +889,7 @@ def pytorch_attention_vae(q, k, v):
         _fallback = True
 
     if _fallback:
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
         out = slice_attention_vae(q.view(B, -1, C), k.view(B, -1, C).transpose(1, 2), v.view(B, -1, C).transpose(1, 2)).reshape(orig_shape)
 
     return out

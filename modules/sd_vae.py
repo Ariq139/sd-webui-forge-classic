@@ -48,7 +48,7 @@ def delete_base_vae():
     global base_vae, checkpoint_info
     base_vae = None
     checkpoint_info = None
-    memory_management.soft_empty_cache()
+    memory_management.soft_empty_cache(force=True)
 
 
 def restore_base_vae(model):

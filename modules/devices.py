@@ -43,8 +43,8 @@ def get_device_for(*args, **kwargs) -> torch.device:
     return device
 
 
-def torch_gc():
-    memory_management.soft_empty_cache()
+def torch_gc(force=True):
+    memory_management.soft_empty_cache(force=force)
 
 
 def autocast(*args, **kwargs):

@@ -1,7 +1,7 @@
 import torch
 
 from backend.sampling.sampling_function import sampling_function
-from modules import prompt_parser, sd_samplers_common
+from modules import prompt_parser, script_callbacks, sd_samplers_common
 from modules.script_callbacks import AfterCFGCallbackParams, CFGDenoiserParams, cfg_after_cfg_callback, cfg_denoiser_callback
 from modules.shared import opts, state
 
@@ -59,6 +59,30 @@ class CFGDenoiser(torch.nn.Module):
         self.classic_ddim_eps_estimation = False
 
         self._refiner_pass = False
+        self._conditioning_device_cache = {}
+
+    @staticmethod
+    def _selected_schedule_entry(schedule, step):
+        for entry in schedule:
+            if step <= entry.end_at_step:
+                return entry
+        return schedule[0]
+
+    @classmethod
+    def _cond_cache_key(cls, cond, step):
+        if cond is None:
+            return None
+        return tuple(id(cls._selected_schedule_entry(schedule, step).cond) for schedule in cond)
+
+    @classmethod
+    def _multicond_cache_key(cls, cond, step):
+        return tuple(
+            tuple((id(cls._selected_schedule_entry(item.schedules, step).cond), item.weight) for item in batch)
+            for batch in cond.batch
+        )
+
+    def clear_conditioning_cache(self):
+        self._conditioning_device_cache.clear()
 
     @property
     def inner_model(self):
@@ -116,6 +140,8 @@ class CFGDenoiser(torch.nn.Module):
             uncond = self.sampler.sampler_extra_args["uncond"]
             self._refiner_pass = True
 
+        cond_cache_key = self._multicond_cache_key(cond, self.step)
+        uncond_cache_key = self._cond_cache_key(uncond, self.step)
         cond_composition, cond = prompt_parser.reconstruct_multicond_batch(cond, self.step)
         uncond = prompt_parser.reconstruct_cond_batch(uncond, self.step) if uncond is not None else None
 
@@ -148,7 +174,20 @@ class CFGDenoiser(torch.nn.Module):
                 self.p.extra_generation_params["NGMS all steps"] = opts.s_min_uncond_all
 
         extra_model_options = kwargs.get("model_options", {})
-        denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
+        condition_cache = None
+        if not script_callbacks.callback_map["callbacks_cfg_denoiser"]:
+            condition_cache = self._conditioning_device_cache
+        denoised = sampling_function(
+            self,
+            denoiser_params=denoiser_params,
+            cond_scale=cond_scale,
+            cond_composition=cond_composition,
+            extra_model_options=extra_model_options,
+            condition_cache=condition_cache,
+            cond_cache_key=cond_cache_key,
+            uncond_cache_key=uncond_cache_key,
+            return_full=False,
+        )
 
         if self.mask is not None:
             blended_latent = denoised * self.nmask + self.init_latent * self.mask

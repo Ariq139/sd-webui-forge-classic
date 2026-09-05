@@ -276,7 +276,7 @@ def unload_model_weights(*args, **kwargs):
     model_data.sd_model = FakeInitialModel()
     model_data.forge_hash = ""
 
-    memory_management.soft_empty_cache()
+    memory_management.soft_empty_cache(force=True)
     gc.collect()
 
 
@@ -340,7 +340,7 @@ def forge_model_reload():
         model_data.sd_model = None
         model_data.forge_hash = ""
         memory_management.unload_all_models()
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
         gc.collect()
 
     timer.record("unload existing model")
@@ -366,7 +366,7 @@ def forge_model_reload():
     else:
         timer.record("forge model load")
     finally:
-        memory_management.soft_empty_cache()
+        memory_management.soft_empty_cache(force=True)
 
     sd_model.extra_generation_params = {}
     sd_model.comments = []

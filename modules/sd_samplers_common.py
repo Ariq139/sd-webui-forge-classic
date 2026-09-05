@@ -17,6 +17,7 @@ from PIL import Image
 from backend.args import dynamic_args
 from backend.sampling.sampling_function import sampling_cleanup, sampling_prepare
 from modules import (
+    batch_planning,
     devices,
     extra_networks,
     images,
@@ -55,7 +56,7 @@ def setup_img2img_steps(p, steps=None):
 approximation_indexes = {"Full": 0, "Approx NN": 1, "RGB": 2, "TAESD": 3}
 
 
-def samples_to_images_tensor(sample, approximation=None, model=None):
+def samples_to_images_tensor(sample, approximation=None, model=None, output_device=None):
     """Transforms 4-channel latent space images into 3-channel RGB image tensors, with values in range [-1, 1]."""
     x_sample = None
 
@@ -79,7 +80,19 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
     if approximation == 2:
         x_sample = sd_vae_approx.cheap_approximation(sample).detach()
     elif x_sample is None:
-        x_sample = (model or shared.sd_model).decode_first_stage(sample)
+        decode = (model or shared.sd_model).decode_first_stage
+        if output_device is None:
+            x_sample = decode(sample)
+        else:
+            try:
+                x_sample = decode(sample, output_device=output_device)
+            except TypeError as error:
+                if "unexpected keyword argument 'output_device'" not in str(error):
+                    raise
+                x_sample = decode(sample)
+
+    if output_device is not None and x_sample.device != torch.device(output_device):
+        x_sample = x_sample.to(output_device)
 
     return x_sample
 
@@ -99,9 +112,9 @@ def single_sample_to_image(sample, approximation=None):
     return Image.fromarray(x_sample)
 
 
-def decode_first_stage(model, x):
+def decode_first_stage(model, x, output_device=None):
     approx_index = approximation_indexes.get(opts.sd_vae_decode_method, 0)
-    return samples_to_images_tensor(x, approx_index, model)
+    return samples_to_images_tensor(x, approx_index, model, output_device=output_device)
 
 
 def sample_to_image(samples, index=0, approximation=None):
@@ -280,6 +293,7 @@ def apply_refiner(cfg_denoiser: "CFGDenoiser", x: torch.Tensor, sigma: torch.Ten
 
     cfg_denoiser.p.extra_generation_params["Refiner"] = refiner_checkpoint_info.short_title
     cfg_denoiser.p.extra_generation_params["Refiner switch at"] = refiner_switch_at
+    cfg_denoiser.clear_conditioning_cache()
 
     if opts.refiner_fast_sd:
         sd_model: "ForgeDiffusionEngine" = shared.sd_model
@@ -446,6 +460,8 @@ class Sampler:
             return state.current_latent
         except InterruptedException:
             return state.current_latent
+        finally:
+            self.model_wrap_cfg.clear_conditioning_cache()
 
     def number_of_needed_noises(self, p):
         return p.steps
@@ -456,6 +472,7 @@ class Sampler:
         self.model_wrap_cfg.mask = p.mask if hasattr(p, "mask") else None
         self.model_wrap_cfg.nmask = p.nmask if hasattr(p, "nmask") else None
         self.model_wrap_cfg.step = 0
+        self.model_wrap_cfg.clear_conditioning_cache()
         self.model_wrap_cfg.image_cfg_scale = getattr(p, "image_cfg_scale", None)
         self.eta = p.eta if p.eta is not None else getattr(opts, self.eta_option_field, 0.0)
         self.s_min_uncond = getattr(p, "s_min_uncond", 0.0)
@@ -503,7 +520,12 @@ class Sampler:
         from k_diffusion.sampling import BrownianTreeNoiseSampler
 
         sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
-        current_iter_seeds = p.all_seeds[p.iteration * p.batch_size : (p.iteration + 1) * p.batch_size]
+        current_iter_seeds = batch_planning.select_batch_values(
+            p.all_seeds,
+            p.iteration,
+            p.batch_size,
+            getattr(p, "_current_batch_indices", None),
+        )
         return BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=current_iter_seeds)
 
     def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):

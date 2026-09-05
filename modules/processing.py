@@ -28,7 +28,8 @@ from backend import args, memory_management
 from backend.logging import setup_logger
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
-from modules import devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
+from modules.latent_retention import retain_latents, scripts_require_latents
+from modules import batch_planning, devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
 from modules.sd_models import apply_token_merging, forge_model_reload
 from modules.sd_samplers_common import approximation_indexes, decode_first_stage, images_tensor_to_samples
 from modules.shared import cmd_opts, opts, state
@@ -611,10 +612,12 @@ class DecodedSamples(list):
     already_decoded = True
 
 
-def decode_latent_batch(model, batch, target_device=None, check_for_nans=False):
-    samples = DecodedSamples()
-    samples_pytorch = decode_first_stage(model, batch).to(target_device)
+def decode_latent_batch(model, batch, target_device=None, check_for_nans=False, as_tensor=False):
+    samples_pytorch = decode_first_stage(model, batch, output_device=target_device)
+    if as_tensor:
+        return samples_pytorch
 
+    samples = DecodedSamples()
     for x in samples_pytorch:
         samples.append(x)
 
@@ -803,22 +806,25 @@ def _extra_network_signature(prompt: str):
 
 
 def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
-    """Do not apply different per-image LoRA sets to one shared model batch."""
+    """Plan homogeneous LoRA batches while preserving each image's original index."""
+    p._extra_network_batch_plan = None
+    p._current_output_index = None
+    p._extra_network_original_batch_size = p.batch_size
+    p._extra_network_original_n_iter = p.n_iter
     if p.disable_extra_networks or p.batch_size <= 1 or len(p.all_prompts or ()) <= 1:
         return
 
     signatures = [_extra_network_signature(prompt) for prompt in p.all_prompts]
+    if getattr(p, "enable_hr", False) and getattr(p, "all_hr_prompts", None):
+        signatures = [
+            (signature, _extra_network_signature(p.all_hr_prompts[index]))
+            for index, signature in enumerate(signatures)
+        ]
     if len(set(signatures)) <= 1:
         return
 
-    # Different LoRA selections are safe when they already occupy separate
-    # requested batches. Only split the run when a single model batch would
-    # contain more than one selection.
-    has_mixed_batch = any(
-        len(set(signatures[start : start + p.batch_size])) > 1
-        for start in range(0, len(signatures), p.batch_size)
-    )
-    if not has_mixed_batch:
+    batch_plan = batch_planning.group_extra_network_batches(signatures, p.batch_size)
+    if batch_plan is None:
         logger.info("Different extra-network selections are batch-aligned; keeping the requested batch size.")
         return
 
@@ -827,9 +833,19 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
         p.batch_size = 1
         return
 
-    logger.info("Different extra-network selections detected; processing one image per batch.")
-    p.batch_size = 1
-    p.n_iter = len(p.all_prompts)
+    if getattr(p, "init_images", None) is not None:
+        logger.info("Different extra-network selections detected; img2img will process one image per batch.")
+        p.batch_size = 1
+        p.n_iter = len(p.all_prompts)
+        return
+
+    p._extra_network_batch_plan = batch_plan
+    p.n_iter = len(batch_plan)
+    logger.info(
+        "Different extra-network selections detected; regrouped %s images into %s homogeneous batches.",
+        len(signatures),
+        len(batch_plan),
+    )
 
 
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
@@ -1000,6 +1016,14 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
 
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
+    retain_all = bool(getattr(opts, "forge_retain_all_latents", False) or getattr(p, "retain_all_latents", False))
+    if p.scripts is not None:
+        retain_all = retain_all or scripts_require_latents(p.scripts, p.script_args)
+    with retain_latents(p, retain_all), batch_planning.restore_grouped_batch_settings(p):
+        return _process_images_inner(p)
+
+
+def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
     _times = 1
@@ -1020,7 +1044,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     else:
         assert p.prompt is not None
 
-    devices.torch_gc()
+    devices.torch_gc(force=False)
 
     seed = get_fixed_seed(p.seed)
     subseed = get_fixed_seed(p.subseed)
@@ -1070,8 +1094,15 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     if p.infinite_generation:
         p._infinite_base_seeds = list(p.all_seeds)
         p._infinite_base_subseeds = list(p.all_subseeds)
+    batch_plan = getattr(p, "_extra_network_batch_plan", None)
+    original_batch_size = getattr(p, "_extra_network_original_batch_size", p.batch_size)
+    original_n_iter = getattr(p, "_extra_network_original_n_iter", p.n_iter)
     infotexts = []
     output_images = []
+    output_order_records = []
+    infotext_order_records = []
+    latent_order_records = []
+    pixel_order_records = []
     with torch.inference_mode():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -1111,12 +1142,23 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 _refresh_infinite_batch(p)
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
-            batch_start = 0 if p.infinite_generation else n * p.batch_size
-            batch_end = batch_start + p.batch_size
-            p.prompts = p.all_prompts[batch_start:batch_end]
-            p.negative_prompts = p.all_negative_prompts[batch_start:batch_end]
-            p.seeds = p.all_seeds[batch_start:batch_end]
-            p.subseeds = p.all_subseeds[batch_start:batch_end]
+            if batch_plan is not None:
+                batch_indices = batch_plan[n]
+                p._current_batch_indices = batch_indices
+                p.batch_size = len(batch_indices)
+                p.prompts = [p.all_prompts[index] for index in batch_indices]
+                p.negative_prompts = [p.all_negative_prompts[index] for index in batch_indices]
+                p.seeds = [p.all_seeds[index] for index in batch_indices]
+                p.subseeds = [p.all_subseeds[index] for index in batch_indices]
+            else:
+                p._current_batch_indices = None
+                batch_start = 0 if p.infinite_generation else n * p.batch_size
+                batch_end = batch_start + p.batch_size
+                batch_indices = list(range(batch_start, min(batch_end, len(p.all_prompts))))
+                p.prompts = p.all_prompts[batch_start:batch_end]
+                p.negative_prompts = p.all_negative_prompts[batch_start:batch_end]
+                p.seeds = p.all_seeds[batch_start:batch_end]
+                p.subseeds = p.all_subseeds[batch_start:batch_end]
 
             if args.dynamic_args.pid:
                 _shape = (3, p.height, p.width)
@@ -1163,8 +1205,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
-            for x_sample in samples_ddim:
+            for sample_index, x_sample in enumerate(samples_ddim):
                 p.latents_after_sampling.append(x_sample)
+                if batch_plan is not None and p._retain_all_latents:
+                    original_index = batch_indices[min(sample_index, len(batch_indices) - 1)]
+                    latent_order_records.append((original_index, len(latent_order_records), x_sample))
 
             if sigmas_backup is not None:
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(sigmas_backup)
@@ -1173,16 +1218,26 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 ps = scripts.PostSampleArgs(samples_ddim)
                 p.scripts.post_sample(p, ps)
                 samples_ddim = ps.samples
+                del ps  # Do not retain this batch through the next sampling call.
 
             if getattr(samples_ddim, "already_decoded", False):
                 x_samples_ddim = samples_ddim
             else:
                 if opts.sd_vae_decode_method != "Full":
                     p.extra_generation_params["VAE Decoder"] = opts.sd_vae_decode_method
-                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
+                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True, as_tensor=True)
 
-            x_samples_ddim = torch.stack(x_samples_ddim).float()
-            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+            if not isinstance(x_samples_ddim, torch.Tensor):
+                x_samples_ddim = torch.stack(x_samples_ddim)
+            x_samples_ddim = x_samples_ddim.float()
+            if (
+                isinstance(samples_ddim, torch.Tensor)
+                and x_samples_ddim.device == samples_ddim.device
+                and x_samples_ddim.untyped_storage().data_ptr() == samples_ddim.untyped_storage().data_ptr()
+            ):
+                # Passthrough decoders and views must not mutate retained samples.
+                x_samples_ddim = x_samples_ddim.clone()
+            x_samples_ddim.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
 
             if len(x_samples_ddim.shape) == 5:
                 x_samples_ddim = x_samples_ddim.reshape(-1, *x_samples_ddim.shape[-3:])
@@ -1190,7 +1245,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             del samples_ddim
 
             devices.test_for_nans(x_samples_ddim)
-            devices.torch_gc()
+            devices.torch_gc(force=False)
 
             state.nextjob()
 
@@ -1200,6 +1255,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 if p.infinite_generation:
                     p.prompts = batch_prompts
                     p.negative_prompts = batch_negative_prompts
+                elif batch_plan is not None:
+                    p.prompts = [p.all_prompts[index] for index in batch_indices]
+                    p.negative_prompts = [p.all_negative_prompts[index] for index in batch_indices]
                 else:
                     p.prompts = p.all_prompts[n * p.batch_size : (n + 1) * p.batch_size]
                     p.negative_prompts = p.all_negative_prompts[n * p.batch_size : (n + 1) * p.batch_size]
@@ -1213,8 +1271,12 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     return create_infotext(p, batch_prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=batch_negative_prompts)
 
                 if not p.infinite_generation and opts.save_prompt_comments and hasattr(p, "_all_prompts_c") and hasattr(p, "_all_negative_prompts_c"):
-                    _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
-                    _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
+                    if batch_plan is not None:
+                        _prompts = [p._all_prompts_c[batch_index] for batch_index in batch_indices]
+                        _negative_prompts = [p._all_negative_prompts_c[batch_index] for batch_index in batch_indices]
+                    else:
+                        _prompts = p._all_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
+                        _negative_prompts = p._all_negative_prompts_c[n * p.batch_size : (n + 1) * p.batch_size]
                     return create_infotext(p, _prompts, p.seeds, p.subseeds, use_main_prompt=False, index=index, all_negative_prompts=_negative_prompts)
 
                 return create_infotext(p, p.prompts, p.seeds, p.subseeds, use_main_prompt=use_main_prompt, index=index, all_negative_prompts=p.negative_prompts)
@@ -1226,9 +1288,13 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             for i, x_sample in enumerate(x_samples_ddim):
                 p.batch_index = i
                 sample_index = i // _times if _is_video else i
+                original_index = batch_indices[min(sample_index, len(batch_indices) - 1)]
+                script_image_index = original_index if batch_plan is not None else i + p.iteration * p.batch_size
+                p._current_output_index = original_index if batch_plan is not None else None
                 image_prompts = batch_prompts if p.infinite_generation else p.prompts
                 prompt_index = min(sample_index, len(image_prompts) - 1)
                 image_prompt = image_prompts[prompt_index]
+                output_start = len(output_images)
                 x_sample = x_sample.cpu().numpy()
                 if x_sample.ndim != 3 or x_sample.shape[0] not in (1, 3, 4):
                     raise RuntimeError(
@@ -1254,7 +1320,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 image = Image.fromarray(x_sample)
 
                 if p.scripts is not None:
-                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
+                    pp = scripts.PostprocessImageArgs(image, script_image_index)
                     p.scripts.postprocess_image(p, pp)
                     image = pp.image
 
@@ -1285,9 +1351,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 image, original_denoised_image = apply_overlay(image, p.paste_to, overlay_image)
 
                 p.pixels_after_sampling.append(image)
+                if batch_plan is not None:
+                    pixel_order_records.append((original_index, len(pixel_order_records), image))
 
                 if p.scripts is not None:
-                    pp = scripts.PostprocessImageArgs(image, i + p.iteration * p.batch_size)
+                    pp = scripts.PostprocessImageArgs(image, script_image_index)
                     p.scripts.postprocess_image_after_composite(p, pp)
                     image = pp.image
 
@@ -1296,6 +1364,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
                 text = infotext(sample_index)
                 infotexts.append(text)
+                if batch_plan is not None:
+                    infotext_order_records.append((original_index, len(infotext_order_records), text))
                 if opts.enable_pnginfo:
                     image.info["parameters"] = text
                 output_images.append(image)
@@ -1315,18 +1385,46 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                         if opts.return_mask_composite:
                             output_images.append(image_mask_composite)
 
+                if batch_plan is not None:
+                    output_order_records.append((original_index, len(output_order_records), output_start, len(output_images)))
+
+            p._current_output_index = None
+
             if _is_video:
                 video_path = images.save_video(p, frames, info=infotext(use_main_prompt=True))
                 del frames
 
             del x_samples_ddim
 
-            devices.torch_gc()
+            if not p._retain_all_latents:
+                p.latents_after_sampling.clear()
+
+            devices.torch_gc(force=False)
 
             if n == 0 and not cmd_opts.no_prompt_history:
                 with open(os.path.join(paths.data_path, "params.txt"), "w", encoding="utf8") as file:
                     processed = Processed(p, [])
                     file.write(processed.infotext(p, 0))
+
+        if batch_plan is not None:
+            output_images, infotexts = batch_planning.restore_grouped_output_order(output_images, output_order_records, infotext_order_records)
+            p.batch_size = original_batch_size
+            p.n_iter = original_n_iter
+            generated_indices = {record[0] for record in output_order_records}
+            completed = len(generated_indices) >= len(p.all_prompts)
+            state_index = len(p.all_prompts) - 1 if completed and p.all_prompts else (output_order_records[-1][0] if output_order_records else 0)
+            p.iteration = state_index // original_batch_size
+            last_batch_start = p.iteration * original_batch_size
+            last_batch_end = last_batch_start + original_batch_size
+            p.prompts = p.all_prompts[last_batch_start:last_batch_end]
+            p.negative_prompts = p.all_negative_prompts[last_batch_start:last_batch_end]
+            p.seeds = p.all_seeds[last_batch_start:last_batch_end]
+            p.subseeds = p.all_subseeds[last_batch_start:last_batch_end]
+            if p._retain_all_latents:
+                p.latents_after_sampling[:] = [latent for _, _, latent in sorted(latent_order_records)]
+            p.pixels_after_sampling[:] = [pixel for _, _, pixel in sorted(pixel_order_records)]
+            p._current_batch_indices = None
+            p._current_output_index = None
 
         if not infotexts:
             infotexts.append(Processed(p, []).infotext(p, 0))
@@ -1336,7 +1434,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         index_of_first_image = 0
         unwanted_grid_because_of_img_count = len(output_images) < 2 and opts.grid_only_if_multiple
         if (opts.return_grid or opts.grid_save) and not p.do_not_save_grid and not unwanted_grid_because_of_img_count:
-            grid = images.image_grid(output_images, p.batch_size)
+            grid = images.image_grid(output_images, original_batch_size)
 
             if opts.return_grid:
                 text = infotext(use_main_prompt=True)
@@ -1478,12 +1576,14 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             self.extra_generation_params["Hires resize"] = f"{self.hr_upscale_to_x}x{self.hr_upscale_to_y}"
 
     @staticmethod
-    def get_hr_prompt(p, index, prompt_text, **kwargs):
+    def get_hr_prompt(p, index, prompt_text, all_prompts=None, **kwargs):
+        index = batch_planning.effective_prompt_index(p, index, all_prompts)
         hr_prompt = p.all_hr_prompts[index]
         return hr_prompt if hr_prompt != prompt_text else None
 
     @staticmethod
-    def get_hr_negative_prompt(p, index, negative_prompt, **kwargs):
+    def get_hr_negative_prompt(p, index, negative_prompt, all_prompts=None, **kwargs):
+        index = batch_planning.effective_prompt_index(p, index, all_prompts)
         hr_negative_prompt = p.all_hr_negative_prompts[index]
         return hr_negative_prompt if hr_negative_prompt != negative_prompt else None
 
@@ -1838,10 +1938,15 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         res = super().parse_extra_network_prompts()
 
         if self.enable_hr:
-            batch_start = 0 if self.infinite_generation else self.iteration * self.batch_size
-            batch_end = batch_start + self.batch_size
-            self.hr_prompts = self.all_hr_prompts[batch_start:batch_end]
-            self.hr_negative_prompts = self.all_hr_negative_prompts[batch_start:batch_end]
+            batch_indices = getattr(self, "_current_batch_indices", None)
+            if batch_indices is None:
+                batch_start = 0 if self.infinite_generation else self.iteration * self.batch_size
+                batch_end = batch_start + self.batch_size
+                self.hr_prompts = self.all_hr_prompts[batch_start:batch_end]
+                self.hr_negative_prompts = self.all_hr_negative_prompts[batch_start:batch_end]
+            else:
+                self.hr_prompts = [self.all_hr_prompts[index] for index in batch_indices]
+                self.hr_negative_prompts = [self.all_hr_negative_prompts[index] for index in batch_indices]
 
             self.hr_prompts, self.hr_extra_network_data = extra_networks.parse_prompts(self.hr_prompts)
 

@@ -88,7 +88,7 @@ class Krea2(ForgeDiffusionEngine):
         width = round(width / 16.0) * 16
         height = round(height / 16.0) * 16
         s = torch.nn.functional.interpolate(samples, size=(height, width), mode="area")
-        sample = self.forge_objects.vae.encode(s.movedim(1, -1)[:, :, :, :3])
+        sample = self.forge_objects.vae.encode(s.movedim(1, -1)[:, :, :, :3], output_device=s.device)
         _latent = self.forge_objects.vae.first_stage_model.process_in(sample)
 
         return (_vision, _latent)
