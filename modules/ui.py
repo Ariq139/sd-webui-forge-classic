@@ -596,7 +596,7 @@ def create_ui():
                             )
 
                         with FormRow():
-                            resize_mode = gr.Radio(label="Resize mode", elem_id="resize_mode", choices=["Just resize", "Crop and resize", "Resize and fill", "Just resize (latent upscale)"], type="index", value="Crop and resize")
+                            resize_mode = gr.Radio(label="Resize Mode", elem_id="resize_mode", choices=["Just Resize", "Crop and Resize", "Resize and Fill", "Latent Upscale", "Preserve Aspect Ratio"], type="index", value=1)
 
                     elif category == "dimensions":
                         with FormRow():
