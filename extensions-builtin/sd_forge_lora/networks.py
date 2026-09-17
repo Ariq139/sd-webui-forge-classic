@@ -1,3 +1,4 @@
+import functools
 import logging
 import os.path
 import re
@@ -16,7 +17,6 @@ from backend.patcher.lora import load_lora, model_lora_keys_clip, model_lora_key
 from backend.state_dict import state_dict_prefix_replace
 from backend.utils import load_torch_file
 from modules import errors, scripts, sd_models, shared
-from modules_forge.lora_detection import detect_lora_state_dict
 
 logger = logging.getLogger("lora")
 setup_logger(logger)
@@ -24,8 +24,7 @@ setup_logger(logger)
 ANIMA_BLOCK_MAPPING = (0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27)
 
 
-def load_lora_state_dict(filename):
-    return load_torch_file(filename, safe_load=True)
+load_lora_state_dict = functools.partial(load_torch_file, safe_load=True)
 
 
 def get_lora_state_keys(network_on_disk):
@@ -121,10 +120,6 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
 
     model_flag: str = type(model.model).__name__ if model is not None else "default"
 
-    detection = detect_lora_state_dict(lora)
-    if not detection.is_adapter:
-        return model, clip
-
     unet_keys = model_lora_keys_unet(model.model) if model is not None else {}
     clip_keys = model_lora_keys_clip(clip.cond_stage_model) if clip is not None else {}
 
@@ -132,10 +127,14 @@ def load_lora_for_models(model: "UnetPatcher", clip: "CLIP", lora: dict[str, tor
     lora_unet, lora_unmatch = load_lora(lora_unmatch, unet_keys)
     lora_clip, lora_unmatch = load_lora(lora_unmatch, clip_keys)
 
-    unmatched_adapter_keys = {item.key for item in detection.adapter_keys} & set(lora_unmatch)
-    matched_adapter_keys = len(detection.adapter_keys) - len(unmatched_adapter_keys)
-    if matched_adapter_keys == 0:
+    _unmatches = len(lora_unmatch)
+
+    if _unmatches / len(lora) > 0.5:
+        logger.warning(f"[LORA] LoRA mismatch for {model_flag}: {filename}")
         return model, clip
+
+    if _unmatches > 0:
+        logger.info(f"[LORA] Loading {os.path.basename(filename)} for {model_flag} with {_unmatches} unmatched keys")
 
     if model is not None and len(lora_unet) > 0:
         new_model = model.clone()
@@ -219,15 +218,9 @@ def load_networks(names: list[str], te_multipliers: list[float] = None, unet_mul
 
     for filename, strength_model, strength_clip, online_mode in compiled_lora_targets:
         lora_sd = load_lora_state_dict(filename)
-        source = lora_sd
-        try:
-            if any(key.startswith("lora_unet__") for key in lora_sd):
-                lora_sd = state_dict_prefix_replace(lora_sd, {"lora_unet__": "lora_unet_"})
-            current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip, filename=filename, online_mode=online_mode)
-        finally:
-            close = getattr(source, "close", None)
-            if close is not None:
-                close()
+        if any(key.startswith("lora_unet__") for key in lora_sd):
+            lora_sd = state_dict_prefix_replace(lora_sd, {"lora_unet__": "lora_unet_"})
+        current_sd.forge_objects.unet, current_sd.forge_objects.clip = load_lora_for_models(current_sd.forge_objects.unet, current_sd.forge_objects.clip, lora_sd, strength_model, strength_clip, filename=filename, online_mode=online_mode)
 
     current_sd.forge_objects_after_applying_lora = current_sd.forge_objects.shallow_copy()
 

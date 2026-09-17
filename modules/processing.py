@@ -850,8 +850,12 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
 
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
     """Refresh one prompt batch through the normal script-processing path."""
-    base_prompt = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else p.prompt
-    base_negative_prompt = p.negative_prompt[0] if isinstance(p.negative_prompt, list) and p.negative_prompt else p.negative_prompt
+    base_prompt = getattr(p, "_infinite_prompt_template", None)
+    if base_prompt is None:
+        base_prompt = p.prompt[0] if isinstance(p.prompt, list) and p.prompt else p.prompt
+    base_negative_prompt = getattr(p, "_infinite_negative_prompt_template", None)
+    if base_negative_prompt is None:
+        base_negative_prompt = p.negative_prompt[0] if isinstance(p.negative_prompt, list) and p.negative_prompt else p.negative_prompt
     base_seeds = getattr(p, "_infinite_base_seeds", None)
     base_subseeds = getattr(p, "_infinite_base_subseeds", None)
     if not base_seeds:
@@ -861,7 +865,7 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
     seed_is_sequence = isinstance(p.seed, list)
     subseed_is_sequence = isinstance(p.subseed, list)
 
-    batch_size = max(1, int(p.batch_size))
+    batch_size = max(1, int(getattr(p, "_infinite_batch_size", p.batch_size)))
     offset = p.iteration * batch_size
     seed_offset = 0 if seed_is_sequence or p.subseed_strength != 0 else offset
     subseed_offset = 0 if subseed_is_sequence else offset
@@ -871,6 +875,7 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
     # batch, while no extension simply keeps the static prompt.
     p.prompt = base_prompt
     p.negative_prompt = base_negative_prompt
+    p.batch_size = batch_size
     p.all_prompts = [base_prompt]
     p.all_negative_prompts = [base_negative_prompt]
     p.n_iter = 1
@@ -1076,6 +1081,14 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     p.fill_fields_from_opts()
     p.setup_prompts()
+
+    if p.infinite_generation:
+        # Keep the styled template and requested batch size stable. LoRA
+        # grouping may reduce p.batch_size for the current pass, but a fresh
+        # prompt script run must still see the original request.
+        p._infinite_prompt_template = p.all_prompts[0]
+        p._infinite_negative_prompt_template = p.all_negative_prompts[0]
+        p._infinite_batch_size = p.batch_size
 
     if isinstance(seed, list):
         p.all_seeds = seed

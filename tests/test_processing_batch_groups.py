@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from modules.batch_planning import (
     effective_output_batch_index,
@@ -13,6 +14,60 @@ from modules.batch_planning import (
 
 
 class ProcessingBatchGroupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules_forge" / "packages"))
+
+        with mock.patch.object(sys, "argv", ["verify"]):
+            from modules import shared_init
+            shared_init.initialize()
+            from modules import processing
+
+        cls.processing = processing
+
+    def test_infinite_refresh_reruns_prompt_processing_after_lora_grouping(self):
+        processing = self.processing
+        p = processing.StableDiffusionProcessingTxt2Img(
+            prompt="template {one|two}",
+            negative_prompt="negative",
+            batch_size=1,
+            n_iter=1,
+            seed=100,
+            subseed=200,
+            infinite_generation=True,
+        )
+        p._infinite_prompt_template = p.prompt
+        p._infinite_negative_prompt_template = p.negative_prompt
+        p._infinite_batch_size = 2
+        p._infinite_base_seeds = [100, 101]
+        p._infinite_base_subseeds = [200, 201]
+
+        seen = []
+
+        def process(processing):
+            seen.append((processing.prompt, processing.batch_size, processing.seed))
+            processing.all_prompts = [f"choice-{processing.seed + i}" for i in range(processing.batch_size)]
+            processing.all_negative_prompts = [processing.negative_prompt] * processing.batch_size
+
+        runner = mock.MagicMock()
+        runner.process.side_effect = process
+        p.scripts_value = runner
+
+        with mock.patch.object(processing, "_extra_network_signature", side_effect=lambda prompt: prompt):
+            p.iteration = 1
+            processing._refresh_infinite_batch(p)
+            first = list(p.all_prompts)
+            p.iteration = 2
+            processing._refresh_infinite_batch(p)
+            second = list(p.all_prompts)
+
+        self.assertEqual(seen, [("template {one|two}", 2, 102), ("template {one|two}", 2, 104)])
+        self.assertEqual(first, ["choice-102"])
+        self.assertEqual(second, ["choice-104"])
+
     def test_aligned_signatures_keep_requested_batches(self):
         signatures = ["a", "a", "b", "b"]
 

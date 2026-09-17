@@ -28,7 +28,7 @@ function setupListeners() {
 
 let modalObserver = new MutationObserver(function (mutations) {
     mutations.forEach(function (mutationRecord) {
-        let selectedTab = gradioApp().querySelector("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab'].selected")?.innerText;
+        let selectedTab = gradioApp().querySelector("#tabs div button.selected")?.innerText;
         if (mutationRecord.target.style.display === "none" && (selectedTab === "txt2img" || selectedTab === "img2img")) {
             gradioApp()
                 .getElementById(selectedTab + "_generation_info_button")
@@ -39,16 +39,17 @@ let modalObserver = new MutationObserver(function (mutations) {
 
 function attachGalleryListeners(tab_name) {
     let gallery = gradioApp().querySelector("#" + tab_name + "_gallery");
-    const updateGenerationInfo = () => {
-        // Gradio updates the selected thumbnail after the gallery click event.
-        setTimeout(() => gradioApp().getElementById(tab_name + "_generation_info_button")?.click(), 0);
-    };
-
-    gallery?.addEventListener("click", updateGenerationInfo);
+    gallery?.addEventListener("click", () =>
+        gradioApp()
+            .getElementById(tab_name + "_generation_info_button")
+            .click(),
+    );
     gallery?.addEventListener("keydown", (e) => {
         if (e.keyCode == 37 || e.keyCode == 39) {
             // left or right arrow
-            updateGenerationInfo();
+            gradioApp()
+                .getElementById(tab_name + "_generation_info_button")
+                .click();
         }
     });
     return gallery;
