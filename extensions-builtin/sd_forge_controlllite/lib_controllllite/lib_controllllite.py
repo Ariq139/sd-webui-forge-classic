@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 import torch
 import torch.nn as nn
 
+from backend.misc.image_resize import adaptive_resize
 from backend.state_dict import load_state_dict
 
 logger = logging.getLogger("ControlNet")
@@ -43,7 +44,8 @@ def load_control_net_lllite_patch(ctrl_sd: dict, cond_image: torch.Tensor, multi
             module_weights[module_name] = {}
         module_weights[module_name][weight_name] = value
 
-    modules = {}
+    modules: dict[str, "LLLiteModule"] = {}
+
     for module_name, weights in module_weights.items():
         if "conditioning1.4.weight" in weights:
             depth = 3
@@ -87,6 +89,8 @@ def load_control_net_lllite_patch(ctrl_sd: dict, cond_image: torch.Tensor, multi
             # cache for tiled slicing: (tuple_key, batch_id) -> tiled tensor
             self._lllite_tiled_cache: dict[tuple, dict[int, torch.Tensor]] = {}
 
+            self._cond_image_original = cond_image_original
+            self._lllite_tiled_cache: dict[tuple, dict[int, torch.Tensor]] = {}
         def _get_tiled_cond(self, bboxes, opt_f: int, PH: int, PW: int, batch_size: int, batch_id: int, x_dtype: torch.dtype, tuple_key: tuple):
             """Slice cond_image_original per bbox like ControlNet. Caches per tuple_key/batch_id."""
             cache_for_key = self._lllite_tiled_cache.get(tuple_key)
@@ -179,20 +183,63 @@ def load_control_net_lllite_patch(ctrl_sd: dict, cond_image: torch.Tensor, multi
 
             return q, k, v
 
+        def _get_tiled_cond(self, bboxes: list[list[int]], opt_f: int, PH: int, PW: int, batch_size: int, batch_id: int, x_dtype: torch.dtype, tuple_key: tuple):
+            if batch_id in (cache_for_key := self._lllite_tiled_cache.get(tuple_key, {})):
+                return cache_for_key[batch_id]
+
+            cond = self._cond_image_original
+
+            if cond.shape[-2] != PH or cond.shape[-1] != PW:
+                resized = adaptive_resize(cond.float(), PW, PH, "nearest-exact", "center").to(dtype=x_dtype)
+                cond_resized = resized.to(device=cond.device, dtype=x_dtype)
+            else:
+                cond_resized = cond
+
+            if cond_resized.shape[0] < batch_size:
+                B = cond_resized.shape[0]
+                if B == 1:
+                    cond_repeat = cond_resized.expand(batch_size, -1, -1, -1)
+                else:
+                    n = (batch_size + B - 1) // B
+                    cond_repeat = cond_resized.repeat(n, 1, 1, 1)[:batch_size]
+            else:
+                cond_repeat = cond_resized[:batch_size]
+
+            tiles = []
+
+            for bbox in bboxes:
+                x1 = bbox[0] * opt_f
+                x2 = bbox[2] * opt_f
+                y1 = bbox[1] * opt_f
+                y2 = bbox[3] * opt_f
+
+                x1 = max(0, min(x1, cond_repeat.shape[3]))
+                x2 = max(0, min(x2, cond_repeat.shape[3]))
+                y1 = max(0, min(y1, cond_repeat.shape[2]))
+                y2 = max(0, min(y2, cond_repeat.shape[2]))
+
+                tile = cond_repeat[:, :, y1:y2, x1:x2]
+                tiles.append(tile)
+
+            tiled = torch.cat(tiles, dim=0) if len(tiles) > 1 else tiles[0]
+
+            _cache = self._lllite_tiled_cache.setdefault(tuple_key, {})
+            _cache[batch_id] = tiled
+
+            return tiled
+
         def to(self, device):
             for d in self.modules.keys():
                 self.modules[d] = self.modules[d].to(device)
-            if hasattr(self, "cond_image_original") and self.cond_image_original is not None:
-                self.cond_image_original = self.cond_image_original.to(device)
-            # also move cached tiled tensors if any
+
+            self._cond_image_original = self._cond_image_original.to(device)
             for key in list(self._lllite_tiled_cache.keys()):
                 for bid in list(self._lllite_tiled_cache[key].keys()):
                     self._lllite_tiled_cache[key][bid] = self._lllite_tiled_cache[key][bid].to(device)
+
             return self
 
-    return control_net_lllite_patch(modules, cond_image_original)
-
-    return control_net_lllite_patch(modules)
+    return control_net_lllite_patch(modules, cond_image.detach().clone())
 
 
 class LLLiteModule(nn.Module):

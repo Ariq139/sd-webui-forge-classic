@@ -39,7 +39,6 @@ class LoRAControl(scripts.Script):
         ctl = False
 
         for m in matches:
-            p.prompt = p.prompt.replace(f"[{m.group(2)}]", "-1.0")
             ctl = True
 
             alias: str = m.group(1)

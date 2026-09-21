@@ -12,6 +12,7 @@ from numpy import exp, pi, sqrt
 from torch import Tensor
 
 from backend import memory_management
+from backend.args import dynamic_args
 from backend.misc.image_resize import adaptive_resize
 from backend.patcher.base import ModelPatcher
 from backend.patcher.controlnet import ControlNet, T2IAdapter
@@ -227,7 +228,7 @@ class AbstractDiffusion:
                 control_tile = torch.cat(all_control_tile, dim=0)
                 self.control_tensor_batch[param_id][batch_id] = control_tile
 
-    def process_controlnet(self, x_shape, x_dtype, c_in: dict, cond_or_uncond: list, bboxes, batch_size: int, batch_id: int):
+    def process_controlnet(self, x_shape: torch.Size, x_dtype: torch.dtype, c_in: dict, cond_or_uncond: list[int], bboxes: list[BBox], batch_size: int, batch_id: int):
         control: ControlNet = c_in["control_model"]
         param_id = -1
         tuple_key = tuple(cond_or_uncond) + tuple(x_shape)
@@ -253,14 +254,6 @@ class AbstractDiffusion:
                     control.cond_hint = adaptive_resize(control.cond_hint_original, width, height, "nearest-exact", "center").float().to(control.device)
                     if control.channels_in == 1 and control.cond_hint.shape[1] > 1:
                         control.cond_hint = torch.mean(control.cond_hint, 1, keepdim=True)
-                elif control.__class__.__name__ == "ControlLLLiteAdvanced":
-                    if control.sub_idxs is not None and control.cond_hint_original.shape[0] >= control.full_latent_length:
-                        control.cond_hint = adaptive_resize(control.cond_hint_original[control.sub_idxs], PW, PH, "nearest-exact", "center").to(dtype=dtype, device=control.device)
-                    else:
-                        if (PH, PW) == (control.cond_hint_original.shape[-2], control.cond_hint_original.shape[-1]):
-                            control.cond_hint = control.cond_hint_original.clone().to(dtype=dtype, device=control.device)
-                        else:
-                            control.cond_hint = adaptive_resize(control.cond_hint_original, PW, PH, "nearest-exact", "center").to(dtype=dtype, device=control.device)
                 else:
                     if (PH, PW) == (control.cond_hint_original.shape[-2], control.cond_hint_original.shape[-1]):
                         control.cond_hint = control.cond_hint_original.clone().to(dtype=dtype, device=control.device)
@@ -276,78 +269,30 @@ class AbstractDiffusion:
                 control.cond_hint = self.control_params[tuple_key][param_id][batch_id]
             control = control.previous_controlnet
 
-    def _process_lllite_patches(self, c_in: dict, bboxes, batch_size: int, batch_id: int, x_shape, x_dtype, cond_or_uncond: list):
-        """Tile ControllLite (classic) patches stored in transformer_options['patches']."""
-        if opt_f is None:
-            return
-        try:
-            transformer_options = c_in.get("transformer_options", {}) or c_in.get("c", {}).get("transformer_options", {})
-            # also check direct c_in transformer_options (calc_cond_uncond_batch stores it in c)
-            if not transformer_options and "transformer_options" in c_in:
-                transformer_options = c_in["transformer_options"]
-        except Exception:
-            transformer_options = {}
-        patches_dict = transformer_options.get("patches", {}) if isinstance(transformer_options, dict) else {}
-        if not patches_dict:
-            return
+    def process_controllllite(self, x_shape: torch.Size, x_dtype: torch.dtype, c_in: dict, cond_or_uncond: list[int], bboxes: list[BBox], batch_size: int, batch_id: int):
         PH, PW = self.h * opt_f, self.w * opt_f
         tuple_key = tuple(cond_or_uncond) + tuple(x_shape)
-        # collect all lllite patches (attn1_patch / attn2_patch are same object)
-        seen = set()
-        for patch_name in ("attn1_patch", "attn2_patch"):
-            plist = patches_dict.get(patch_name, [])
-            for patch in plist:
-                pid = id(patch)
-                if pid in seen:
+
+        if patches_dict := c_in.get("transformer_options", {}).get("patches", {}):  # SDXL
+            seen: set[int] = set()
+
+            for patch in [*patches_dict.get("attn1_patch", []), *patches_dict.get("attn2_patch", [])]:
+                if type(patch).__name__ != "control_net_lllite_patch":
                     continue
-                seen.add(pid)
-                # detect classic LLLite patch via attributes introduced in lib_controllllite
-                if hasattr(patch, "cond_image_original") and hasattr(patch, "prepare_tiled"):
-                    try:
-                        if self.refresh:
-                            patch.clear_cache()
-                        patch.prepare_tiled(bboxes, opt_f, PH, PW, batch_size, batch_id, x_dtype, tuple_key)
-                    except Exception as e:
-                        # do not break diffusion on tiling error; fallback to original
-                        import traceback
+                if (pid := id(patch)) in seen:
+                    continue
 
-                        traceback.print_exc()
-                        print(f"[TiledDiffusion] LLLite tiling failed: {e}")
-
-    def _process_lllite_anima(self, bboxes, batch_size: int, batch_id: int, x_shape, x_dtype, cond_or_uncond: list):
-        """Tile ControllLite DiT (Anima) via global registry."""
-        if opt_f is None:
-            return
-        ACTIVE = None
-        try:
-            import importlib
-
-            mod = importlib.import_module("lib_controllllite.lib_controllllite_anima")
-            ACTIVE = getattr(mod, "ACTIVE_DIT_LLLITE_INSTANCES", None)
-        except Exception:
-            pass
-        if ACTIVE is None:
-            try:
-                import importlib
-
-                mod = importlib.import_module("lib_controllllite_anima")
-                ACTIVE = getattr(mod, "ACTIVE_DIT_LLLITE_INSTANCES", None)
-            except Exception:
-                return
-        if not ACTIVE:
-            return
-        PH, PW = self.h * opt_f, self.w * opt_f
-        tuple_key = tuple(cond_or_uncond) + tuple(x_shape)
-        for inst in list(ACTIVE):
-            try:
                 if self.refresh:
-                    inst.clear_tiled_cache()
-                inst.prepare_tiled(bboxes, opt_f, PH, PW, batch_size, batch_id, x_dtype, tuple_key)
-            except Exception as e:
-                import traceback
+                    patch.clear_cache()
+                patch.prepare_tiled(bboxes, opt_f, PH, PW, batch_size, batch_id, x_dtype, tuple_key)
 
-                traceback.print_exc()
-                print(f"[TiledDiffusion] Anima LLLite tiling failed: {e}")
+                seen.add(pid)
+
+        if active_dits := getattr(dynamic_args, "ACTIVE_LLLITE_DIT", None):  # Anima
+            for instance in active_dits:
+                if self.refresh:
+                    instance.clear_tiled_cache()
+                instance.prepare_tiled(bboxes, opt_f, PH, PW, batch_size, batch_id, x_dtype, tuple_key)
 
 
 def gaussian_weights(tile_w: int, tile_h: int) -> Tensor:
@@ -408,9 +353,7 @@ class MultiDiffusion(AbstractDiffusion):
                     self.process_controlnet(x_tile.shape, x_tile.dtype, c_in, cond_or_uncond, bboxes, N, batch_id)
                     c_tile["control"] = c_in["control_model"].get_control(x_tile, ts_tile, c_tile, len(cond_or_uncond))
 
-                # --- ControllLite tiling (classic + Anima) ---
-                self._process_lllite_patches(c_in, bboxes, N, batch_id, x_tile.shape, x_tile.dtype, cond_or_uncond)
-                self._process_lllite_anima(bboxes, N, batch_id, x_tile.shape, x_tile.dtype, cond_or_uncond)
+                self.process_controllllite(x_tile.shape, x_tile.dtype, c_in, cond_or_uncond, bboxes, N, batch_id)
 
                 if is_5d:
                     x_tile = x_tile.unsqueeze(2)
@@ -524,9 +467,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     self.process_controlnet(x_tile.shape, x_tile.dtype, c_in, cond_or_uncond, bboxes, N, batch_id)
                     c_tile["control"] = c_in["control_model"].get_control(x_tile, t_tile, c_tile, len(cond_or_uncond))
 
-                # --- ControllLite tiling (classic + Anima) ---
-                self._process_lllite_patches(c_in, bboxes, N, batch_id, x_tile.shape, x_tile.dtype, cond_or_uncond)
-                self._process_lllite_anima(bboxes, N, batch_id, x_tile.shape, x_tile.dtype, cond_or_uncond)
+                self.process_controllllite(x_tile.shape, x_tile.dtype, c_in, cond_or_uncond, bboxes, N, batch_id)
 
                 if is_5d:
                     x_tile = x_tile.unsqueeze(2)

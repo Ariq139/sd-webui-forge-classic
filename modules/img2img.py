@@ -54,6 +54,8 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     cfg_scale = p.cfg_scale
     sampler_name = p.sampler_name
     steps = p.steps
+    width = p.width
+    height = p.height
     override_settings = p.override_settings
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
     batch_results = None
@@ -77,6 +79,9 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
         if to_scale:
             p.width = sRound(img.width * scale_by)
             p.height = sRound(img.height * scale_by)
+        else:
+            p.width = width
+            p.height = height
 
         _w, _h = img.size
         if p.resize_mode < 4 and not (_w % _STEP == 0 and _h % _STEP == 0):
