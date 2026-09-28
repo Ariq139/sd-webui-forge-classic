@@ -79,3 +79,7 @@ def parse_prompt_attention(text: str, emphasis: str = None) -> list[tuple[str, f
                 i += 1
 
     return res
+
+
+def strip_emphasis(prompt: str) -> str:
+    return "".join(text for text, _ in parse_prompt_attention(prompt))

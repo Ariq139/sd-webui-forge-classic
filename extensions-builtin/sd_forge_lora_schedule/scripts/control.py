@@ -35,6 +35,9 @@ class LoRAControl(scripts.Script):
     def before_process(self, p: StableDiffusionProcessing):
         self.mapping.clear()
 
+        if not isinstance(p.prompt, str):
+            return
+
         matches = re.finditer(lora_ctl, p.prompt)
         ctl = False
 
