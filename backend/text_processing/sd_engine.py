@@ -52,7 +52,7 @@ class CLIPEmbeddingForTextualInversion(torch.nn.Module):
         return torch.stack(vecs)
 
 
-class ClassicTextProcessingEngine:
+class ClipEngine:
     def __init__(self, text_encoder, tokenizer, chunk_length=75, embedding_dir=None, embedding_key="clip_l", embedding_expected_shape=768, text_projection=False, minimal_clip_skip=1, clip_skip=1, return_pooled=False, final_layer_norm=True):
 
         self.embeddings = EmbeddingDatabase(tokenizer, embedding_expected_shape)
@@ -86,7 +86,7 @@ class ClassicTextProcessingEngine:
         return emphasis.get_current_option(opts.emphasis)()
 
     def tokenize(self, texts: str | list[str]) -> EMBEDDINGS | list[EMBEDDINGS]:
-        return self.tokenizer(texts)["input_ids"]
+        return self.tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"]
 
     def empty_chunk(self):
         chunk = PromptChunk()
@@ -100,8 +100,6 @@ class ClassicTextProcessingEngine:
     def encode_with_transformers(self, tokens: torch.Tensor) -> torch.Tensor:
         device = memory_management.text_encoder_device()
         tokens = tokens.to(device)
-    def tokenize(self, texts):
-        tokenized = self.tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"]
 
         embeddings = self.text_encoder.transformer.text_model.embeddings
         embeddings.position_ids = embeddings.position_ids.to(device=device)

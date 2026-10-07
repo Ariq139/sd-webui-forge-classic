@@ -197,12 +197,11 @@ QUANT_ALGOS = {
         "comfy_tensor_layout": "AsymW4A8Int8Layout",
         "quantize_input": False,
     },
-    "awq_w4a16": {
+    "w6a8_int8": {
         "storage_t": torch.int8,
-        "parameters": {"weight_scale", "weight_zero"},
-        "comfy_tensor_layout": "TensorCoreAWQW4A16Layout",
+        "parameters": {"weight_scale"},
+        "comfy_tensor_layout": "AsymW4A8Int8Layout",
         "quantize_input": False,
-        "group_size": 64,
     },
 }
 

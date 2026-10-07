@@ -112,7 +112,7 @@ def encode_pil_to_base64(image):
             image.save(output_bytes, format="PNG", pnginfo=(metadata if use_metadata else None), quality=opts.jpeg_quality)
 
         elif opts.samples_format.lower() in ("jpg", "jpeg", "webp"):
-            if image.mode in ("RGBA", "P"):
+            if image.mode in ("RGBA", "P") and opts.samples_format.lower() in ("jpg", "jpeg"):
                 image = image.convert("RGB")
             parameters = image.info.get("parameters", None)
             exif_bytes = piexif.dump({"Exif": {piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(parameters or "", encoding="unicode")}})
@@ -629,8 +629,6 @@ class Api:
         eta_relative = eta - time_since_start
 
         progress = min(progress, 1)
-
-        shared.state.set_current_image()
 
         current_image = None
         if shared.state.current_image and not req.skip_current_image:

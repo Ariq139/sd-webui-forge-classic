@@ -79,12 +79,22 @@ try:
                 SDPBackend.MATH,
             ]
 
+            SDPA_CONTIGUOUS_THRESHOLD = None
+
+            if memory_management.is_amd():
+                props = torch.cuda.get_device_properties(memory_management.get_torch_device())
+                if props.gcnArchName.split(":")[0] == "gfx1151":
+                    SDPA_CONTIGUOUS_THRESHOLD = props.L2_cache_size
+
             def scaled_dot_product_attention(q, k, v, *args, **kwargs):
-                q, k, v = match_attention_dtypes(q, k, v)
+                if q.nelement() < 1024 * 128:
+                    return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
                 attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
                 if kwargs.get("enable_gqa", False) and attn_mask is not None and not memory_management.is_nvidia():
                     k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
                     kwargs["enable_gqa"] = False
+                if SDPA_CONTIGUOUS_THRESHOLD and sum(t.shape[-2] * t.shape[-1] for t in (k, v)) * k.element_size() > SDPA_CONTIGUOUS_THRESHOLD:
+                    k, v = k.contiguous(), v.contiguous()
                 with sdpa_kernel(SDPA_BACKEND_PRIORITY, set_priority=True):
                     if kwargs.get("enable_gqa", False) and attn_mask is not None and q.shape[-3] != k.shape[-3]:
                         dropout_p = args[1] if len(args) > 1 else kwargs.get("dropout_p", 0.0)
@@ -689,6 +699,25 @@ class TiledOperations(ForgeOperations):
 # region Pick OPs
 
 
+def _get_disabled_quants(device):
+    disabled = set()
+
+    if not memory_management.supports_nvfp4_compute(device):
+        disabled.add("nvfp4")
+    if not memory_management.supports_mxfp8_compute(device):
+        disabled.add("mxfp8")
+    if not memory_management.supports_fp8_compute(device):
+        disabled.add("float8_e4m3fn")
+        disabled.add("float8_e5m2")
+    if not memory_management.supports_int8_compute(device):
+        disabled.add("int8_tensorwise")
+        disabled.add("convrot_w4a4")
+        disabled.add("asym_w4a8_int8")
+        disabled.add("w6a8_int8")
+
+    return disabled
+
+
 @contextlib.contextmanager
 def using_forge_operations(
     *,
@@ -712,18 +741,7 @@ def using_forge_operations(
 
         _device = memory_management.get_torch_device()
         _dtype = torch.bfloat16 if memory_management.should_use_bf16(_device) else torch.float32
-        fp8_compute = memory_management.supports_fp8_compute(_device)
-        nvfp4_compute = memory_management.supports_nvfp4_compute(_device)
-        mxfp8_compute = memory_management.supports_mxfp8_compute(_device)
-
-        disabled = set()
-        if not nvfp4_compute:
-            disabled.add("nvfp4")
-        if not mxfp8_compute:
-            disabled.add("mxfp8")
-        if not fp8_compute:
-            disabled.add("float8_e4m3fn")
-            disabled.add("float8_e5m2")
+        disabled = _get_disabled_quants(_device)
 
         _full: bool = extra_dtype.pop("TE", False)  # https://github.com/Comfy-Org/ComfyUI/blob/v0.16.4/comfy/sd1_clip.py#L114
         operations = mixed_precision_ops(quant_config=extra_dtype, compute_dtype=_dtype, full_precision_mm=_full, disabled=disabled)

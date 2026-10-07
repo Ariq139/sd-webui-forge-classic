@@ -14,6 +14,7 @@ class PresetArch(Enum):
     ernie = 10  # Ernie-Image
     pid = 11  # PiD
     krea = 12  # Krea2
+    qwen21 = 13  # Qwen-Image-2.1
     ltx2 = 13  # LTX-2.3 video
     ideogram = 14  # Ideogram 4
 
@@ -35,6 +36,7 @@ SAMPLERS = {
     PresetArch.ernie: "Euler",
     PresetArch.pid: "LCM",
     PresetArch.krea: "Euler",
+    PresetArch.qwen21: "Euler",
     PresetArch.ltx2: "Euler",
     PresetArch.ideogram: "Euler",
 }
@@ -52,6 +54,7 @@ SCHEDULERS = {
     PresetArch.ernie: "Simple",
     PresetArch.pid: "Simple",
     PresetArch.krea: "Simple",
+    PresetArch.qwen21: "Simple",
     PresetArch.ltx2: "Simple",
     PresetArch.ideogram: "Simple",
 }
@@ -69,6 +72,7 @@ STEPS = {
     PresetArch.ernie: 8,
     PresetArch.pid: 4,
     PresetArch.krea: 8,
+    PresetArch.qwen21: 32,
     PresetArch.ltx2: 30,
     PresetArch.ideogram: 48,
 }
@@ -86,6 +90,7 @@ CFG = {
     PresetArch.ernie: 1.0,
     PresetArch.pid: 1.0,
     PresetArch.krea: 1.0,
+    PresetArch.qwen21: 2.5,
     PresetArch.ltx2: 3.0,
     PresetArch.ideogram: 7.0,
 }

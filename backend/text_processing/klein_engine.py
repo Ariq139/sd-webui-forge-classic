@@ -8,7 +8,7 @@ from backend.text_processing import emphasis
 from ._comfy import EMBEDDINGS, INF, SDClipModel, SDTokenizer
 
 
-class KleinTextProcessingEngine:
+class Qwen3_4B_8B_Engine:
     def __init__(self, text_encoder, tokenizer):
         self.text_encoder = SDClipModel(text_encoder, layer=[9, 18, 27], layer_idx=None, special_tokens={"pad": 151643}, layer_norm_hidden_state=False, enable_attention_masks=True, return_attention_masks=True)
         self.tokenizer = SDTokenizer(tokenizer, pad_with_end=False, has_start_token=False, has_end_token=False, pad_to_max_length=False, max_length=INF, min_length=512, pad_token=151643)
@@ -20,8 +20,10 @@ class KleinTextProcessingEngine:
         return emphasis.EmphasisNone()
 
     def tokenize(self, texts: str | list[str]) -> EMBEDDINGS | list[EMBEDDINGS]:
-        llama_texts = [self.llama_template.format(text) for text in texts]
-        return self.tokenizer.tokenizer(llama_texts)["input_ids"]
+        if isinstance(texts, str):
+            return self.tokenizer.tokenizer(self.llama_template.format(texts))["input_ids"]
+        else:
+            return [self.tokenizer.tokenizer(self.llama_template.format(t))["input_ids"] for t in texts]
 
     def __call__(self, texts: list[str]) -> list[torch.Tensor]:
         if any(emphasis.uses_emphasis(text) for text in texts):

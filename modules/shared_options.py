@@ -266,6 +266,7 @@ options_templates.update(
             "divmisc": OptionDiv(),
             "qwen_vae_resize": OptionInfo(False, "[Qwen-Image-Edit] Resize input image to 1 megapixel for ref_latent"),
             "klein_do_reference": OptionInfo(True, "[Klein] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
+            "qwen21_do_reference": OptionInfo(True, "[Qwen 2.1] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
             "anima_do_reference": OptionInfo(False, "[Anima] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often").info("requires specfic Edit LoRA"),
             "krea2_do_reference": OptionInfo(False, "[Krea2] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often").info("requires specfic Edit LoRA"),
             "reference_explanation": OptionHTML("<b>Note:</b> Remember to change the setting before txt2img to clear the references"),
@@ -335,6 +336,7 @@ options_templates.update(
         ("optimizations", "Optimizations", "sd"),
         {
             "cross_attention_optimization": OptionInfo("Automatic", "Cross Attention Optimization", gr.Dropdown, {"choices": ("Automatic",), "interactive": False}),
+            "batch_cond_uncond": OptionInfo(True, "Batch Cond/Uncond").info("do both positive and negative denoising in the same batch ; increase speed & VRAM usage").info("less effective on macOS"),
             "persistent_cond_cache": OptionInfo(True, "Persistent Cond Cache").info("do not re-encode prompts if only the Seed changes ; <b>Note:</b> may cause certain Infotext to be missing"),
             "skip_early_cond": OptionInfo(0.0, "Ignore Negative Prompt during Early Steps", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}, infotext="Skip Early CFG").info("in percentage of total steps; 0 = disable; higher = faster"),
             "s_min_uncond": OptionInfo(0.0, "Skip Negative Prompt during Later Steps", gr.Slider, {"minimum": 0.0, "maximum": 8.0, "step": 0.05}).info('in "sigma"; 0 = disable; higher = faster'),
