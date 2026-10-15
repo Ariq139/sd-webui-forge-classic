@@ -1,6 +1,7 @@
 import logging
 import os.path
 import sys
+from typing import Callable
 
 import gradio as gr
 import torch
@@ -8,6 +9,7 @@ from gradio.context import Context
 from gradio.events import Dependency
 from rich import print_json
 
+from backend import memory_management
 from backend.args import dynamic_args
 from backend.logging import setup_logger
 from modules import (
@@ -147,7 +149,7 @@ def vram_mode_change(mode: str, save: bool = True) -> bool:
 
 
 def make_checkpoint_manager_ui():
-    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_vram_mode
+    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_vram_mode, _event_refresh
 
     if shared.opts.sd_model_checkpoint in [None, "None", "none", ""]:
         if len(sd_models.checkpoints_list) == 0:

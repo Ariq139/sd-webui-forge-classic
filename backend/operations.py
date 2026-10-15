@@ -87,8 +87,7 @@ try:
                     SDPA_CONTIGUOUS_THRESHOLD = props.L2_cache_size
 
             def scaled_dot_product_attention(q, k, v, *args, **kwargs):
-                if q.nelement() < 1024 * 128:
-                    return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
+                q, k, v = match_attention_dtypes(q, k, v)
                 attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
                 if kwargs.get("enable_gqa", False) and attn_mask is not None and not memory_management.is_nvidia():
                     k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)

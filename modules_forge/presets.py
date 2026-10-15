@@ -14,7 +14,7 @@ class PresetArch(Enum):
     ernie = 10  # Ernie-Image
     pid = 11  # PiD
     krea = 12  # Krea2
-    qwen21 = 13  # Qwen-Image-2.1
+    qwen21 = 15  # Qwen-Image-2.1
     ltx2 = 13  # LTX-2.3 video
     ideogram = 14  # Ideogram 4
 

@@ -4,8 +4,8 @@ import json
 
 import torch
 
+from backend import memory_management
 from backend.memory_management import cast_to_device, logger
-from backend.operations import main_stream_worker, weights_manual_cast
 
 from .operations import (
     ForgeOperations,
@@ -18,6 +18,7 @@ from .quant_ops import (  # noqa
     QuantizedTensor,
     TensorCoreFP8Layout,
     TensorWiseINT8Layout,
+    awq_w4a16_embedding_lookup,
     ck,
     get_layout_class,
     nvfp4_embedding_lookup,
@@ -284,6 +285,11 @@ def _quantized_weight_state_dict(module: torch.nn.Module, sd: dict[str, torch.Te
         elif module.quant_format in _GROUPED_INT8_FORMATS:
             quant_conf["group_size"] = getattr(params, "group_size", 16)
             quant_conf["convrot_groupsize"] = getattr(params, "convrot_groupsize", 256)
+        elif module.quant_format == "awq_w4a16":
+            quant_conf["group_size"] = getattr(params, "group_size", 64)
+            plural_key = f"{prefix}weight_zeros"
+            if plural_key in sd:
+                sd[f"{prefix}weight_zero"] = sd.pop(plural_key)
         if extra_quant_conf:
             quant_conf.update(extra_quant_conf)
         sd[f"{prefix}comfy_quant"] = torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8)
