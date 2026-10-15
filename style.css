@@ -359,7 +359,8 @@ input[type="checkbox"].input-accordion-checkbox {
     object-fit: scale-down !important;
 }
 
-#txt2img_player video, #img2img_player video {
+#txt2img_player video,
+#img2img_player video {
     max-height: 60vh;
 }
 
@@ -2507,7 +2508,8 @@ div.xyz_entries {
     margin-bottom: var(--spacing-lg);
 }
 
-div.xyz_entries .gradio-textbox span, div.xyz_entries .gradio-dropdown.multiselect span {
+div.xyz_entries .gradio-textbox span,
+div.xyz_entries .gradio-dropdown.multiselect span {
     margin-bottom: var(--spacing-lg);
 }
 

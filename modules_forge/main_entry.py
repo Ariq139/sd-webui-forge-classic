@@ -5,9 +5,9 @@ import sys
 import gradio as gr
 import torch
 from gradio.context import Context
+from gradio.events import Dependency
 from rich import print_json
 
-from backend import memory_management
 from backend.args import dynamic_args
 from backend.logging import setup_logger
 from modules import (
@@ -210,7 +210,7 @@ def make_checkpoint_manager_ui():
         ]
 
     refresh_button = ui_common.ToolButton(value=ui_common.refresh_symbol, elem_id="forge_refresh_checkpoint", tooltip="Refresh")
-    refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
+    _event_refresh = refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
     Context.root_block.load(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
 
     ui_forge_unet_dtype = gr.Dropdown(
@@ -322,6 +322,7 @@ def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) ->
 
 def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
     shared_items.refresh_checkpoints()
+    shared_items.refresh_vae_list()
     ckpt_list = shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
 
     file_extensions = ("ckpt", "pt", "pth", "bin", "safetensors", "sft", "gguf")
@@ -758,3 +759,35 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
         gr.update(**t2i_batch_count_args),
         gr.update(**i2i_batch_count_args),
     ]
+
+
+# region Callback
+
+
+_CALLBACK_SET = False
+
+_refresh_callbacks: list[tuple[Callable, list[gr.components.Component], list[gr.components.Component]]] = []
+
+
+def capture_callbacks():
+    global _CALLBACK_SET
+    _CALLBACK_SET = False
+    _refresh_callbacks.clear()
+
+
+def on_refresh_checkpoint(callback: Callable, inputs: list[gr.components.Component] = None, outputs: list[gr.components.Component] = None):
+    """register a function to be called after the refresh button for Checkpoint / VAE / Text Encoder is clicked"""
+    if _CALLBACK_SET:
+        raise RuntimeError("Cannot register callback after forge_main_entry")
+    _refresh_callbacks.append((callback, inputs, outputs))
+
+
+def _refreshed_callback():
+    global _CALLBACK_SET
+
+    event = _event_refresh
+
+    for callback, inputs, outputs in _refresh_callbacks:
+        event = event.then(fn=callback, inputs=inputs, outputs=outputs, queue=False, show_progress=False)
+
+    _CALLBACK_SET = True
