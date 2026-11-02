@@ -66,9 +66,9 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
         assert mask.shape[2] == x_in.shape[3]
         mask = mask[:, area[2] : area[0] + area[2], area[3] : area[1] + area[3]] * mask_strength
         mask = mask.unsqueeze(1).repeat(input_x.shape[0] // mask.shape[0], input_x.shape[1], 1, 1)
+        mult = mask * strength
     else:
-        mask = torch.ones_like(input_x)
-    mult = mask * strength
+        mult = torch.full_like(input_x, strength)
 
     if "mask" not in conds:
         rr = 8
@@ -181,10 +181,10 @@ def compute_cond_indices(cond_or_uncond, sigmas):
 
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
     out_cond = torch.zeros_like(x_in)
-    out_count = torch.ones_like(x_in) * 1e-37
+    out_count = torch.full_like(x_in, 1e-37)
 
     out_uncond = torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None
-    out_uncond_count = torch.ones_like(x_in) * 1e-37 if uncond is not None else None
+    out_uncond_count = torch.full_like(x_in, 1e-37) if uncond is not None else None
 
     COND = 0
     UNCOND = 1

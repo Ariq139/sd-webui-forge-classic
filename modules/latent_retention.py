@@ -13,9 +13,9 @@ def retain_latents(processing, retain_all):
             processing.latents_after_sampling.clear()
 
 
-def scripts_require_latents(runner, script_args):
+def scripts_require_latents(runner, script_args, attribute="requires_all_latents"):
     scripts = list(runner.alwayson_scripts)
     selected = script_args.get(0, 0) if isinstance(script_args, dict) else (script_args[0] if script_args else 0)
     if isinstance(selected, int) and 0 < selected <= len(runner.selectable_scripts):
         scripts.append(runner.selectable_scripts[selected - 1])
-    return any(getattr(script, "requires_all_latents", False) for script in scripts)
+    return any(getattr(script, attribute, False) for script in scripts)

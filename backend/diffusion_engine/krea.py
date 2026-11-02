@@ -44,7 +44,31 @@ class Krea2(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: "SdConditioning"):
-        memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+        initial_latent = self.ini_latent
+        reference_latents = list(dynamic_args.ref_latents)
+        try:
+            return self._get_learned_conditioning(prompt)
+        except Exception as error:
+            if not memory_management.is_oom(error):
+                raise
+        # Release the failed call's traceback before freeing memory and retrying.
+        self.ini_latent = initial_latent
+        dynamic_args.ref_latents = reference_latents
+        clip_patcher = self.forge_objects.clip.patcher
+        memory_management.unload_models_except([clip_patcher], device=clip_patcher.load_device)
+        memory_management.soft_empty_cache(force=True)
+        return self._get_learned_conditioning(prompt)
+
+    def _get_learned_conditioning(self, prompt: "SdConditioning"):
+        clip_patcher = self.forge_objects.clip.patcher
+        has_image_conditioning = self.ini_latent is not None or bool(self.ref_latents)
+        device = clip_patcher.load_device
+        headroom = clip_patcher.model_size() + max(4 * 1024**3, memory_management.minimum_inference_memory())
+        if any(model is not clip_patcher for model in memory_management.loaded_models()) and (
+            has_image_conditioning or memory_management.get_free_memory(device) < headroom
+        ):
+            memory_management.unload_models_except([clip_patcher], device=device)
+        memory_management.load_model_gpu(clip_patcher)
 
         if not prompt.is_negative_prompt:
             _references = [*self.ref_latents]

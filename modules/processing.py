@@ -1018,6 +1018,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     retain_all = bool(getattr(opts, "forge_retain_all_latents", False) or getattr(p, "retain_all_latents", False))
     if p.scripts is not None:
         retain_all = retain_all or scripts_require_latents(p.scripts, p.script_args)
+    p._retain_all_pixels = bool(getattr(p, "retain_all_pixels", False) or retain_all)
+    if p.scripts is not None:
+        p._retain_all_pixels |= scripts_require_latents(p.scripts, p.script_args, "requires_all_pixels")
     with retain_latents(p, retain_all), batch_planning.restore_grouped_batch_settings(p):
         return _process_images_inner(p)
 
@@ -1126,6 +1129,10 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
         batch_iterator = itertools.count() if p.infinite_generation else range(p.n_iter)
         for n in batch_iterator:
             p.iteration = n
+            if state.interrupted or state.stopping_generation:
+                break
+            if n and not p._retain_all_pixels:
+                p.pixels_after_sampling.clear()
 
             if p.infinite_generation and n:
                 # Infinite runs return the latest batch instead of retaining an unbounded gallery.
@@ -1358,7 +1365,7 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 image, original_denoised_image = apply_overlay(image, p.paste_to, overlay_image)
 
                 p.pixels_after_sampling.append(image)
-                if batch_plan is not None:
+                if batch_plan is not None and p._retain_all_pixels:
                     pixel_order_records.append((original_index, len(pixel_order_records), image))
 
                 if p.scripts is not None:
@@ -1429,7 +1436,8 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
             p.subseeds = p.all_subseeds[last_batch_start:last_batch_end]
             if p._retain_all_latents:
                 p.latents_after_sampling[:] = [latent for _, _, latent in sorted(latent_order_records)]
-            p.pixels_after_sampling[:] = [pixel for _, _, pixel in sorted(pixel_order_records)]
+            if p._retain_all_pixels:
+                p.pixels_after_sampling[:] = [pixel for _, _, pixel in sorted(pixel_order_records)]
             p._current_batch_indices = None
             p._current_output_index = None
 

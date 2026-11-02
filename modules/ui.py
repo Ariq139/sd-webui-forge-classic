@@ -285,7 +285,7 @@ def create_ui():
 
                                 with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=shared.opts.hires_fix_show_sampler):
 
-                                    def _refresh_models():
+                                    def _load_models():
                                         checkpoints, _ = main_entry.refresh_models()
                                         return [
                                             ["Use same checkpoint"] + checkpoints,

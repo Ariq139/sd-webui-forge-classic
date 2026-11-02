@@ -670,15 +670,11 @@ def minimum_inference_memory() -> float:
 
 
 def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = []):
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elif torch.xpu.is_available():
-        torch.xpu.synchronize()
-
     cleanup_models_gc()
     unloaded_model = []
     can_unload = []
     unloaded_models = []
+    synchronized = False
 
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
@@ -695,6 +691,12 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem
+        if not synchronized:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elif device.type == "xpu":
+                torch.xpu.synchronize(device)
+            synchronized = True
         logger.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
         if current_loaded_models[i].model_unload(memory_to_free):
             unloaded_model.append(i)
@@ -1545,6 +1547,16 @@ def unload_model(model: "ModelPatcher") -> bool:
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())
+
+
+def unload_models_except(models: list["ModelPatcher"], device: torch.device = None):
+    """Unload every tracked model on the target device except the requested models."""
+    cleanup_models_gc(target=models)
+    if device is None:
+        device = get_torch_device()
+
+    keep_loaded = [loaded for loaded in current_loaded_models if loaded.model in models]
+    free_memory(1e30, device, keep_loaded=keep_loaded)
 
 
 # region Streams

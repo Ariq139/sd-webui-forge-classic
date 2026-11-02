@@ -80,6 +80,10 @@ class ConditionConstant(Condition):
         return self.cond
 
 
+def conditioning_shape(row):
+    return tuple((key, value.shape) for key, value in row.items()) if isinstance(row, dict) else row.shape
+
+
 def compile_conditions(cond, cache_namespace=None):
     if cond is None:
         return None

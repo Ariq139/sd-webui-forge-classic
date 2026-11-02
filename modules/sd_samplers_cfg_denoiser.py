@@ -60,6 +60,7 @@ class CFGDenoiser(torch.nn.Module):
 
         self._refiner_pass = False
         self._conditioning_device_cache = {}
+        self._conditioning_schedule_key = None
 
     @staticmethod
     def _selected_schedule_entry(schedule, step):
@@ -83,6 +84,7 @@ class CFGDenoiser(torch.nn.Module):
 
     def clear_conditioning_cache(self):
         self._conditioning_device_cache.clear()
+        self._conditioning_schedule_key = None
 
     @property
     def inner_model(self):
@@ -142,6 +144,10 @@ class CFGDenoiser(torch.nn.Module):
 
         cond_cache_key = self._multicond_cache_key(cond, self.step)
         uncond_cache_key = self._cond_cache_key(uncond, self.step)
+        schedule_key = (cond_cache_key, uncond_cache_key)
+        if schedule_key != self._conditioning_schedule_key:
+            self.clear_conditioning_cache()
+            self._conditioning_schedule_key = schedule_key
         cond_composition, cond = prompt_parser.reconstruct_multicond_batch(cond, self.step)
         uncond = prompt_parser.reconstruct_cond_batch(uncond, self.step) if uncond is not None else None
 
