@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from backend import args, memory_management
+from backend import args, attention, memory_management
 from backend.modules.k_prediction import k_prediction_from_diffusers_scheduler
 
 
@@ -62,7 +62,17 @@ class KModel(torch.nn.Module):
         input_shapes = [input_shape]
         area = sum(map(lambda input_shape: input_shape[0] * math.prod(input_shape[2:]), input_shapes))
 
-        if memory_management.xformers_enabled() or memory_management.pytorch_attention_flash_attention():
-            return (area * memory_management.dtype_size(self.computation_dtype) * 0.01 * self.config.memory_usage_factor) * (1024 * 1024)
+        if attention.attention_function is attention.attention_basic:
+            size = 8
+            multiplier = 0.02
+        elif args.dynamic_args.ops.startswith("Mixed"):
+            size = 1
+            multiplier = 0.02
+        elif memory_management.xformers_enabled() or memory_management.pytorch_attention_flash_attention():
+            size = memory_management.dtype_size(self.computation_dtype)
+            multiplier = 0.01
         else:
-            return (area * 0.15 * self.config.memory_usage_factor) * (1024 * 1024)
+            size = 0.15
+            multiplier = 1.0
+
+        return (area * size * multiplier * self.config.memory_usage_factor) * (1024 * 1024)

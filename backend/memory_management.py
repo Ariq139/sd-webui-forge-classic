@@ -1202,7 +1202,11 @@ def pytorch_attention_enabled() -> bool:
 
 
 def pytorch_attention_enabled_vae() -> bool:
-    return ENABLE_PYTORCH_ATTENTION and not is_amd()
+    if is_amd():
+        arch = torch.cuda.get_device_properties(get_torch_device()).gcnArchName
+        if arch.startswith("gfx11"):
+            return False
+    return ENABLE_PYTORCH_ATTENTION
 
 
 def pytorch_attention_flash_attention() -> bool:
@@ -1395,6 +1399,9 @@ def should_use_bf16(device: torch.device = None, model_params: int = 0, prioriti
 
 
 def supports_fp8_compute(device: torch.device = None) -> bool:
+    if is_device_cpu(device):
+        return False
+
     if SUPPORT_FP8_OPS is True:
         return True
 
@@ -1420,6 +1427,9 @@ def supports_fp8_compute(device: torch.device = None) -> bool:
 
 
 def supports_nvfp4_compute(device: torch.device = None) -> bool:
+    if is_device_cpu(device):
+        return False
+
     if not is_nvidia():
         return False
 
@@ -1431,6 +1441,9 @@ def supports_nvfp4_compute(device: torch.device = None) -> bool:
 
 
 def supports_mxfp8_compute(device: torch.device = None) -> bool:
+    if is_device_cpu(device):
+        return False
+
     if not is_nvidia():
         return False
 
@@ -1445,6 +1458,9 @@ def supports_mxfp8_compute(device: torch.device = None) -> bool:
 
 
 def supports_int8_compute(device: torch.device = None) -> bool:
+    if is_device_cpu(device):
+        return False
+
     if (device is not None and is_device_mps(device)) or mps_mode():
         return False
 

@@ -3,7 +3,7 @@ import json
 import torch
 
 
-def load_state_dict(model: torch.nn.Module, sd: dict[str, torch.Tensor], ignore_errors: list[str] = [], log_name: str = None, ignore_start: str = None):
+def load_state_dict(model: torch.nn.Module, sd: dict[str, torch.Tensor], ignore_errors: list[str] = [], log_name: str = None, ignore_start: str | list[str] = None):
     is_meta = any(p.is_meta for p in model.parameters())
 
     if is_meta:
@@ -25,9 +25,11 @@ def load_state_dict(model: torch.nn.Module, sd: dict[str, torch.Tensor], ignore_
     missing = [x for x in missing if x not in ignore_errors]
     unexpected = [x for x in unexpected if x not in ignore_errors]
 
-    if isinstance(ignore_start, str):
-        missing = [x for x in missing if not x.startswith(ignore_start)]
-        unexpected = [x for x in unexpected if not x.startswith(ignore_start)]
+    if ignore_start is not None:
+        missing = [x for x in missing if not x.startswith(tuple(ignore_start))]
+        unexpected = [x for x in unexpected if not x.startswith(tuple(ignore_start))]
+
+    unexpected = [x for x in unexpected if "comfy_attention" not in x]
 
     log_name = log_name or type(model).__name__
     if len(missing) > 0:
@@ -210,6 +212,23 @@ def _ensure_quantization_markers(state_dict: dict[str, torch.Tensor]) -> bool:
 
 def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
     _ensure_quantization_markers(state_dict)
+    counts: dict[str, int] = {}
+    for key, value in state_dict.items():
+        if not key.endswith(".comfy_quant"):
+            continue
+        try:
+            quant_format = json.loads(value.detach().cpu().numpy().tobytes())["format"]
+        except (AttributeError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if quant_format in QUANT_ALGOS:
+            counts[quant_format] = counts.get(quant_format, 0) + 1
+
+    if counts:
+        from backend.quant_ops import QUANT_ALGOS
+
+        layout = QUANT_ALGOS[max(counts, key=counts.get)]["comfy_tensor_layout"]
+        return {"mixed_ops": True, "TE": not is_unet, "layout": layout}
+
     if any(k.endswith(".comfy_quant") for k in state_dict):
         return {"mixed_ops": True, "TE": not is_unet}
     return None

@@ -100,7 +100,7 @@ def check_versions():
     if torch.cuda.is_available() and torch.cuda.get_device_properties().major < 8:
         expected_torch = "2.10.0"
     else:
-        expected_torch = "2.13.0"
+        expected_torch = "2.14.0"
 
     expected_torch = "2.11.0"
     expected_xformers = "0.0.35"

@@ -1,13 +1,13 @@
 import html
 import os
 
-from modules import shared, ui_extra_networks, sd_models
+from modules import sd_models, shared, ui_extra_networks
 from modules.ui_extra_networks_checkpoints_user_metadata import CheckpointUserMetadataEditor
 
 
 class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
     def __init__(self):
-        super().__init__('Checkpoints')
+        super().__init__("Checkpoints")
 
         self.allow_prompt = False
 
@@ -24,6 +24,10 @@ class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
         search_terms = [self.search_terms_from_path(checkpoint.filename)]
         if checkpoint.sha256:
             search_terms.append(checkpoint.sha256)
+
+        user_metadata: dict = ui_extra_networks.extra_networks.get_user_metadata(checkpoint.filename)
+        preferred_modules: list[str] = user_metadata.get("vae_te", [])
+
         return {
             "name": checkpoint.name_for_extra,
             "filename": checkpoint.filename,
@@ -31,10 +35,10 @@ class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
             "preview": self.find_preview(path),
             "description": self.find_description(path),
             "search_terms": search_terms,
-            "onclick": html.escape(f"return selectCheckpoint({ui_extra_networks.quote_js(name)})"),
+            "onclick": html.escape(f"return selectCheckpoint({ui_extra_networks.quote_js(name)}, {ui_extra_networks.quote_js(preferred_modules)})"),
             "local_preview": f"{path}.{shared.opts.samples_format}",
             "metadata": checkpoint.metadata,
-            "sort_keys": {'default': index, **self.get_sort_keys(checkpoint.filename)},
+            "sort_keys": {"default": index, **self.get_sort_keys(checkpoint.filename)},
         }
 
     def list_items(self):

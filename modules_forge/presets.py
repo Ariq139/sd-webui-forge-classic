@@ -17,6 +17,7 @@ class PresetArch(Enum):
     qwen21 = 15  # Qwen-Image-2.1
     ltx2 = 13  # LTX-2.3 video
     ideogram = 14  # Ideogram 4
+    moss = 16  # MOSS-Image
 
     @staticmethod
     def choices() -> list[str]:
@@ -39,6 +40,7 @@ SAMPLERS = {
     PresetArch.qwen21: "Euler",
     PresetArch.ltx2: "Euler",
     PresetArch.ideogram: "Euler",
+    PresetArch.moss: "Euler",
 }
 
 SCHEDULERS = {
@@ -57,6 +59,7 @@ SCHEDULERS = {
     PresetArch.qwen21: "Simple",
     PresetArch.ltx2: "Simple",
     PresetArch.ideogram: "Simple",
+    PresetArch.moss: "Simple",
 }
 
 STEPS = {
@@ -75,6 +78,7 @@ STEPS = {
     PresetArch.qwen21: 32,
     PresetArch.ltx2: 30,
     PresetArch.ideogram: 48,
+    PresetArch.moss: 50,
 }
 
 CFG = {
@@ -93,6 +97,7 @@ CFG = {
     PresetArch.qwen21: 2.5,
     PresetArch.ltx2: 3.0,
     PresetArch.ideogram: 7.0,
+    PresetArch.moss: 3.0,
 }
 
 DISTILL = {
@@ -108,6 +113,7 @@ SHIFT = {
     PresetArch.ernie: 3.0,
     PresetArch.pid: -1.5,
     PresetArch.krea: -1.15,
+    PresetArch.moss: 5.0,
 }
 
 FRAMES = {
@@ -276,12 +282,12 @@ def register(options_templates: dict):
                 (f"ui_{name}", name.upper(), "presets"),
                 {
                     f"{name}_t2i_ss1": OptionRow(),
-                    f"{name}_t2i_sampler": OptionInfo(sampler, "txt2img Sampler", Dropdown, lambda: {"choices": [x.name for x in list_samplers()]}),
-                    f"{name}_t2i_scheduler": OptionInfo(scheduler, "txt2img Scheduler", Dropdown, lambda: {"choices": list_schedulers()}),
+                    f"{name}_t2i_sampler": OptionInfo(sampler, "txt2img Sampler", Dropdown, lambda: {"choices": [x.name for x in list_samplers()], "allow_custom_value": True}),
+                    f"{name}_t2i_scheduler": OptionInfo(scheduler, "txt2img Scheduler", Dropdown, lambda: {"choices": list_schedulers(), "allow_custom_value": True}),
                     f"{name}_t2i_ss0": OptionRow(),
                     f"{name}_i2i_ss1": OptionRow(),
-                    f"{name}_i2i_sampler": OptionInfo(sampler, "img2img Sampler", Dropdown, lambda: {"choices": [x.name for x in list_samplers()]}),
-                    f"{name}_i2i_scheduler": OptionInfo(scheduler, "img2img Scheduler", Dropdown, lambda: {"choices": list_schedulers()}),
+                    f"{name}_i2i_sampler": OptionInfo(sampler, "img2img Sampler", Dropdown, lambda: {"choices": [x.name for x in list_samplers()], "allow_custom_value": True}),
+                    f"{name}_i2i_scheduler": OptionInfo(scheduler, "img2img Scheduler", Dropdown, lambda: {"choices": list_schedulers(), "allow_custom_value": True}),
                     f"{name}_i2i_ss0": OptionRow(),
                 },
             )

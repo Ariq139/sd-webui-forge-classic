@@ -5,6 +5,7 @@ import json
 import torch
 
 from backend import memory_management
+from backend.args import args
 from backend.memory_management import cast_to_device, logger
 
 from .operations import (
@@ -28,6 +29,22 @@ from .quant_ops import (  # noqa
 _GROUPED_INT8_FORMATS = {"asym_w4a8_int8": 4, "w6a8_int8": 6}
 
 _COMPILE_UNSAFE_LAYOUTS = {"TensorCoreConvRotW4A4Layout", "AsymW4A8Int8Layout"}
+
+
+def _convrot_rotate_input(module: torch.nn.Linear, x: torch.Tensor) -> bool:
+    weight = module.weight
+    return module._full_precision_mm and isinstance(weight, QuantizedTensor) and weight._layout_cls == "TensorWiseINT8Layout" and getattr(weight._params, "convrot", False) and not getattr(weight._params, "transposed", False) and not isinstance(x, QuantizedTensor) and x.numel() // max(x.shape[-1], 1) < module.out_features and len(module.weight_function) == 0 and not getattr(module, "forge_force_cast_weights", False)
+
+
+def _convrot_linear(x: torch.Tensor, weight: QuantizedTensor, bias: torch.Tensor) -> torch.Tensor:
+    qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    group_size = weight._params.convrot_groupsize
+    x = ck.tensor.int8_utils._rotate_activation(x, ck.tensor.int8_utils._build_hadamard(group_size, device=x.device, dtype=x.dtype), group_size)
+    scale = scale.to(dtype=x.dtype).reshape(-1)
+    if x.dtype == torch.float16:
+        return torch.nn.functional.linear(x, qdata.to(dtype=x.dtype) * scale.reshape(-1, 1), bias)
+    out = torch.nn.functional.linear(x, qdata.to(dtype=x.dtype)) * scale
+    return out if bias is None else out + bias
 
 
 @torch.compiler.disable
@@ -154,7 +171,6 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
         module.layout_type = qconfig["comfy_tensor_layout"]
         layout_cls = get_layout_class(module.layout_type)
 
-        # Per-format scales; fp8 dtype views handle both legacy uint8-on-disk and native fp8.
         if module.quant_format in ("float8_e4m3fn", "float8_e5m2"):
             scales = {"scale": pop_scale("weight_scale")}
         elif module.quant_format == "mxfp8":
@@ -191,7 +207,7 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
                 "scale": scale,
                 "convrot_groupsize": int(layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))),
                 "quant_group_size": 64,
-                "linear_dtype": layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
+                "linear_dtype": "int8" if args.force_w4a8 else layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
             }
         elif module.quant_format in _GROUPED_INT8_FORMATS:
             bits = _GROUPED_INT8_FORMATS[module.quant_format]
@@ -363,6 +379,13 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
 
                 weight_only_quant = _use_quantized and not quantize_input and isinstance(self.weight, QuantizedTensor)
 
+                if not weight_only_quant and _convrot_rotate_input(self, input):
+                    weight, bias, signal = weights_manual_cast(self, x=input, dtype=self.weight.dtype)
+                    with main_stream_worker(weight, bias, signal):
+                        if isinstance(weight, QuantizedTensor):
+                            return _convrot_linear(input, weight, bias)
+                        return torch.nn.functional.linear(input, weight.to(dtype=input.dtype), bias)
+
                 if weight_only_quant:
                     weight, bias, signal = weights_manual_cast(self, x=None, dtype=self.weight.dtype, device=input.device, bias_dtype=input.dtype)
                     weight = weight.to(dtype=input.dtype)
@@ -370,6 +393,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     weight, bias, signal = weights_manual_cast(self, x=input)
 
                 with main_stream_worker(weight, bias, signal):
+                    if self._full_precision_mm and isinstance(weight, QuantizedTensor):
+                        weight = weight.dequantize()
                     output = torch.nn.functional.linear(input, weight, bias)
 
                 if reshaped_nd:
@@ -602,9 +627,15 @@ def _swiglu_eager(x: torch.Tensor) -> torch.Tensor:
     return F.silu(gate).mul_(up)
 
 
+def _situ_eager(x: torch.Tensor) -> torch.Tensor:
+    hidden, gate = x.chunk(2, dim=-1)
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
+
+
 INPUT_ACT_EAGER = {
     "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
     "swiglu": _swiglu_eager,
+    "situ": _situ_eager,
 }
 
 
@@ -633,7 +664,7 @@ def linear_input_act(linear: torch.nn.Linear, x: torch.Tensor, input_act: str, a
     full_precision_mm = getattr(linear, "_full_precision_mm", False)
 
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout" or getattr(weight._params, "transposed", False) or full_precision_mm:
-        if not isinstance(weight, QuantizedTensor) and not full_precision_mm and _fp16_linear_wanted(x):
+        if not isinstance(weight, QuantizedTensor) and not full_precision_mm and _fp16_linear_wanted(x) and getattr(weight, "gguf_cls", None) is None:
             weight, bias, offload_stream = weights_manual_cast(linear, x)
             with main_stream_worker(weight, bias, offload_stream):
                 return ck.fp16_linear(_eager_input_act(x, input_act, act_weight, act_eps), weight, bias, residual=residual, residual_scale=residual_scale)

@@ -329,8 +329,8 @@ def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
 
     file_extensions = ("ckpt", "pt", "pth", "bin", "safetensors", "sft", "gguf")
 
-    module_list.clear()
-    module_categories.clear()
+    refreshed_modules: dict[str, os.PathLike] = {}
+    refreshed_categories: dict[str, str] = {}
 
     module_paths = [
         ("VAE", [os.path.join(paths.models_path, "VAE"), *shared.cmd_opts.vae_dirs]),
@@ -346,8 +346,13 @@ def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
             visited_paths.add(root)
 
             module_files = find_files_with_extensions(root, file_extensions)
-            module_list.update(module_files)
-            module_categories.update({name: category for name in module_files})
+            refreshed_modules.update(module_files)
+            refreshed_categories.update({name: category for name in module_files})
+
+    module_list.clear()
+    module_categories.clear()
+    module_list.update({name: refreshed_modules[name] for name in sorted(refreshed_modules, key=shared.natural_sort_key)})
+    module_categories.update({name: refreshed_categories[name] for name in module_list})
 
     return sorted(ckpt_list, key=shared.natural_sort_key), sorted(module_list.keys(), key=shared.natural_sort_key)
 

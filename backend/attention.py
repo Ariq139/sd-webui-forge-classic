@@ -929,7 +929,7 @@ def pytorch_attention_vae(q, k, v):
 if memory_management.xformers_enabled_vae():
     _automatic_vae_attention_function = xformers_attention_vae
     logger.info("Using xformers Attention for VAE")
-elif memory_management.pytorch_attention_enabled():
+elif memory_management.pytorch_attention_enabled_vae():
     _automatic_vae_attention_function = pytorch_attention_vae
     logger.info("Using PyTorch Attention for VAE")
 else:

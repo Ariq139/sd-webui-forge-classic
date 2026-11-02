@@ -1,5 +1,5 @@
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 
 import gradio as gr
@@ -8,33 +8,33 @@ from modules import script_callbacks, scripts, sd_models, shared, shared_items, 
 from modules.call_queue import wrap_gradio_call_no_job
 from modules.options import options_section
 from modules.shared import opts
-from modules.ui_components import FormRow
-from modules.ui_gradio_extensions import reload_javascript
-from modules_forge import main_entry
-
-CURRENT_ROW: gr.Row = None
+from modules.ui_components import FormRow
+from modules.ui_gradio_extensions import reload_javascript
+from modules_forge import main_entry
+
+CURRENT_ROW: gr.Row = None
 
 
 def get_value_for_setting(key):
     value = getattr(opts, key)
 
-    info = opts.data_labels[key]
-    args = info.component_args() if callable(info.component_args) else info.component_args or {}
-    args = {k: v for k, v in args.items() if k not in {"precision"}}
-    return gr.update(value=value, **args)
+    info = opts.data_labels[key]
+    args = info.component_args() if callable(info.component_args) else info.component_args or {}
+    args = {k: v for k, v in args.items() if k not in {"precision"}}
+    return gr.update(value=value, **args)
 
 
-def create_setting_component(key, is_quicksettings=False):
-    def fun():
-        value = opts.data[key] if key in opts.data else opts.data_labels[key].default
-        return value
+def create_setting_component(key, is_quicksettings=False):
+    def fun():
+        value = opts.data[key] if key in opts.data else opts.data_labels[key].default
+        return value
 
     info = opts.data_labels[key]
     t = type(info.default)
 
-    args = info.component_args() if callable(info.component_args) else info.component_args
-    args = dict(args or {})
-
+    args = info.component_args() if callable(info.component_args) else info.component_args
+    args = dict(args or {})
+
     if info.component is not None:
         comp = info.component
     elif t == str:
@@ -85,12 +85,12 @@ class UiSettings:
     dummy_component = None
     quicksettings_list = None
     quicksettings_names = None
-    text_settings = None
-    show_all_pages = None
-    search_input = None
+    text_settings = None
+    show_all_pages = None
+    search_input = None
 
-    def run_settings(self, *args):
-        changed = []
+    def run_settings(self, *args):
+        changed = []
 
         for key, value, comp in zip(opts.data_labels.keys(), args, self.components):
             assert comp == self.dummy_component or opts.same_type(value, opts.data_labels[key].default), f"Bad value for setting {key}: {value}; expecting {type(opts.data_labels[key].default).__name__}"
@@ -103,8 +103,8 @@ class UiSettings:
             if key in ("sd_model_checkpoint", "sd_vae"):
                 continue
 
-            if opts.set(key, value):
-                changed.append(key)
+            if opts.set(key, value):
+                changed.append(key)
 
         try:
             opts.save(shared.config_filename)
@@ -152,36 +152,36 @@ class UiSettings:
 
             self.result = gr.HTML(elem_id="settings_result")
 
-            self.quicksettings_names = opts.quicksettings_list
-            self.quicksettings_names = {x: i for i, x in enumerate(self.quicksettings_names) if x != "quicksettings"}
-
-            self.quicksettings_list = []
-            settings_tab_metadata = []
+            self.quicksettings_names = opts.quicksettings_list
+            self.quicksettings_names = {x: i for i, x in enumerate(self.quicksettings_names) if x != "quicksettings"}
 
-            previous_section = None
-            current_tab = None
-            current_row = None
-            with gr.Tabs(elem_id="settings"):
-                for i, (k, item) in enumerate(opts.data_labels.items()):
-                    section_must_be_skipped = item.section[0] is None
-
-                    if previous_section != item.section and not section_must_be_skipped:
-                        elem_id, text = item.section
-
-                        if current_tab is not None:
-                            current_row.__exit__()
-                            current_tab.__exit__()
+            self.quicksettings_list = []
+            settings_tab_metadata = []
 
-                        gr.Group()
-                        current_tab = gr.TabItem(elem_id=f"settings_{elem_id}", label=text)
-                        settings_tab_metadata.append({"id": f"settings_{elem_id}", "label": text})
-                        current_tab.__enter__()
-                        current_row = gr.Column(elem_id=f"column_settings_{elem_id}", variant="compact")
-                        current_row.__enter__()
-
-                        previous_section = item.section
-
-                    if k in self.quicksettings_names and not shared.cmd_opts.freeze_settings:
+            previous_section = None
+            current_tab = None
+            current_row = None
+            with gr.Tabs(elem_id="settings"):
+                for i, (k, item) in enumerate(opts.data_labels.items()):
+                    section_must_be_skipped = item.section[0] is None
+
+                    if previous_section != item.section and not section_must_be_skipped:
+                        elem_id, text = item.section
+
+                        if current_tab is not None:
+                            current_row.__exit__()
+                            current_tab.__exit__()
+
+                        gr.Group()
+                        current_tab = gr.TabItem(elem_id=f"settings_{elem_id}", label=text)
+                        settings_tab_metadata.append({"id": f"settings_{elem_id}", "label": text})
+                        current_tab.__enter__()
+                        current_row = gr.Column(elem_id=f"column_settings_{elem_id}", variant="compact")
+                        current_row.__enter__()
+
+                        previous_section = item.section
+
+                    if k in self.quicksettings_names and not shared.cmd_opts.freeze_settings:
                         self.quicksettings_list.append((i, k, item))
                         self.components.append(dummy_component)
                     elif section_must_be_skipped:
@@ -191,9 +191,9 @@ class UiSettings:
                         self.component_dict[k] = component
                         self.components.append(component)
 
-                if current_tab is not None:
-                    current_row.__exit__()
-                    current_tab.__exit__()
+                if current_tab is not None:
+                    current_row.__exit__()
+                    current_tab.__exit__()
 
                 with gr.TabItem("Defaults", id="defaults", elem_id="settings_tab_defaults"):
                     loadsave.create_ui()
@@ -209,37 +209,37 @@ class UiSettings:
                         with gr.Column(scale=100):
                             pass
 
-                with gr.TabItem("Actions", id="actions", elem_id="settings_tab_actions"):
+                with gr.TabItem("Actions", id="actions", elem_id="settings_tab_actions"):
                     request_notifications = gr.Button(value="Request browser notifications", elem_id="request_notifications")
                     download_localization = gr.Button(value="Download localization template", elem_id="download_localization")
                     reload_script_bodies = gr.Button(value="Reload custom script bodies (No ui updates, No restart)", variant="secondary", elem_id="settings_reload_script_bodies")
                     with gr.Row():
                         unload_sd_model = gr.Button(value="Unload All Models", tooltip="Clear all models from RAM and VRAM", elem_id="sett_unload_sd_model")
                         list_loaded_model = gr.Button(value="List Loaded Models", tooltip="Print out all models currently loaded", elem_id="sett_list_loaded_model")
-                    with gr.Row():
-                        calculate_all_checkpoint_hash = gr.Button(value="Calculate hash for all checkpoint", elem_id="calculate_all_checkpoint_hash")
-                        calculate_all_checkpoint_hash_threads = gr.Number(value=1, label="Number of parallel calculations", elem_id="calculate_all_checkpoint_hash_threads", precision=0, minimum=1)
+                    with gr.Row():
+                        calculate_all_checkpoint_hash = gr.Button(value="Calculate hash for all checkpoint", elem_id="calculate_all_checkpoint_hash")
+                        calculate_all_checkpoint_hash_threads = gr.Number(value=1, label="Number of parallel calculations", elem_id="calculate_all_checkpoint_hash_threads", precision=0, minimum=1)
 
-                with gr.TabItem("Licenses", id="licenses", elem_id="settings_tab_licenses") as license_tab:
-                    gr.HTML(shared.html("licenses.html"), elem_id="licenses")
-
-                self.show_all_pages = gr.Button(value="Show all pages", elem_id="settings_show_all_pages")
-
-                self.search_input = gr.Textbox(value="", elem_id="settings_search", max_lines=1, placeholder="Search...", show_label=False)
+                with gr.TabItem("Licenses", id="licenses", elem_id="settings_tab_licenses") as license_tab:
+                    gr.HTML(shared.html("licenses.html"), elem_id="licenses")
 
-                self.text_settings = gr.Textbox(elem_id="settings_json", value=lambda: opts.dumpjson(), visible=False)
-
-            settings_tab_metadata.extend(
-                [
-                    {"id": "settings_tab_defaults", "label": "Defaults"},
-                    {"id": "settings_tab_sysinfo", "label": "Sysinfo"},
-                    {"id": "settings_tab_actions", "label": "Actions"},
-                    {"id": "settings_tab_licenses", "label": "Licenses"},
-                ]
-            )
-            gr.Textbox(value=json.dumps(settings_tab_metadata), elem_id="settings_nav_data", visible=False)
-
-            def call_func_and_return_text(func, text):
+                self.show_all_pages = gr.Button(value="Show all pages", elem_id="settings_show_all_pages")
+
+                self.search_input = gr.Textbox(value="", elem_id="settings_search", max_lines=1, placeholder="Search...", show_label=False)
+
+                self.text_settings = gr.Textbox(elem_id="settings_json", value=lambda: opts.dumpjson(), visible=False)
+
+            settings_tab_metadata.extend(
+                [
+                    {"id": "settings_tab_defaults", "label": "Defaults"},
+                    {"id": "settings_tab_sysinfo", "label": "Sysinfo"},
+                    {"id": "settings_tab_actions", "label": "Actions"},
+                    {"id": "settings_tab_licenses", "label": "Licenses"},
+                ]
+            )
+            gr.Textbox(value=json.dumps(settings_tab_metadata), elem_id="settings_nav_data", visible=False)
+
+            def call_func_and_return_text(func, text):
                 def handler():
                     t = timer.Timer()
                     func()
@@ -297,11 +297,11 @@ class UiSettings:
                         print(f"{completed} / {len(checkpoints_list)} ")
                     print("Finish calculating hash for all checkpoints")
 
-            calculate_all_checkpoint_hash.click(
-                fn=calculate_all_checkpoint_hash_fn,
-                inputs=[calculate_all_checkpoint_hash_threads],
-            )
-
+            calculate_all_checkpoint_hash.click(
+                fn=calculate_all_checkpoint_hash_fn,
+                inputs=[calculate_all_checkpoint_hash_threads],
+            )
+
         self.interface = settings_interface
 
     def add_quicksettings(self):
@@ -339,23 +339,35 @@ class UiSettings:
                 )
 
         text_set_checkpoint = gr.Textbox("", elem_id="change_checkpoint_text", visible=False)
-        button_set_checkpoint = gr.Button("Change checkpoint", elem_id="change_checkpoint", visible=False)
+        text_set_modules = gr.Textbox("", elem_id="change_modules_text", visible=False)
 
-        def _change_model(ckpt: str):
-            if (model := sd_models.get_closet_checkpoint_match(ckpt)) is not None:
-                return gr.update(value=model.name)
-            gr.Warning(f'Failed to find model "{ckpt}"')
-            return gr.skip()
+        button_set_checkpoint = gr.Button("Change Models", elem_id="change_checkpoint", visible=False)
+
+
+        def _change_model(ckpt: str, modules_json: str):
+
+            model = sd_models.get_closet_checkpoint_match(ckpt)
+            if model is None:
+                gr.Warning(f'Failed to find model "{ckpt}"')
+                return [gr.skip(), gr.skip()]
+            try:
+                modules = json.loads(modules_json or "[]")
+            except (TypeError, json.JSONDecodeError):
+                modules = []
+            if not isinstance(modules, list):
+                modules = []
+            module_update = gr.update(value=main_entry.valid_module_values(modules, main_entry.module_choices())) if modules else gr.skip()
+            return [gr.update(value=model.name), module_update]
 
         button_set_checkpoint.click(
             fn=_change_model,
-            inputs=[text_set_checkpoint],
-            outputs=[main_entry.ui_checkpoint],
+            inputs=[text_set_checkpoint, text_set_modules],
+            outputs=[main_entry.ui_checkpoint, main_entry.ui_vae],
             queue=False,
             show_progress=False,
         ).success(
-            fn=main_entry.checkpoint_change,
-            inputs=[main_entry.ui_checkpoint, main_entry.ui_forge_preset],
+            fn=main_entry._load_presets,
+            inputs=[main_entry.ui_checkpoint, main_entry.ui_vae, main_entry.ui_forge_unet_dtype, main_entry.ui_forge_preset],
             queue=False,
             show_progress=False,
         )
