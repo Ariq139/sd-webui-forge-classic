@@ -178,7 +178,7 @@ def make_checkpoint_manager_ui():
     ui_forge_preset = gr.Dropdown(
         label="UI Preset",
         value=shared.opts.forge_preset,
-        choices=PresetArch.choices(),
+        choices=sorted(p for p in PresetArch.choices() if p not in shared.cmd_opts.disable_preset) if shared.cmd_opts.sort_preset else [p for p in PresetArch.choices() if p not in shared.cmd_opts.disable_preset],
         elem_id="forge_ui_preset",
     )
 
@@ -357,7 +357,7 @@ def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
     return sorted(ckpt_list, key=shared.natural_sort_key), sorted(module_list.keys(), key=shared.natural_sort_key)
 
 
-def refresh_model_loading_parameters(*, refresh: bool = True):
+def refresh_model_loading_parameters(*, refresh: bool = True, disable_log: bool = False):
     if not refresh:
         return
 
@@ -376,12 +376,14 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
     modules: list[str] = [os.path.basename(x) for x in shared.opts.forge_additional_modules]
     dtype = str(unet_storage_dtype or [torch.float16, torch.bfloat16])
 
-    logger.info("Model Selected:")
-    print_json(data=dict(checkpoint=os.path.basename(ckpt), modules=modules, dtype=dtype))
+    if not disable_log:
+        logger.info("Model Selected:")
+        print_json(data=dict(checkpoint=os.path.basename(ckpt), modules=modules, dtype=dtype))
 
     if ckpt.endswith(("gguf", "GGUF")) and not lora_fp16:
-        logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
+        if not disable_log:
+            logger.warning("GGUF requires fp16 LoRA ; overriding option")
 
     online_lora = lora_fp16
     parameters_changed = model_data.forge_loading_parameters != loading_parameters
@@ -391,9 +393,10 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
     if not parameters_changed and not lora_mode_changed:
         return
 
-    logger.info(f"Patch LoRAs on-the-fly: {online_lora} (fp16={lora_fp16})")
-    if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
-        logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
+    if not disable_log:
+        logger.info(f"Patch LoRAs on-the-fly: {online_lora} (fp16={lora_fp16})")
+        if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
+            logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
 
     processing.need_global_unload = True
 

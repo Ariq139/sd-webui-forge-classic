@@ -52,7 +52,7 @@ class ModelResidencyTests(unittest.TestCase):
 
     def test_gguf_resident_weights_are_not_rebaked(self):
         from backend.operations_gguf import ParameterGGUF
-        from modules_forge.packages.gguf import GGMLQuantizationType
+        from gguf import GGMLQuantizationType
 
         model = torch.nn.Sequential(torch.nn.Linear(32, 1, bias=False))
         model[0].weight = ParameterGGUF(torch.zeros((1, 18), dtype=torch.uint8), tensor_type=GGMLQuantizationType.Q4_0, tensor_shape=torch.Size([1, 32]))

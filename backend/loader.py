@@ -399,6 +399,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 from backend.nn.wan_vae import WanVAE
 
                 config = WanVAE.load_config(config_path)
+                config["image_channels"] = int(state_dict["encoder.conv1.weight"].shape[1])
+                config["conv_out_channels"] = int(state_dict["decoder.head.2.weight"].shape[0])
                 dtype = memory_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float16, torch.float32])
 
             is_2d_vae = "post_quant_conv.weight" in state_dict
@@ -551,7 +553,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             if storage_dtype == "gguf":
                 with no_init_weights():
-                    with using_forge_operations(device=memory_management.cpu, dtype=memory_management.text_encoder_dtype(), manual_cast_enabled=False, extra_dtype=storage_dtype):
+                    with using_forge_operations(device=memory_management.cpu, dtype=memory_management.text_encoder_dtype(), manual_cast_enabled=True, extra_dtype=storage_dtype):
                         model = Qwen35_9B(config)
             else:
                 with no_init_weights():
@@ -758,8 +760,7 @@ def replace_state_dict(sd: dict[str, torch.Tensor], asd: dict[str, torch.Tensor]
     if str(path).lower().endswith(".gguf"):
         from backend.loader_gguf import gguf_remapping
 
-        architecture = (metadata or {}).get("general.architecture")
-        asd = gguf_remapping(asd, architecture=architecture)
+        asd = gguf_remapping(asd, metadata or {})
 
     #   flux 2
     if "decoder.post_quant_conv.weight" in asd:
@@ -1001,7 +1002,11 @@ def replace_state_dict(sd: dict[str, torch.Tensor], asd: dict[str, torch.Tensor]
                 continue
             sd[f"{text_encoder_key_prefix}ministral3_3b.transformer.{k}"] = v
 
-    if "visual.blocks.0.attn.proj.weight" in asd:
+    if "visual.merger.linear_fc2.weight" in asd:
+        for k, v in asd.items():
+            if k.startswith("visual."):
+                sd[f"{text_encoder_key_prefix}qwen35_9b.transformer.model.{k}"] = v
+    elif "visual.blocks.0.attn.proj.weight" in asd:
         for k, v in asd.items():
             sd[f"{text_encoder_key_prefix}qwen25_7b.{k}"] = v
 
@@ -1099,7 +1104,7 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
     if isinstance(additional_state_dicts, list):
         for asd in additional_state_dicts:
             _asd, _meta = load_torch_file(asd, return_metadata=True)
-            _asd, _ = convert_quantization(_asd, _meta)
+            _asd, _meta = convert_quantization(_asd, _meta)
             has_external_vae |= _is_detectable_standalone_vae(_asd)
             sd = replace_state_dict(sd, _asd, guess, asd, metadata=_meta)
             del _asd

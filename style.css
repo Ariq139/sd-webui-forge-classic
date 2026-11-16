@@ -1347,6 +1347,10 @@ footer {
     background-image: url("/gradio_api/file=html/card-no-preview.jpg");
 }
 
+.extra-network-pane div.card:last-child {
+    margin-bottom: 0.5rem !important;
+}
+
 .extra-network-pane .card:hover {
     box-shadow: 0 0 2px 0.3em rgba(0, 128, 255, 0.35);
 }

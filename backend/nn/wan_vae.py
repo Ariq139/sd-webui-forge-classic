@@ -10,7 +10,14 @@ from einops import rearrange
 
 from backend.attention import attention_function_vae
 from backend.nn._vae import ProcessLatent
-from backend.nn._wan_cache import CACHE_T, CausalConv3d, cached_chain, strip_apply, strip_down, strip_residual
+from backend.nn._wan_cache import (
+    CACHE_T,
+    CausalConv3d,
+    cached_chain,
+    strip_apply,
+    strip_down,
+    strip_residual,
+)
 
 
 class RMS_norm(nn.Module):
@@ -320,6 +327,9 @@ class WanVAE(nn.Module, ProcessLatent, ConfigMixin):
         self.decoder = Decoder3d(base_dim, z_dim, conv_out_channels, dim_mult, num_res_blocks, attn_scales, self.temporal_upsample, dropout)
 
     def encode(self, x):
+        if self.encoder.conv1.in_channels == 4 and x.shape[1] == 3:
+            x = torch.cat((x, torch.ones_like(x[:, :1])), dim=1)
+
         conv_idx = [0]
         t = x.shape[2]
         t = 1 + ((t - 1) // 4) * 4
