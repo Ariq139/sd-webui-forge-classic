@@ -5,6 +5,7 @@ import torch
 import gguf
 from gguf import GGMLQuantizationType
 
+from backend import memory_management
 from modules_forge.packages.gguf import quants
 
 QUANTS_MAPPING: dict[GGMLQuantizationType, type[quants.TorchQuant]] = {
@@ -67,7 +68,10 @@ def _llamacpp_cuda_module():
             return None
         _CUDA_MODULE = llamacpp_gguf_cuda
         logger.info("GGUF CUDA linear kernels are available")
-    except Exception:
+    except Exception as error:
+        if memory_management.is_oom(error):
+            _CUDA_PROBED = False
+            raise
         logger.debug("GGUF CUDA kernels are unavailable; using dequantization", exc_info=True)
     return _CUDA_MODULE
 
@@ -87,7 +91,9 @@ def try_llamacpp_cuda_linear(weight, input_tensor, bias):
         if not module.may_support_linear_qtype_name(qtype_name):
             return None
         return module.linear(raw_weight, qtype_name, tuple(weight.real_shape), input_tensor, bias, input_tensor.dtype)
-    except Exception:
+    except Exception as error:
+        if memory_management.is_oom(error):
+            raise
         logger.debug("GGUF CUDA linear failed for %s; using dequantization", qtype_name, exc_info=True)
         return None
 
@@ -107,7 +113,9 @@ def try_llamacpp_cuda_embedding(weight, input_tensor, dtype):
         if not hasattr(module, "embedding") or not module.may_support_embedding_qtype_name(qtype_name):
             return None
         return module.embedding(raw_weight, qtype_name, tuple(weight.real_shape), input_tensor, dtype)
-    except Exception:
+    except Exception as error:
+        if memory_management.is_oom(error):
+            raise
         logger.debug("GGUF CUDA embedding failed for %s; using dequantization", qtype_name, exc_info=True)
         return None
 

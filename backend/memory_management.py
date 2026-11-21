@@ -245,7 +245,7 @@ ACCELERATOR_ERROR = getattr(torch, "AcceleratorError", None)
 def is_oom(e: Exception) -> bool:
     if OOM_EXCEPTION is not None and isinstance(e, OOM_EXCEPTION):
         return True
-    if (ACCELERATOR_ERROR is not None and isinstance(e, ACCELERATOR_ERROR)) or "out of memory" in str(e).lower():
+    if "out of memory" in str(e).lower():
         discard_cuda_async_error()
         return True
     return False
@@ -292,7 +292,6 @@ else:
         import pynvml
 
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     except Exception:
         PYNVML_IS_AVAILABLE = False
     else:
@@ -532,6 +531,9 @@ class LoadedModel:
         else:
             return self.model_memory()
 
+    def uses_device(self, device):
+        return device in self.model.resident_devices() if hasattr(self.model, "resident_devices") else self.device == device
+
     def model_load(self, lowvram_model_memory=0, force_patch_weights=False, force_full_load=False):
         model = self.model
         resident_state = (self.device, model.current_device, model.model_dtype(), model.loaded_size(), model.patches_uuid, model.force_cast_weights, vram_state)
@@ -578,6 +580,8 @@ class LoadedModel:
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
         self._resident_state = None
+        if hasattr(self.model, "resident_devices"):
+            memory_to_free = None
         if memory_to_free is not None:
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
@@ -660,7 +664,7 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
 
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
-        if shift_model.device == device:
+        if shift_model.uses_device(device):
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
@@ -739,14 +743,49 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
             if loaded_model.model is not current_loaded_models[i].model and loaded_model.model.is_clone(current_loaded_models[i].model):
                 to_unload = [i] + to_unload
         for i in to_unload:
-            model_to_unload = current_loaded_models.pop(i)
-            model_to_unload.model.detach(unpatch_all=False)
-            if model_to_unload.model_finalizer is not None:
-                model_to_unload.model_finalizer.detach()
+            model_to_unload = current_loaded_models[i]
+            if hasattr(loaded_model.model, "resident_devices") and hasattr(model_to_unload.model, "resident_devices"):
+                # The clone shares the still-resident model. Keep it tracked
+                # even if planning or patching the replacement later fails.
+                model_to_unload.model.detach(unpatch_all=False)
+                loaded_model.real_model = model_to_unload.real_model
+                loaded_model.model_finalizer = model_to_unload.model_finalizer
+                model_to_unload.model_finalizer = None
+                current_loaded_models[i] = loaded_model
+            else:
+                current_loaded_models.pop(i)
+                model_to_unload.model.detach(unpatch_all=False)
+                if model_to_unload.model_finalizer is not None:
+                    model_to_unload.model_finalizer.detach()
 
     total_memory_required = {}
+    sharded_devices = set()
     for loaded_model in models_to_load:
-        total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
+        if hasattr(loaded_model.model, "prepare_sharded_load"):
+            loaded_model.model.prepare_sharded_load(models_to_load, force_patch_weights=force_patch_weights, reserve=extra_mem)
+        if hasattr(loaded_model.model, "device_memory_requirements"):
+            from backend.multi_gpu.planner import InsufficientDeviceMemory
+            try:
+                requirements = loaded_model.model.device_memory_requirements(extra_mem)
+            except InsufficientDeviceMemory:
+                cleanup_errors = []
+                for device in (loaded_model.model.load_device, loaded_model.model.secondary_device):
+                    try:
+                        free_memory(float("inf"), device, keep_loaded=models_to_load)
+                    except Exception as error:
+                        cleanup_errors.append(error)
+                        logger.exception("Failed to reclaim %s before retrying multi-GPU placement", device)
+                if cleanup_errors:
+                    raise RuntimeError("Multi-GPU placement retry aborted because memory cleanup failed") from cleanup_errors[0]
+                try:
+                    requirements = loaded_model.model.device_memory_requirements(extra_mem)
+                except InsufficientDeviceMemory as error:
+                    raise torch.OutOfMemoryError("Multi-GPU model placement cannot fit within the available device memory") from error
+            sharded_devices.update(requirements)
+        else:
+            requirements = {loaded_model.device: loaded_model.model_memory_required(loaded_model.device)}
+        for device, required in requirements.items():
+            total_memory_required[device] = total_memory_required.get(device, 0) + required
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
@@ -756,8 +795,15 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if device != torch.device("cpu"):
             free_mem = get_free_memory(device)
             if free_mem < minimum_memory_required:
-                models_l = free_memory(minimum_memory_required, device)
+                protected = [loaded for loaded in models_to_load if hasattr(loaded.model, "resident_devices")]
+                models_l = free_memory(minimum_memory_required, device, keep_loaded=protected)
                 logger.debug("{} models unloaded.".format(len(models_l)))
+
+    for device in sharded_devices:
+        required = total_memory_required[device] + extra_mem
+        available = get_free_memory(device)
+        if available < required:
+            raise torch.OutOfMemoryError(f"Multi-GPU placement needs {required / 1024**2:.0f} MiB free on {device}, but only {available / 1024**2:.0f} MiB is available")
 
     for loaded_model in models_to_load:
         model = loaded_model.model
@@ -780,7 +826,35 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM or (UNET_ALWAYS_OFFLOAD and type(loaded_model.model).__name__.startswith("Unet")):
             lowvram_model_memory = 0.1
 
-        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights, force_full_load=force_full_load)
+        try:
+            loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights, force_full_load=force_full_load)
+        except BaseException as error:
+            if hasattr(model, "resident_devices") and isinstance(error, Exception) and is_oom(error) and getattr(model.model, "_anima_shard", None):
+                try:
+                    model.detach()
+                except Exception:
+                    logger.exception("Failed to release a multi-GPU model after loading OOM")
+                else:
+                    if loaded_model in current_loaded_models:
+                        current_loaded_models.remove(loaded_model)
+                    if loaded_model.model_finalizer is not None:
+                        loaded_model.model_finalizer.detach()
+                        loaded_model.model_finalizer = None
+            if hasattr(model, "resident_devices") and not getattr(model.model, "_anima_shard", None):
+                try:
+                    # Extension callbacks may have moved before loading
+                    # failed, even when no model weights were placed yet.
+                    model.model_patches_to(model.offload_device)
+                except Exception:
+                    logger.exception("Failed to release multi-GPU extension callbacks after loading error")
+            if hasattr(model, "resident_devices") and getattr(model.model, "_anima_shard", None) and loaded_model not in current_loaded_models:
+                # A failed rollback may have left weights on either device.
+                # Retain the record so later memory reclamation can retry.
+                loaded_model.real_model = weakref.ref(model.model)
+                loaded_model.model_finalizer = weakref.finalize(model.model, cleanup_models)
+                loaded_model.model_finalizer.atexit = False
+                current_loaded_models.insert(0, loaded_model)
+            raise
         if loaded_model in current_loaded_models:
             current_loaded_models.remove(loaded_model)
         current_loaded_models.insert(0, loaded_model)
@@ -1229,10 +1303,18 @@ def get_free_memory(dev: torch.device = None, torch_free_too: bool = False) -> i
             mem_free_total = mem_free_cuda + mem_free_torch
 
             if PYNVML_IS_AVAILABLE:
-                nvml_mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                torch_reserved = torch.cuda.memory_reserved(dev)
-                external = nvml_mem.used - torch_reserved
-                mem_free_total -= external
+                try:
+                    # CUDA indices can be reordered by CUDA_VISIBLE_DEVICES.
+                    # Match physical devices by UUID, not NVML index.
+                    uuid = getattr(torch.cuda.get_device_properties(dev), "uuid", None)
+                    if uuid is not None:
+                        uuid = str(uuid)
+                        nvml_handle = pynvml.nvmlDeviceGetHandleByUUID(uuid if uuid.startswith(("GPU-", "MIG-")) else "GPU-" + uuid)
+                        nvml_mem = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+                        mem_free_total = min(mem_free_cuda, nvml_mem.free) + mem_free_torch
+                except Exception:
+                    # CUDA's own per-device free memory remains a safe fallback.
+                    pass
 
     if torch_free_too:
         return (mem_free_total, mem_free_torch)
@@ -1532,9 +1614,9 @@ def current_stream(device: torch.device):
     if device is None:
         return None
     if is_device_cuda(device):
-        return torch.cuda.current_stream()
+        return torch.cuda.current_stream(device)
     elif is_device_xpu(device):
-        return torch.xpu.current_stream()
+        return torch.xpu.current_stream(device)
     else:
         return None
 
@@ -1632,10 +1714,10 @@ def get_offload_stream(device: torch.device):
 
     if streams is not None:
         active_stream = current_stream(device)
-        streams[stream_counter].wait_stream(active_stream)
-        stream_counter = (stream_counter + 1) % len(streams)
-        stream_counters[device] = stream_counter
-        return streams[stream_counter]
+        selected = streams[stream_counter]
+        selected.wait_stream(active_stream)
+        stream_counters[device] = (stream_counter + 1) % len(streams)
+        return selected
     if is_device_cuda(device):
         ss = []
         for _ in range(NUM_STREAMS):
@@ -1643,7 +1725,8 @@ def get_offload_stream(device: torch.device):
             ss.append(s1)
         STREAMS[device] = ss
         s = ss[stream_counter]
-        stream_counters[device] = stream_counter
+        s.wait_stream(current_stream(device))
+        stream_counters[device] = (stream_counter + 1) % len(ss)
         return s
     elif is_device_xpu(device):
         ss = []
@@ -1652,7 +1735,8 @@ def get_offload_stream(device: torch.device):
             ss.append(s1)
         STREAMS[device] = ss
         s = ss[stream_counter]
-        stream_counters[device] = stream_counter
+        s.wait_stream(current_stream(device))
+        stream_counters[device] = (stream_counter + 1) % len(ss)
         return s
 
     return None
@@ -1687,11 +1771,17 @@ if args.pin_shared_memory:
 
 def discard_cuda_async_error():
     try:
-        a = torch.tensor([1], dtype=torch.uint8, device=get_torch_device())
-        b = torch.tensor([1], dtype=torch.uint8, device=get_torch_device())
+        if not torch.cuda.is_available():
+            return
+        device = get_torch_device()
+        if not is_device_cuda(device):
+            return
+        a = torch.tensor([1], dtype=torch.uint8, device=device)
+        b = torch.tensor([1], dtype=torch.uint8, device=device)
         _ = a + b
-        torch.cuda.synchronize()
-    except torch.AcceleratorError:
+        torch.cuda.synchronize(device)
+    except Exception:
+        # Clearing a pending CUDA error must not hide the original OOM.
         pass
 
 

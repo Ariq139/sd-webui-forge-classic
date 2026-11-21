@@ -2,6 +2,7 @@
 # Reference: https://github.com/QwenLM/Qwen-Image
 
 import math
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -11,7 +12,7 @@ from einops import repeat
 
 from backend.args import dynamic_args
 from backend.attention import attention_function
-from backend.nn.flux import EmbedND
+from backend.nn.flux import EmbedND, _shard_to
 from backend.utils import pad_to_patch_size
 
 
@@ -442,7 +443,12 @@ class QwenImageTransformer2DModel(nn.Module):
         patches = transformer_options.get("patches", {})
         blocks_replace = patches_replace.get("dit", {})
 
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.transformer_blocks):
+            if shard and i == shard[2]:
+                hidden_states, encoder_hidden_states, encoder_hidden_states_mask, temb, image_rotary_emb = (
+                    _shard_to(value, shard[1]) for value in (hidden_states, encoder_hidden_states, encoder_hidden_states_mask, temb, image_rotary_emb)
+                )
             if ("double_block", i) in blocks_replace:
 
                 def block_wrap(args):
@@ -454,17 +460,18 @@ class QwenImageTransformer2DModel(nn.Module):
                 hidden_states = out["img"]
                 encoder_hidden_states = out["txt"]
             else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_hidden_states_mask=encoder_hidden_states_mask,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
+                with torch.cuda.device(hidden_states.device) if shard else nullcontext():
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                    )
 
             if "double_block" in patches:
                 for p in patches["double_block"]:
-                    out = p({"img": hidden_states, "txt": encoder_hidden_states, "x": x, "block_index": i})
+                    out = p({"img": hidden_states, "txt": encoder_hidden_states, "x": x.to(hidden_states.device) if shard else x, "block_index": i})
                     hidden_states = out["img"]
                     encoder_hidden_states = out["txt"]
 
@@ -473,8 +480,10 @@ class QwenImageTransformer2DModel(nn.Module):
                 if i < len(control_i):
                     add = control_i[i]
                     if add is not None:
-                        hidden_states[:, : add.shape[1]] += add
+                        hidden_states[:, : add.shape[1]] += add.to(hidden_states.device) if shard else add
 
+        if shard:
+            hidden_states, temb = hidden_states.to(shard[0]), temb.to(shard[0])
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 

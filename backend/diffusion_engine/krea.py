@@ -53,11 +53,44 @@ class Krea2(ForgeDiffusionEngine):
                 raise
         # Release the failed call's traceback before freeing memory and retrying.
         self.ini_latent = initial_latent
-        dynamic_args.ref_latents = reference_latents
+        dynamic_args.ref_latents = list(reference_latents)
         clip_patcher = self.forge_objects.clip.patcher
-        memory_management.unload_models_except([clip_patcher], device=clip_patcher.load_device)
-        memory_management.soft_empty_cache(force=True)
-        return self._get_learned_conditioning(prompt)
+        devices = {clip_patcher.load_device}
+        unet = self.forge_objects.unet
+        if hasattr(unet, "secondary_device"):
+            devices.update((unet.load_device, unet.secondary_device))
+        cleanup_errors = []
+        for device in devices:
+            try:
+                memory_management.unload_models_except([clip_patcher], device=device)
+            except Exception as error:
+                cleanup_errors.append(error)
+                memory_management.logger.exception("Failed to release models on %s before Krea conditioning retry", device)
+        try:
+            memory_management.soft_empty_cache(force=True)
+        except Exception as error:
+            cleanup_errors.append(error)
+            memory_management.logger.exception("Failed to clear the cache before Krea conditioning retry")
+        if cleanup_errors:
+            raise RuntimeError("Krea conditioning retry aborted because memory cleanup failed") from cleanup_errors[0]
+        try:
+            return self._get_learned_conditioning(prompt)
+        except Exception as error:
+            self.ini_latent = initial_latent
+            dynamic_args.ref_latents = list(reference_latents)
+            if memory_management.is_oom(error):
+                # No further retry is possible. Release the encoder too so a
+                # failed conditioning pass does not occupy both devices.
+                for device in devices:
+                    try:
+                        memory_management.unload_models_except([], device=device)
+                    except Exception:
+                        memory_management.logger.exception("Failed to release models on %s after Krea conditioning OOM", device)
+                try:
+                    memory_management.soft_empty_cache(force=True)
+                except Exception:
+                    memory_management.logger.exception("Failed to clear the cache after Krea conditioning OOM")
+            raise
 
     def _get_learned_conditioning(self, prompt: "SdConditioning"):
         clip_patcher = self.forge_objects.clip.patcher

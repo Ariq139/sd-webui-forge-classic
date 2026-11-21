@@ -19,13 +19,14 @@ refresh_symbol = "\U0001f504"  # 🔄
 def update_generation_info(generation_info, html_info, img_index):
     try:
         generation_info = json.loads(generation_info)
+        img_index = int(img_index)
         if img_index < 0 or img_index >= len(generation_info["infotexts"]):
-            return html_info, gr.skip()
-        return plaintext_to_html(generation_info["infotexts"][img_index]), gr.skip()
+            return html_info
+        return plaintext_to_html(generation_info["infotexts"][img_index])
     except Exception:
         pass
     # if the json parse or anything else fails, just return the old html_info
-    return html_info, gr.skip()
+    return html_info
 
 
 def plaintext_to_html(text, classname=None):
@@ -227,12 +228,20 @@ def create_output_panel(tabname, outdir, toprow=None):
 
                     res.generation_info = gr.Textbox(visible=False, elem_id=f"generation_info_{tabname}")
                     if tabname == "txt2img" or tabname == "img2img":
+                        gallery_index = gr.Number(value=0, visible=False)
                         generation_info_button = gr.Button(visible=False, elem_id=f"{tabname}_generation_info_button")
                         generation_info_button.click(
                             fn=update_generation_info,
                             _js="function(x, y, z){ return [x, y, selected_gallery_index()] }",
-                            inputs=[res.generation_info, res.infotext, res.infotext],
-                            outputs=[res.infotext, res.infotext],
+                            inputs=[res.generation_info, res.infotext, gallery_index],
+                            outputs=[res.infotext],
+                            show_progress=False,
+                        )
+                        res.gallery.select(
+                            fn=update_generation_info,
+                            _js=f"(x, y, z) => [x, y, selected_gallery_index_id('{tabname}_gallery')]",
+                            inputs=[res.generation_info, res.infotext, gallery_index],
+                            outputs=[res.infotext],
                             show_progress=False,
                         )
 

@@ -1,9 +1,25 @@
 import math
+import sys
 
 import torch
 
 from backend import args, attention, memory_management
 from backend.modules.k_prediction import k_prediction_from_diffusers_scheduler
+
+
+def _release_shards_after_oom(shard):
+    # MOSS keeps per-block reference keys and values outside the model. They
+    # must be dropped before reclaiming VRAM; the next attempt can rebuild them.
+    args.dynamic_args.moss_ref_kv = None
+    for device in shard[:2]:
+        try:
+            memory_management.free_memory(float("inf"), device)
+        except Exception:
+            memory_management.logger.exception("Failed to release models on %s after OOM", device)
+    try:
+        memory_management.soft_empty_cache(force=True)
+    except Exception:
+        memory_management.logger.exception("Failed to clear the CUDA cache after OOM")
 
 
 class KModel(torch.nn.Module):
@@ -35,27 +51,55 @@ class KModel(torch.nn.Module):
             self.predictor = k_predictor
 
     def apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
-        sigma = t
-        xc = self.predictor.calculate_input(sigma, x)
-        if c_concat is not None:
-            xc = torch.cat([xc] + [c_concat], dim=1)
+        shard = getattr(self.diffusion_model, "_anima_shard_devices", None)
+        if shard:
+            from backend.multi_gpu.patches import device_aware_options, restore_patch_devices
+            sources = transformer_options.get("_multi_gpu_patch_sources", ())
+            original_options = transformer_options
+            transformer_options = transformer_options.copy()
+            transformer_options.pop("_multi_gpu_patch_sources", None)
+            transformer_options = device_aware_options(transformer_options)
+        try:
+            sigma = t
+            xc = self.predictor.calculate_input(sigma, x)
+            if c_concat is not None:
+                xc = torch.cat([xc] + [c_concat], dim=1)
 
-        context = c_crossattn
-        dtype = self.computation_dtype
+            context = c_crossattn
+            dtype = self.computation_dtype
 
-        xc = xc.to(dtype)
-        t = self.predictor.timestep(t).float()
-        context = context.to(dtype)
-        extra_conds = {}
-        for o in kwargs:
-            extra = kwargs[o]
-            if hasattr(extra, "dtype"):
-                if extra.dtype != torch.int and extra.dtype != torch.long:
-                    extra = extra.to(dtype)
-            extra_conds[o] = extra
+            xc = xc.to(dtype)
+            t = self.predictor.timestep(t).float()
+            context = context.to(dtype)
+            extra_conds = {}
+            for o in kwargs:
+                extra = kwargs[o]
+                if hasattr(extra, "dtype"):
+                    if extra.dtype != torch.int and extra.dtype != torch.long:
+                        extra = extra.to(dtype)
+                extra_conds[o] = extra
 
-        model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
-        return self.predictor.calculate_denoised(sigma, model_output, x)
+            model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
+            return self.predictor.calculate_denoised(sigma, model_output, x)
+        finally:
+            if shard:
+                failure = sys.exc_info()[1]
+                out_of_memory = failure is not None and memory_management.is_oom(failure)
+                cleanup_device = torch.device("cpu") if out_of_memory else shard[0]
+                cleanup_oom = False
+                try:
+                    restore_patch_devices(transformer_options, cleanup_device, (original_options, *sources))
+                except Exception as cleanup_error:
+                    cleanup_oom = memory_management.is_oom(cleanup_error)
+                    if failure is None:
+                        if cleanup_oom:
+                            _release_shards_after_oom(shard)
+                        raise
+                    memory_management.logger.exception("Failed to restore multi-GPU extension callbacks after an error")
+                if out_of_memory or cleanup_oom:
+                    # A partially completed sampler cannot safely be retried,
+                    # but its resident models should not block the next job.
+                    _release_shards_after_oom(shard)
 
     def memory_required(self, input_shape: list[int]) -> float:
         """https://github.com/comfyanonymous/ComfyUI/blob/v0.3.64/comfy/model_base.py#L354"""

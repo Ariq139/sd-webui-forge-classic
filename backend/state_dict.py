@@ -221,6 +221,8 @@ def _ensure_quantization_markers(state_dict: dict[str, torch.Tensor]) -> bool:
 
 
 def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
+    from backend.quant_ops import QUANT_ALGOS
+
     _ensure_quantization_markers(state_dict)
     counts: dict[str, int] = {}
     for key, value in state_dict.items():
@@ -234,8 +236,6 @@ def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = 
             counts[quant_format] = counts.get(quant_format, 0) + 1
 
     if counts:
-        from backend.quant_ops import QUANT_ALGOS
-
         layout = QUANT_ALGOS[max(counts, key=counts.get)]["comfy_tensor_layout"]
         return {"mixed_ops": True, "TE": not is_unet, "layout": layout}
 

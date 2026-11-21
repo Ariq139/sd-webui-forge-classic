@@ -1,11 +1,13 @@
 # https://github.com/Comfy-Org/ComfyUI/blob/v0.42.0/comfy/ldm/moss_image/model.py
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 
 from backend.args import dynamic_args
 from backend.attention import attention_function
-from backend.nn.flux import EmbedND, timestep_embedding
+from backend.nn.flux import EmbedND, timestep_embedding, _shard_to
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.operations_mixed_precision import linear_input_act
 from backend.quant_ops import ck
@@ -164,8 +166,12 @@ class MOSSImage(nn.Module):
         vec = self.time_embedding(timestep_embedding(torch.zeros(1, device=x.device), 256).to(x.dtype))
         mod = self.shared_block_modulation(vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
         kv = x.new_empty((x.shape[0], len(self.layers), 2) + x.shape[1:])
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.layers):
-            x = block(x, mod, pe, transformer_options, None, None, kv[:, i])
+            if shard and i == shard[2]:
+                x, mod, pe = (_shard_to(value, shard[1]) for value in (x, mod, pe))
+            with torch.cuda.device(x.device) if shard else nullcontext():
+                x = block(x, mod, pe, transformer_options, None, None, kv[:, i])
         return kv
 
     def forward(self, x, timestep, context, transformer_options={}, **kwargs):
@@ -208,9 +214,12 @@ class MOSSImage(nn.Module):
         blocks_replace = transformer_options.get("patches_replace", {}).get("dit", {})
         transformer_options["total_blocks"] = len(self.layers)
         transformer_options["block_type"] = "single"
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.layers):
+            if shard and i == shard[2]:
+                x, mod, pe, ref, vec = (_shard_to(value, shard[1]) for value in (x, mod, pe, ref, vec))
             transformer_options["block_index"] = i
-            ref_kv_i = None if ref_kv is None else ref_kv[:, i]
+            ref_kv_i = None if ref_kv is None else ref_kv[:, i].to(x.device) if shard else ref_kv[:, i]
             if ("single_block", i) in blocks_replace:
 
                 def block_wrap(args):
@@ -218,7 +227,10 @@ class MOSSImage(nn.Module):
 
                 x = blocks_replace[("single_block", i)]({"img": x, "vec": vec, "mod": mod, "pe": pe, "ref": ref, "ref_kv": ref_kv_i, "transformer_options": transformer_options}, {"original_block": block_wrap})["img"]
             else:
-                x = block(x, mod, pe, transformer_options, ref, ref_kv_i)
+                with torch.cuda.device(x.device) if shard else nullcontext():
+                    x = block(x, mod, pe, transformer_options, ref, ref_kv_i)
 
+        if shard:
+            x = x.to(shard[0])
         out = self.final_linear_video(modulated_rms_norm(x[:, : H * W], self.final_norm_video, head_scale, head_shift))
         return out.transpose(1, 2).reshape(B, self.latent_channels, H, W)

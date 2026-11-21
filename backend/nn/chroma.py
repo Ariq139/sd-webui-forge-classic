@@ -1,6 +1,7 @@
 # https://github.com/Comfy-Org/ComfyUI/tree/v0.10.0/comfy/ldm/chroma
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 from einops import rearrange, repeat
@@ -13,6 +14,7 @@ from backend.nn.flux import (
     ModulationOut,
     SingleStreamBlock,
     timestep_embedding,
+    _shard_to,
 )
 from backend.utils import fp16_fix, pad_to_patch_size
 
@@ -179,7 +181,10 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.double_blocks)
         transformer_options["block_type"] = "double"
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.double_blocks):
+            if shard and i == shard[2]:
+                img, txt, mod_vectors, pe, attn_mask = (_shard_to(value, shard[1]) for value in (img, txt, mod_vectors, pe, attn_mask))
             transformer_options["block_index"] = i
             if i not in self.skip_mmdit:
                 double_mod = (
@@ -197,14 +202,15 @@ class IntegratedChromaTransformer2DModel(nn.Module):
                     txt = out["txt"]
                     img = out["img"]
                 else:
-                    img, txt = block(img=img, txt=txt, vec=double_mod, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                    with torch.cuda.device(img.device) if shard else nullcontext():
+                        img, txt = block(img=img, txt=txt, vec=double_mod, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
                 if control is not None:  # ControlNet
                     control_i = control.get("input")
                     if i < len(control_i):
                         add = control_i[i]
                         if add is not None:
-                            img += add
+                            img += add.to(img.device) if shard else add
 
         img = fp16_fix(img)
         img = torch.cat((txt, img), 1)
@@ -212,6 +218,8 @@ class IntegratedChromaTransformer2DModel(nn.Module):
         transformer_options["total_blocks"] = len(self.single_blocks)
         transformer_options["block_type"] = "single"
         for i, block in enumerate(self.single_blocks):
+            if shard and len(self.double_blocks) + i == shard[2]:
+                img, txt, mod_vectors, pe, attn_mask = (_shard_to(value, shard[1]) for value in (img, txt, mod_vectors, pe, attn_mask))
             transformer_options["block_index"] = i
             if i not in self.skip_dit:
                 single_mod = self.get_modulations(mod_vectors, "single", idx=i)
@@ -225,17 +233,20 @@ class IntegratedChromaTransformer2DModel(nn.Module):
                     out = blocks_replace[("single_block", i)]({"img": img, "vec": single_mod, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
                     img = out["img"]
                 else:
-                    img = block(img, vec=single_mod, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                    with torch.cuda.device(img.device) if shard else nullcontext():
+                        img = block(img, vec=single_mod, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
                 if control is not None:  # ControlNet
                     control_o = control.get("output")
                     if i < len(control_o):
                         add = control_o[i]
                         if add is not None:
-                            img[:, txt.shape[1] :, ...] += add
+                            img[:, txt.shape[1] :, ...] += add.to(img.device) if shard else add
 
         img = img[:, txt.shape[1] :, ...]
         if hasattr(self, "final_layer"):
+            if shard:
+                img, mod_vectors = img.to(shard[0]), mod_vectors.to(shard[0])
             final_mod = self.get_modulations(mod_vectors, "final")
             img = self.final_layer(img, vec=final_mod)
 

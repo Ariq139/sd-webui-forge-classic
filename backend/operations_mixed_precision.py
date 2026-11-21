@@ -62,7 +62,9 @@ def _quantized_apply(module: torch.nn.Module, fn, recurse=True):
         p: torch.Tensor = fn(param)
         try:
             module.register_parameter(key, torch.nn.Parameter(p, requires_grad=False))
-        except RuntimeError:
+        except RuntimeError as error:
+            if memory_management.is_oom(error):
+                raise
             module.register_parameter(key, torch.nn.Parameter(p.clone(), requires_grad=False))
     for key, buf in module._buffers.items():
         if buf is not None:

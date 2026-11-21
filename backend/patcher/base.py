@@ -327,25 +327,48 @@ class ModelPatcher:
                 return utils.get_attr(self.model, name)
 
     def model_patches_to(self, device):
+        moved = {}
+
+        def move(value):
+            if not hasattr(value, "to"):
+                return value
+            identity = id(value)
+            if identity not in moved:
+                result = value.to(device)
+                moved[identity] = value if result is None else result
+                moved[id(moved[identity])] = moved[identity]
+            return moved[identity]
+
         to = self.model_options["transformer_options"]
         if "patches" in to:
             patches = to["patches"]
             for name in patches:
                 patch_list = patches[name]
                 for i in range(len(patch_list)):
-                    if hasattr(patch_list[i], "to"):
-                        patch_list[i] = patch_list[i].to(device)
+                    patch_list[i] = move(patch_list[i])
         if "patches_replace" in to:
             patches = to["patches_replace"]
             for name in patches:
                 patch_list = patches[name]
                 for k in patch_list:
-                    if hasattr(patch_list[k], "to"):
-                        patch_list[k] = patch_list[k].to(device)
+                    patch_list[k] = move(patch_list[k])
         if "model_function_wrapper" in self.model_options:
-            wrap_func = self.model_options["model_function_wrapper"]
-            if hasattr(wrap_func, "to"):
-                self.model_options["model_function_wrapper"] = wrap_func.to(device)
+            self.model_options["model_function_wrapper"] = move(self.model_options["model_function_wrapper"])
+        # These hooks historically did not receive dtype conversions. They
+        # still need device moves so unloading releases their GPU state.
+        def move_modifier(value):
+            return moved.get(id(value), value) if isinstance(device, torch.dtype) else move(value)
+
+        for name in ("block_modifiers", "block_inner_modifiers"):
+            if name in to:
+                modifiers = to[name]
+                if isinstance(modifiers, tuple):
+                    to[name] = tuple(move_modifier(modifier) for modifier in modifiers)
+                else:
+                    for i, modifier in enumerate(modifiers):
+                        modifiers[i] = move_modifier(modifier)
+        if "group_norm_wrapper" in to:
+            to["group_norm_wrapper"] = move_modifier(to["group_norm_wrapper"])
 
     def model_patches_models(self):
         to = self.model_options["transformer_options"]

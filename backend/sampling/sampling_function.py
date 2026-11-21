@@ -297,6 +297,12 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
                 c["control"] = control.get_control(input_x, timestep_, control_cond, len(cond_or_uncond))
                 c["control_model"] = control
 
+            if getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None):
+                sources = [model_options.get("transformer_options", {})]
+                if patches is not None:
+                    sources.append({"patches": patches})
+                transformer_options["_multi_gpu_patch_sources"] = sources
+
             if "model_function_wrapper" in model_options:
                 output = model_options["model_function_wrapper"](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
             else:
@@ -324,6 +330,7 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 @contextlib.contextmanager
 def conditioning_batch(control, indices, batch_size):
     saved = []
+    out_of_memory = False
 
     def select(obj, key):
         value = getattr(obj, key)
@@ -355,9 +362,16 @@ def conditioning_batch(control, indices, batch_size):
             control = control.previous_controlnet
 
         yield
+    except Exception as error:
+        out_of_memory = memory_management.is_oom(error)
+        raise
     finally:
-        for obj, key, value in reversed(saved):
-            setattr(obj, key, value)
+        while saved:
+            obj, key, value = saved.pop()
+            # A batch-specific forward may have discarded the cache while
+            # recovering from OOM. Do not revive the larger previous cache.
+            setattr(obj, key, None if out_of_memory and obj is dynamic_args and key == "moss_ref_kv" else value)
+            value = None
 
 
 def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False, condition_cache=None):

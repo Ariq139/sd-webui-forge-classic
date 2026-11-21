@@ -2,6 +2,7 @@
 # Reference: https://github.com/Alpha-VLLM/Lumina-Image-2.0
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -423,9 +424,18 @@ class NextDiT(nn.Module):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t, num_tokens, transformer_options=transformer_options)
         freqs_cis = freqs_cis.to(x.device)
 
-        for layer in self.layers:
-            x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+        shard = getattr(self, "_anima_shard_devices", None)
+        for i, layer in enumerate(self.layers):
+            if shard and i == shard[2]:
+                x = x.to(shard[1])
+                mask = mask.to(shard[1]) if mask is not None else None
+                freqs_cis = freqs_cis.to(shard[1])
+                adaln_input = adaln_input.to(shard[1])
+            with torch.cuda.device(x.device) if shard else nullcontext():
+                x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
 
+        if shard:
+            x, adaln_input = x.to(shard[0]), adaln_input.to(shard[0])
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]
 

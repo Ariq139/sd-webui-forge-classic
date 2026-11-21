@@ -2,6 +2,7 @@
 # https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py
 
 from typing import Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -303,8 +304,17 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.pe_embedder(pos)
 
-        for block in self.blocks:
-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+        shard = getattr(self, "_anima_shard_devices", None)
+        for index, block in enumerate(self.blocks):
+            if shard and index == shard[2]:
+                combined = combined.to(shard[1])
+                tvec = tvec.to(shard[1])
+                freqs = freqs.to(shard[1])
+            with torch.cuda.device(combined.device) if shard else nullcontext():
+                combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+
+        if shard:
+            combined = combined.to(shard[0])
 
         out = self.last(combined[:, txtlen + reflen : txtlen + reflen + imglen], t)
         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_, w=w_, ph=patch, pw=patch, c=self.channels)

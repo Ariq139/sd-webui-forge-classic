@@ -25,6 +25,11 @@ function selected_gallery_button() {
 }
 
 function selected_gallery_index() {
+    const selectedTab = gradioApp().querySelector('#tabs [role="tab"][aria-selected="true"]');
+    const tabName = selectedTab?.getAttribute("data-tab-id");
+    if (tabName && gradioApp().getElementById(`${tabName}_gallery`)) {
+        return selected_gallery_index_id(`${tabName}_gallery`);
+    }
     return all_gallery_buttons().findIndex((elem) => elem.classList.contains("selected"));
 }
 

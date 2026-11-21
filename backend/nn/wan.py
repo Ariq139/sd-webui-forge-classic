@@ -3,6 +3,7 @@
 # Reference: https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ from einops import repeat
 from backend import args
 from backend.attention import attention_function
 from backend.memory_management import cast_to_device
-from backend.nn.flux import EmbedND
+from backend.nn.flux import EmbedND, _shard_to
 from backend.quant_ops import ck
 from backend.utils import pad_to_patch_size
 
@@ -366,7 +367,10 @@ class WanModel(nn.Module):
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.blocks)
         transformer_options["block_type"] = "double"
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.blocks):
+            if shard and i == shard[2]:
+                x, context, e0, freqs = (_shard_to(value, shard[1]) for value in (x, context, e0, freqs))
             transformer_options["block_index"] = i
             if ("double_block", i) in blocks_replace:
 
@@ -378,9 +382,12 @@ class WanModel(nn.Module):
                 out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
                 x = out["img"]
             else:
-                x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+                with torch.cuda.device(x.device) if shard else nullcontext():
+                    x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
         # head
+        if shard:
+            x = x.to(shard[0])
         x = self.head(x, e)
 
         # unpatchify

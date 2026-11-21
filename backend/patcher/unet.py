@@ -13,6 +13,26 @@ class UnetPatcher(ModelPatcher):
     @classmethod
     def from_model(cls, model, diffusers_scheduler, config, *, k_predictor=None):
         model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, config=config)
+        from backend.args import args
+        if args.multi_gpu_anima is not None:
+            if isinstance(model.diffusion_model, NunchakuModelMixin):
+                raise ValueError("Multi-GPU does not support Nunchaku models")
+            from backend.nn.anima import Anima
+            from backend.nn.krea import SingleStreamDiT
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            from backend.nn.unet import IntegratedUNet2DConditionModel
+            from backend.nn.moss_image import MOSSImage
+            from backend.nn.qwen import QwenImageTransformer2DModel
+            from backend.nn.qwen21 import QwenImage21Transformer2DModel
+            from backend.nn.wan import WanModel
+            from backend.nn.lumina import NextDiT
+            from backend.nn.ernie import ErnieImageModel
+            from backend.nn.chroma import IntegratedChromaTransformer2DModel
+            from backend.nn.pixeldit.pid import PidNet
+            if isinstance(model.diffusion_model, (Anima, SingleStreamDiT, IntegratedFluxTransformer2DModel, IntegratedUNet2DConditionModel, MOSSImage, QwenImageTransformer2DModel, QwenImage21Transformer2DModel, WanModel, NextDiT, ErnieImageModel, IntegratedChromaTransformer2DModel, PidNet)):
+                from backend.multi_gpu.patcher import ShardedModelPatcher
+                return ShardedModelPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device)
+            raise ValueError("Multi-GPU does not support this diffusion model")
         if isinstance(model.diffusion_model, NunchakuModelMixin):
             return NunchakuPatcher(model, load_device=model.diffusion_model.load_device, offload_device=model.diffusion_model.offload_device, current_device=model.diffusion_model.initial_device)
         else:

@@ -1,5 +1,7 @@
 # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/qwen_image21/model.py
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +9,7 @@ import torch.nn.functional as F
 from backend import memory_management
 from backend.args import dynamic_args
 from backend.attention import attention_function
-from backend.nn.flux import EmbedND, timestep_embedding
+from backend.nn.flux import EmbedND, timestep_embedding, _shard_to
 from backend.nn.qwen import TimestepEmbedding
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.operations_mixed_precision import linear_input_act
@@ -230,7 +232,11 @@ class QwenImage21Transformer2DModel(nn.Module):
         transformer_options["total_blocks"] = len(self.transformer_blocks)
         transformer_options["block_type"] = "single"
 
+        shard = getattr(self, "_anima_shard_devices", None)
         for i, block in enumerate(self.transformer_blocks):
+            if shard and i == shard[2]:
+                hidden_states, pe, mod = (_shard_to(value, shard[1]) for value in (hidden_states, pe, mod))
+                segments = [_shard_to(segment, shard[1]) for segment in segments]
             transformer_options["block_index"] = i
             attn_fn = block_causal_attention(segments, transformer_options)
             if ("single_block", i) in blocks_replace:
@@ -241,10 +247,13 @@ class QwenImage21Transformer2DModel(nn.Module):
                 args = {"img": hidden_states, "vec": temb, "pe": pe, "mod": mod, "attn_fn": attn_fn, "prefix_len": prefix_len, "transformer_options": transformer_options}
                 hidden_states = blocks_replace[("single_block", i)](args, {"original_block": block_wrap})["img"]
             else:
-                hidden_states = block(hidden_states, mod, pe, attn_fn, prefix_len, transformer_options)
+                with torch.cuda.device(hidden_states.device) if shard else nullcontext():
+                    hidden_states = block(hidden_states, mod, pe, attn_fn, prefix_len, transformer_options)
             for p in patches.get("single_block", []):
-                hidden_states = p({"img": hidden_states, "x": x, "block_index": i, "transformer_options": transformer_options})["img"]
+                hidden_states = p({"img": hidden_states, "x": x.to(hidden_states.device) if shard else x, "block_index": i, "transformer_options": transformer_options})["img"]
 
+        if shard:
+            hidden_states = hidden_states.to(shard[0])
         hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
         hidden_states = self.proj_out(hidden_states)
         return hidden_states.transpose(1, 2).reshape(B, self.out_channels, H, W)

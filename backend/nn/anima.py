@@ -6,6 +6,7 @@
 # References: https://github.com/nvidia-cosmos/cosmos-predict2
 
 import math
+from contextlib import nullcontext
 from typing import Callable, Final, Optional
 
 import torch
@@ -501,14 +502,31 @@ class Anima(nn.Module):
         if x_B_T_H_W_D.dtype is torch.float16:
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
-        for block in self.blocks:
-            x_B_T_H_W_D = block(
-                x_B_T_H_W_D,
-                t_embedding_B_T_D,
-                crossattn_emb,
-                **block_kwargs,
-            )
+        shard = getattr(self, "_anima_shard_devices", None)
 
+        for index, block in enumerate(self.blocks):
+            if shard and index == shard[2]:
+                secondary = shard[1]
+                x_B_T_H_W_D = x_B_T_H_W_D.to(secondary)
+                t_embedding_B_T_D = t_embedding_B_T_D.to(secondary)
+                crossattn_emb = crossattn_emb.to(secondary)
+                for name in ("rope_emb_L_1_1_D", "adaln_lora_B_T_3D", "extra_per_block_pos_emb"):
+                    value = block_kwargs[name]
+                    if value is not None:
+                        block_kwargs[name] = value.to(secondary)
+            with torch.cuda.device(x_B_T_H_W_D.device) if shard else nullcontext():
+                x_B_T_H_W_D = block(
+                    x_B_T_H_W_D,
+                    t_embedding_B_T_D,
+                    crossattn_emb,
+                    **block_kwargs,
+                )
+
+        if shard:
+            primary = shard[0]
+            x_B_T_H_W_D = x_B_T_H_W_D.to(primary)
+            t_embedding_B_T_D = t_embedding_B_T_D.to(primary)
+            adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(primary)
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(crossattn_emb.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
         return x_B_C_Tt_Hp_Wp

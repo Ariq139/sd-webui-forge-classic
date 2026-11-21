@@ -18,10 +18,13 @@ _calc_cond_uncond_batch = sampling_function.calc_cond_uncond_batch
 
 
 @wraps(_calc_cond_uncond_batch)
-def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
+def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
     if (calc_batch_function := model_options.get("sampler_calc_cond_batch_function", None)) is not None:
         return calc_batch_function(model, cond, uncond, x_in, timestep, model_options)
-    return _calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options)
+    return _calc_cond_uncond_batch(
+        model, cond, uncond, x_in, timestep, model_options,
+        condition_cache=condition_cache, materialize_uncond=materialize_uncond,
+    )
 
 
 sampling_function.calc_cond_uncond_batch = calc_cond_uncond_batch

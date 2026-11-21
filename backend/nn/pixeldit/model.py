@@ -1,6 +1,7 @@
 # https://github.com/Comfy-Org/ComfyUI/blob/v0.28.0/comfy/ldm/pixeldit/model.py
 
 from abc import abstractmethod
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -218,9 +219,15 @@ class PixDiT_T2I(nn.Module):
         s = self._pre_pixel_blocks(s, **kwargs)
         s_cond = s.view(B * L, self.hidden_size)
         x_pixels = self.pixel_embedder(x, patch_size=self.patch_size)
-        for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask=None, transformer_options=transformer_options)
+        shard = getattr(self, "_anima_shard_devices", None)
+        for i, blk in enumerate(self.pixel_blocks):
+            if shard and i == shard[2]:
+                x_pixels, s_cond = x_pixels.to(shard[1]), s_cond.to(shard[1])
+            with torch.cuda.device(x_pixels.device) if shard else nullcontext():
+                x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask=None, transformer_options=transformer_options)
 
+        if shard:
+            x_pixels = x_pixels.to(shard[0])
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels
         P2 = self.patch_size * self.patch_size

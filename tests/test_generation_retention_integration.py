@@ -14,13 +14,14 @@ class GenerationRetentionIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules_forge" / "packages"))
         with mock.patch.object(sys, "argv", ["verify"]):
-            from modules import shared_init
-            shared_init.initialize()
+            from modules import shared, shared_init
+            if shared.opts is None:
+                shared_init.initialize()
             from modules import processing, shared
         cls.processing = processing
         cls.shared = shared
 
-    def run_generation(self, retain=False, grouped=False, fail=False, interrupt=False, compatibility=False, check_lifetime=False, replace_samples=False, uneven_groups=False, fail_stage="post_sample", alias_decode=False):
+    def run_generation(self, retain=False, grouped=False, fail=False, interrupt=False, compatibility=False, check_lifetime=False, replace_samples=False, uneven_groups=False, fail_stage="post_sample", alias_decode=False, dynamic_prompts=None):
         processing, shared = self.processing, self.shared
         forge = SimpleNamespace(vae=SimpleNamespace(latent_channels=4))
         forge.shallow_copy = lambda: forge
@@ -35,6 +36,11 @@ class GenerationRetentionIntegrationTests(unittest.TestCase):
             width=16, height=16, do_not_save_samples=True, do_not_save_grid=True,
         )
         runner = mock.MagicMock()
+        if dynamic_prompts is not None:
+            def expand_prompts(processing):
+                processing.all_prompts = list(dynamic_prompts)
+                processing.all_negative_prompts = [""] * len(dynamic_prompts)
+            runner.process.side_effect = expand_prompts
         runner.alwayson_scripts = [SimpleNamespace(requires_all_latents=retain)]
         runner.selectable_scripts = []
         p.scripts_value = runner
@@ -99,7 +105,7 @@ class GenerationRetentionIntegrationTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(processing.rng, "ImageRNG"))
             stack.enter_context(mock.patch.object(processing.extra_networks, "activate"))
             stack.enter_context(mock.patch.object(processing.extra_networks, "deactivate"))
-            stack.enter_context(mock.patch.object(processing, "_extra_network_signature", side_effect=lambda prompt: prompt))
+            stack.enter_context(mock.patch.object(processing, "_extra_network_signature", side_effect=lambda prompt: prompt.split("<lora:")[-1] if dynamic_prompts is not None else prompt))
             stack.enter_context(mock.patch.object(p, "init"))
             stack.enter_context(mock.patch.object(p, "setup_conds"))
             stack.enter_context(mock.patch.object(p, "parse_extra_network_prompts"))
@@ -134,6 +140,14 @@ class GenerationRetentionIntegrationTests(unittest.TestCase):
         self.assertEqual(batches, [2, 4])
         self.assertEqual(final, [10, 11, 12, 13])
         self.assertEqual(result.infotexts, ["a seed=10", "b seed=11", "a seed=12", "b seed=13"])
+
+    def test_dynamic_prompts_follow_images_after_lora_regrouping(self):
+        from dynamicprompts.generators import RandomPromptGenerator
+
+        expanded = RandomPromptGenerator().generate("{red|blue|green}", num_images=4)
+        prompts = [f"{prompt} <lora:{'alpha' if i % 2 == 0 else 'beta'}:1>" for i, prompt in enumerate(expanded)]
+        _, result, _, _ = self.run_generation(grouped=True, dynamic_prompts=prompts)
+        self.assertEqual(result.infotexts, [f"{prompt} seed={10 + i}" for i, prompt in enumerate(prompts)])
 
     def test_callback_error_and_interruption_release_latents(self):
         self.run_generation(fail=True)

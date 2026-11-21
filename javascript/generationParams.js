@@ -39,18 +39,5 @@ let modalObserver = new MutationObserver(function (mutations) {
 
 function attachGalleryListeners(tab_name) {
     let gallery = gradioApp().querySelector("#" + tab_name + "_gallery");
-    gallery?.addEventListener("click", () =>
-        gradioApp()
-            .getElementById(tab_name + "_generation_info_button")
-            .click(),
-    );
-    gallery?.addEventListener("keydown", (e) => {
-        if (e.keyCode == 37 || e.keyCode == 39) {
-            // left or right arrow
-            gradioApp()
-                .getElementById(tab_name + "_generation_info_button")
-                .click();
-        }
-    });
     return gallery;
 }

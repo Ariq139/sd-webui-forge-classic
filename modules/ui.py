@@ -432,6 +432,7 @@ def create_ui():
                 inputs=[dummy_component],
                 outputs=[
                     output_panel.gallery,
+                    output_panel.player,
                     output_panel.generation_info,
                     output_panel.infotext,
                     output_panel.html_log,
@@ -793,6 +794,7 @@ def create_ui():
                 inputs=[dummy_component],
                 outputs=[
                     output_panel.gallery,
+                    output_panel.player,
                     output_panel.generation_info,
                     output_panel.infotext,
                     output_panel.html_log,

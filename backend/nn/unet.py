@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 
 import torch
 from einops import rearrange, repeat
@@ -42,13 +43,17 @@ def avg_pool_nd(dims, *args, **kwargs):
     raise ValueError(f"unsupported dimensions: {dims}")
 
 
-def apply_control(h, control, name):
+def apply_control(h, control, name, move_to_device=False):
     if control is not None and name in control and len(control[name]) > 0:
         ctrl = control[name].pop()
         if ctrl is not None:
+            if move_to_device:
+                ctrl = ctrl.to(h.device)
             try:
                 h += ctrl
             except:
+                if move_to_device:
+                    raise
                 print("warning control could not be applied", h.shape, ctrl.shape)
     return h
 
@@ -657,6 +662,7 @@ class IntegratedUNet2DConditionModel(nn.Module):
         transformer_options["transformer_index"] = 0
         transformer_patches = transformer_options.get("patches", {})
         block_modifiers = transformer_options.get("block_modifiers", [])
+        shard = getattr(self, "_anima_shard_devices", None)
         assert (y is not None) == (self.num_classes is not None)
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
@@ -666,11 +672,15 @@ class IntegratedUNet2DConditionModel(nn.Module):
             emb = emb + self.label_emb(y)
         h = x
         for id, module in enumerate(self.input_blocks):
+            if shard and id == shard[2]:
+                h, emb = h.to(shard[1]), emb.to(shard[1])
+                context = context.to(shard[1]) if context is not None else None
             transformer_options["block"] = ("input", id)
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "before", transformer_options)
-            h = module(h, emb, context, transformer_options)
-            h = apply_control(h, control, "input")
+            with torch.cuda.device(h.device) if shard else nullcontext():
+                h = module(h, emb, context, transformer_options)
+            h = apply_control(h, control, "input", move_to_device=bool(shard))
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "after", transformer_options)
             if "input_block_patch" in transformer_patches:
@@ -683,16 +693,25 @@ class IntegratedUNet2DConditionModel(nn.Module):
                 for p in patch:
                     h = p(h, transformer_options)
         transformer_options["block"] = ("middle", 0)
+        if shard and len(self.input_blocks) == shard[2]:
+            h, emb = h.to(shard[1]), emb.to(shard[1])
+            context = context.to(shard[1]) if context is not None else None
         for block_modifier in block_modifiers:
             h = block_modifier(h, "before", transformer_options)
-        h = self.middle_block(h, emb, context, transformer_options)
-        h = apply_control(h, control, "middle")
+        with torch.cuda.device(h.device) if shard else nullcontext():
+            h = self.middle_block(h, emb, context, transformer_options)
+        h = apply_control(h, control, "middle", move_to_device=bool(shard))
         for block_modifier in block_modifiers:
             h = block_modifier(h, "after", transformer_options)
         for id, module in enumerate(self.output_blocks):
+            if shard and len(self.input_blocks) + 1 + id == shard[2]:
+                h, emb = h.to(shard[1]), emb.to(shard[1])
+                context = context.to(shard[1]) if context is not None else None
             transformer_options["block"] = ("output", id)
             hsp = hs.pop()
-            hsp = apply_control(hsp, control, "output")
+            if shard:
+                hsp = hsp.to(h.device)
+            hsp = apply_control(hsp, control, "output", move_to_device=bool(shard))
             if "output_block_patch" in transformer_patches:
                 patch = transformer_patches["output_block_patch"]
                 for p in patch:
@@ -705,10 +724,13 @@ class IntegratedUNet2DConditionModel(nn.Module):
                 output_shape = None
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "before", transformer_options)
-            h = module(h, emb, context, transformer_options, output_shape)
+            with torch.cuda.device(h.device) if shard else nullcontext():
+                h = module(h, emb, context, transformer_options, output_shape)
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "after", transformer_options)
         transformer_options["block"] = ("last", 0)
+        if shard:
+            h = h.to(shard[0])
         for block_modifier in block_modifiers:
             h = block_modifier(h, "before", transformer_options)
         if "group_norm_wrapper" in transformer_options:

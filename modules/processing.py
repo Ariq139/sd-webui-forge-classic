@@ -811,26 +811,46 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     p._current_output_index = None
     p._extra_network_original_batch_size = p.batch_size
     p._extra_network_original_n_iter = p.n_iter
-    if p.disable_extra_networks or p.batch_size <= 1 or len(p.all_prompts or ()) <= 1:
+    if len(p.all_prompts or ()) <= 1:
+        return
+    if not p.infinite_generation and (p.disable_extra_networks or p.batch_size <= 1):
         return
 
-    signatures = [_extra_network_signature(prompt) for prompt in p.all_prompts]
-    if getattr(p, "enable_hr", False) and getattr(p, "all_hr_prompts", None):
+    signatures = [None] * len(p.all_prompts) if p.disable_extra_networks else [_extra_network_signature(prompt) for prompt in p.all_prompts]
+    if not p.disable_extra_networks and getattr(p, "enable_hr", False) and getattr(p, "all_hr_prompts", None):
         signatures = [
             (signature, _extra_network_signature(p.all_hr_prompts[index]))
             for index, signature in enumerate(signatures)
         ]
+    if p.infinite_generation:
+        # Keep consecutive selections together so no expanded prompt is lost
+        # and the image order remains the same as the original batch.
+        groups = []
+        for index, signature in enumerate(signatures):
+            if not groups or len(groups[-1]) >= p.batch_size or signature != signatures[groups[-1][-1]]:
+                groups.append([])
+            groups[-1].append(index)
+        if len(groups) == 1:
+            return
+        fields = ("all_prompts", "all_negative_prompts", "all_seeds", "all_subseeds", "all_hr_prompts", "all_hr_negative_prompts")
+        p._infinite_pending_groups = []
+        for group in groups:
+            values = {}
+            for field in fields:
+                items = getattr(p, field, None)
+                if items is not None and len(items) >= len(signatures):
+                    values[field] = [items[i] for i in group]
+            p._infinite_pending_groups.append(values)
+        logger.info("Different extra-network selections detected; infinite generation will process %s groups without dropping prompts.", len(groups))
+        _take_infinite_group(p)
+        return
+
     if len(set(signatures)) <= 1:
         return
 
     batch_plan = batch_planning.group_extra_network_batches(signatures, p.batch_size)
     if batch_plan is None:
         logger.info("Different extra-network selections are batch-aligned; keeping the requested batch size.")
-        return
-
-    if p.infinite_generation:
-        logger.info("Different extra-network selections detected; infinite generation will process one image per batch.")
-        p.batch_size = 1
         return
 
     if getattr(p, "init_images", None) is not None:
@@ -848,6 +868,13 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     )
 
 
+def _take_infinite_group(p: StableDiffusionProcessing):
+    values = p._infinite_pending_groups.pop(0)
+    for field, items in values.items():
+        setattr(p, field, items)
+    p.batch_size = len(values["all_prompts"])
+
+
 def _refresh_infinite_batch(p: StableDiffusionProcessing):
     """Refresh one prompt batch through the normal script-processing path."""
     base_prompt = getattr(p, "_infinite_prompt_template", None)
@@ -862,11 +889,12 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
         base_seeds = list(p.seed) if isinstance(p.seed, list) else [int(p.seed)]
     if not base_subseeds:
         base_subseeds = list(p.subseed) if isinstance(p.subseed, list) else [int(p.subseed)]
-    seed_is_sequence = isinstance(p.seed, list)
-    subseed_is_sequence = isinstance(p.subseed, list)
+    seed_is_sequence = getattr(p, "_infinite_seed_is_sequence", isinstance(p.seed, list))
+    subseed_is_sequence = getattr(p, "_infinite_subseed_is_sequence", isinstance(p.subseed, list))
 
     batch_size = max(1, int(getattr(p, "_infinite_batch_size", p.batch_size)))
-    offset = p.iteration * batch_size
+    p._infinite_cycle = getattr(p, "_infinite_cycle", 0) + 1
+    offset = getattr(p, "_infinite_next_seed_offset", batch_size)
     seed_offset = 0 if seed_is_sequence or p.subseed_strength != 0 else offset
     subseed_offset = 0 if subseed_is_sequence else offset
 
@@ -893,6 +921,7 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
     if p.scripts is not None:
         p.scripts.process(p)
 
+    p._infinite_next_seed_offset = offset + len(p.all_prompts or ())
     _split_batches_for_extra_networks(p)
 
     prompts = list((p.all_prompts or [base_prompt])[: p.batch_size])
@@ -1100,10 +1129,15 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
     if p.scripts is not None:
         p.scripts.process(p)
 
-    _split_batches_for_extra_networks(p)
     if p.infinite_generation:
         p._infinite_base_seeds = list(p.all_seeds)
         p._infinite_base_subseeds = list(p.all_subseeds)
+        p._infinite_pending_groups = []
+        p._infinite_cycle = 0
+        p._infinite_next_seed_offset = len(p.all_prompts)
+        p._infinite_seed_is_sequence = isinstance(seed, list)
+        p._infinite_subseed_is_sequence = isinstance(subseed, list)
+    _split_batches_for_extra_networks(p)
     batch_plan = getattr(p, "_extra_network_batch_plan", None)
     original_batch_size = getattr(p, "_extra_network_original_batch_size", p.batch_size)
     original_n_iter = getattr(p, "_extra_network_original_n_iter", p.n_iter)
@@ -1153,7 +1187,10 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sd_models.forge_model_reload()  # model can be changed for example by refiner, hiresfix
 
             if p.infinite_generation and n:
-                _refresh_infinite_batch(p)
+                if p._infinite_pending_groups:
+                    _take_infinite_group(p)
+                else:
+                    _refresh_infinite_batch(p)
 
             p.sd_model.forge_objects = p.sd_model.forge_objects_original.shallow_copy()
             if batch_plan is not None:
@@ -1399,6 +1436,12 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                         if opts.return_mask_composite:
                             output_images.append(image_mask_composite)
 
+                # Every gallery image, including returned masks, needs an infotext.
+                for _ in range(len(output_images) - output_start - 1):
+                    infotexts.append(text)
+                    if batch_plan is not None:
+                        infotext_order_records.append((original_index, len(infotext_order_records), text))
+
                 if batch_plan is not None:
                     output_order_records.append((original_index, len(output_order_records), output_start, len(output_images)))
 
@@ -1452,7 +1495,7 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
             grid = images.image_grid(output_images, original_batch_size)
 
             if opts.return_grid:
-                text = infotext(use_main_prompt=True)
+                text = infotexts[0]
                 infotexts.insert(0, text)
                 if opts.enable_pnginfo:
                     grid.info["parameters"] = text

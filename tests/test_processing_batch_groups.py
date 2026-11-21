@@ -22,8 +22,9 @@ class ProcessingBatchGroupTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modules_forge" / "packages"))
 
         with mock.patch.object(sys, "argv", ["verify"]):
-            from modules import shared_init
-            shared_init.initialize()
+            from modules import shared, shared_init
+            if shared.opts is None:
+                shared_init.initialize()
             from modules import processing
 
         cls.processing = processing
@@ -60,18 +61,75 @@ class ProcessingBatchGroupTests(unittest.TestCase):
             p.iteration = 1
             processing._refresh_infinite_batch(p)
             first = list(p.all_prompts)
+            processing._take_infinite_group(p)
+            remaining = list(p.all_prompts)
             p.iteration = 2
             processing._refresh_infinite_batch(p)
             second = list(p.all_prompts)
 
         self.assertEqual(seen, [("template {one|two}", 2, 102), ("template {one|two}", 2, 104)])
         self.assertEqual(first, ["choice-102"])
+        self.assertEqual(remaining, ["choice-103"])
         self.assertEqual(second, ["choice-104"])
+        processing._take_infinite_group(p)
+        self.assertEqual(p.all_prompts, ["choice-105"])
+        self.assertEqual(p.all_seeds, [105])
 
     def test_aligned_signatures_keep_requested_batches(self):
         signatures = ["a", "a", "b", "b"]
 
         self.assertIsNone(group_extra_network_batches(signatures, batch_size=2))
+
+    def test_infinite_groups_preserve_order_and_cap_batch_size(self):
+        p = self.processing.StableDiffusionProcessingTxt2Img(
+            prompt="test", batch_size=2, n_iter=1, seed=10, subseed=20, infinite_generation=True,
+        )
+        p.all_prompts = ["a0", "a1", "a2", "b3", "a4"]
+        p.all_negative_prompts = [f"n{i}" for i in range(5)]
+        p.all_seeds = list(range(10, 15))
+        p.all_subseeds = list(range(20, 25))
+        with mock.patch.object(self.processing, "_extra_network_signature", side_effect=lambda s: s[0]):
+            self.processing._split_batches_for_extra_networks(p)
+        groups = []
+        while True:
+            groups.append((list(p.all_prompts), list(p.all_seeds), list(p.all_negative_prompts)))
+            if not p._infinite_pending_groups:
+                break
+            self.processing._take_infinite_group(p)
+        self.assertEqual(groups, [
+            (["a0", "a1"], [10, 11], ["n0", "n1"]),
+            (["a2"], [12], ["n2"]),
+            (["b3"], [13], ["n3"]),
+            (["a4"], [14], ["n4"]),
+        ])
+
+    def test_infinite_refresh_advances_seeds_by_expanded_count(self):
+        p = self.processing.StableDiffusionProcessingTxt2Img(
+            prompt="template", negative_prompt="", batch_size=2, n_iter=1,
+            seed=100, subseed=200, infinite_generation=True,
+        )
+        p._infinite_prompt_template = p.prompt
+        p._infinite_negative_prompt_template = ""
+        p._infinite_batch_size = 2
+        p._infinite_base_seeds = [100, 101]
+        p._infinite_base_subseeds = [200, 201]
+        p._infinite_next_seed_offset = 2
+        seen = []
+        def expand(processing):
+            seen.append(processing.seed)
+            processing.all_prompts = [f"a{i}" for i in range(4)]
+            processing.all_negative_prompts = [""] * 4
+            processing.all_seeds = list(range(processing.seed, processing.seed + 4))
+            processing.all_subseeds = list(range(processing.subseed, processing.subseed + 4))
+        p.scripts_value = mock.MagicMock()
+        p.scripts.process.side_effect = expand
+        with mock.patch.object(self.processing, "_extra_network_signature", return_value="a"):
+            self.processing._refresh_infinite_batch(p)
+            self.assertEqual(p.all_seeds, [102, 103])
+            self.processing._take_infinite_group(p)
+            self.assertEqual(p.all_seeds, [104, 105])
+            self.processing._refresh_infinite_batch(p)
+        self.assertEqual(seen, [102, 106])
 
     def test_mixed_signatures_are_grouped_in_first_seen_order(self):
         signatures = ["a", "b", "a", "b", "a"]

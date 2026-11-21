@@ -1,6 +1,7 @@
 # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/ernie/model.py
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -272,9 +273,17 @@ class ErnieImageModel(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [t.unsqueeze(1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)]
 
         temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, rotary_pos_emb, temb)
+        shard = getattr(self, "_anima_shard_devices", None)
+        for i, layer in enumerate(self.layers):
+            if shard and i == shard[2]:
+                hidden_states = hidden_states.to(shard[1])
+                rotary_pos_emb = rotary_pos_emb.to(shard[1])
+                temb = [value.to(shard[1]) for value in temb]
+            with torch.cuda.device(hidden_states.device) if shard else nullcontext():
+                hidden_states = layer(hidden_states, rotary_pos_emb, temb)
 
+        if shard:
+            hidden_states = hidden_states.to(shard[0])
         hidden_states = self.final_norm(hidden_states, c).type_as(hidden_states)
 
         patches = self.final_linear(hidden_states)[:, :N_img, :]

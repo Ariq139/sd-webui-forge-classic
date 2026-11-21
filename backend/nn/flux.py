@@ -3,6 +3,7 @@
 
 import math
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 from einops import rearrange, repeat
@@ -139,6 +140,16 @@ class ModulationOut:
     shift: torch.Tensor
     scale: torch.Tensor
     gate: torch.Tensor
+
+
+def _shard_to(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, ModulationOut):
+        return ModulationOut(_shard_to(value.shift, device), _shard_to(value.scale, device), _shard_to(value.gate, device))
+    if isinstance(value, tuple):
+        return tuple(_shard_to(item, device) for item in value)
+    return value
 
 
 class Modulation(nn.Module):
@@ -460,6 +471,7 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         patches = transformer_options.get("patches", {})
         patches_replace = transformer_options.get("patches_replace", {})
+        shard = getattr(self, "_anima_shard_devices", None)
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
@@ -501,6 +513,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         transformer_options["total_blocks"] = len(self.double_blocks)
         transformer_options["block_type"] = "double"
         for i, block in enumerate(self.double_blocks):
+            if shard and i == shard[2]:
+                img, txt, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, txt, vec, pe, attn_mask))
             transformer_options["block_index"] = i
             if ("double_block", i) in blocks_replace:
 
@@ -513,24 +527,29 @@ class IntegratedFluxTransformer2DModel(nn.Module):
                 txt = out["txt"]
                 img = out["img"]
             else:
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                with torch.cuda.device(img.device) if shard else nullcontext():
+                    img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
             if control is not None:  # Controlnet
                 control_i = control.get("input")
                 if i < len(control_i):
                     add = control_i[i]
                     if add is not None:
-                        img[:, : add.shape[1]] += add
+                        img[:, : add.shape[1]] += add.to(img.device) if shard else add
 
         img = fp16_fix(img)
         img = torch.cat((txt, img), 1)
 
         if self.global_modulation:
             vec, _ = self.single_stream_modulation(vec_orig)
+            if shard:
+                vec = _shard_to(vec, img.device)
 
         transformer_options["total_blocks"] = len(self.single_blocks)
         transformer_options["block_type"] = "single"
         for i, block in enumerate(self.single_blocks):
+            if shard and len(self.double_blocks) + i == shard[2]:
+                img, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, vec, pe, attn_mask))
             transformer_options["block_index"] = i
             if ("single_block", i) in blocks_replace:
 
@@ -542,16 +561,20 @@ class IntegratedFluxTransformer2DModel(nn.Module):
                 out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
                 img = out["img"]
             else:
-                img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                with torch.cuda.device(img.device) if shard else nullcontext():
+                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
             if control is not None:  # Controlnet
                 control_o = control.get("output")
                 if i < len(control_o):
                     add = control_o[i]
                     if add is not None:
-                        img[:, txt.shape[1] : txt.shape[1] + add.shape[1], ...] += add
+                        img[:, txt.shape[1] : txt.shape[1] + add.shape[1], ...] += add.to(img.device) if shard else add
 
         img = img[:, txt.shape[1] :, ...]
+
+        if shard:
+            img = img.to(shard[0])
 
         return self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
 

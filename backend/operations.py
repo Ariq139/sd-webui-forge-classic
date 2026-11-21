@@ -697,6 +697,8 @@ class ForgeOperationsFP8(ForgeOperations):
                 if (out := fp8_linear(self, x)) is not None:
                     return out
             except Exception as e:
+                if memory_management.is_oom(e):
+                    raise
                 memory_management.logger.error(f"Error during fp8_fast: {e}")
 
             return super().forward(x)
@@ -783,6 +785,8 @@ def using_forge_operations(
     manual_cast_enabled: bool = False,
     sd_dtype: torch.dtype = None,
     extra_dtype: str | dict = None,
+    quant_compute_dtype: torch.dtype = None,
+    quant_devices: tuple = (),
 ):
 
     if extra_dtype is None and dtype == sd_dtype and memory_management.is_device_cpu(device):
@@ -796,8 +800,10 @@ def using_forge_operations(
         # https://github.com/Comfy-Org/ComfyUI/blob/v0.16.4/comfy/ops.py#L950
 
         _device = memory_management.get_torch_device()
-        _dtype = torch.bfloat16 if memory_management.should_use_bf16(_device) else torch.float32
+        _dtype = quant_compute_dtype or (torch.bfloat16 if memory_management.should_use_bf16(_device) else torch.float32)
         disabled = _get_disabled_quants(_device)
+        for quant_device in quant_devices:
+            disabled.update(_get_disabled_quants(quant_device))
 
         _full: bool = extra_dtype.pop("TE", False)  # https://github.com/Comfy-Org/ComfyUI/blob/v0.16.4/comfy/sd1_clip.py#L114
         operations = mixed_precision_ops(quant_config=extra_dtype, compute_dtype=_dtype, full_precision_mm=_full, disabled=disabled)
@@ -808,7 +814,7 @@ def using_forge_operations(
         elif extra_dtype in ["vae"] and args.tiled_conv2d:
             memory_management.logger.info(f"Using TiledOperations ({args.tiled_conv2d}) for VAE")
             operations = TiledOperations
-        elif dtype is torch.float8_e4m3fn and args.fast_fp8 and memory_management.supports_fp8_compute(memory_management.get_torch_device()):
+        elif dtype is torch.float8_e4m3fn and args.fast_fp8 and memory_management.supports_fp8_compute(memory_management.get_torch_device()) and all(memory_management.supports_fp8_compute(device) for device in quant_devices):
             operations = ForgeOperationsFP8
         else:
             operations = ForgeOperations
