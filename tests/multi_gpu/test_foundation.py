@@ -17,6 +17,12 @@ class MultiGpuFoundationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No contiguous split"):
             contiguous_split([4, 4], Budget(5, 2), Budget(6, 1))
 
+    def test_primary_preference_respects_both_memory_budgets(self):
+        self.assertEqual(contiguous_split([2, 2, 2, 2], Budget(7, 0), Budget(7, 0), policy="prefer_primary"), 3)
+        self.assertEqual(contiguous_split([2, 2, 2, 2], Budget(5, 0), Budget(7, 0), policy="prefer_primary"), 2)
+        with self.assertRaisesRegex(ValueError, "Unknown multi-GPU split policy"):
+            contiguous_split([2, 2], Budget(10, 0), Budget(10, 0), policy="unknown")
+
     def test_residency_detects_missing_and_wrong_device(self):
         model = torch.nn.Linear(2, 2)
         Residency({"weight": "cpu", "bias": "cpu"}).validate(model)

@@ -1,5 +1,6 @@
 import inspect
 import re
+import sys
 from collections import namedtuple
 from typing import TYPE_CHECKING
 
@@ -7,7 +8,7 @@ if TYPE_CHECKING:
     from backend.diffusion_engine.base import ForgeDiffusionEngine
     from modules.sd_samplers_cfg_denoiser import CFGDenoiser
 
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import k_diffusion.sampling
 import numpy as np
@@ -31,6 +32,32 @@ from modules.shared import opts, state
 from modules_forge import main_entry
 
 SamplerDataTuple = namedtuple("SamplerData", ["name", "constructor", "aliases", "options"])
+
+
+def cleanup_replica_on_error(function):
+    """Release prepared CFG replicas if sampler setup or execution fails."""
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        def current_unet():
+            inner = getattr(getattr(self, "model_wrap", None), "inner_model", None)
+            return getattr(getattr(inner, "forge_objects", None), "unet", None)
+
+        original = current_unet()
+        try:
+            return function(self, *args, **kwargs)
+        except BaseException:
+            from backend import memory_management
+            from backend.sampling.sampling_function import _release_parallel_cfg
+
+            current = current_unet()
+            for unet in (original, current if current is not original else None):
+                if unet is not None:
+                    try:
+                        _release_parallel_cfg(unet)
+                    except Exception:
+                        memory_management.logger.exception("Failed to release a CFG replica after sampler error")
+            raise
+    return wrapped
 
 
 class SamplerData(SamplerDataTuple):
@@ -298,6 +325,10 @@ def apply_refiner(cfg_denoiser: "CFGDenoiser", x: torch.Tensor, sigma: torch.Ten
     if opts.refiner_fast_sd:
         sd_model: "ForgeDiffusionEngine" = shared.sd_model
 
+        from backend.sampling.sampling_function import _invalidate_parallel_cfg_cache, _release_parallel_cfg
+        _release_parallel_cfg(sd_model.forge_objects.unet)
+        _invalidate_parallel_cfg_cache(sd_model.forge_objects.unet.model)
+
         import huggingface_guess
 
         from backend.loader import preprocess_state_dict
@@ -350,7 +381,7 @@ def apply_refiner(cfg_denoiser: "CFGDenoiser", x: torch.Tensor, sigma: torch.Ten
             extra_networks.activate(cfg_denoiser.p, cfg_denoiser.p.extra_network_data)
 
         # 3. reload the LoRA
-        sampling_prepare(shared.sd_model.forge_objects.unet, x=x)
+        sampling_prepare(shared.sd_model.forge_objects.unet, x=x, cfg_scale=cfg_denoiser.p.cfg_scale)
 
         # 4. reset the current_lora_hash again for the non-refiner pass
         sd_model.current_lora_hash = str([])
@@ -382,7 +413,7 @@ def apply_refiner(cfg_denoiser: "CFGDenoiser", x: torch.Tensor, sigma: torch.Ten
     cfg_denoiser.p.setup_conds()
     cfg_denoiser.update_inner_model()
 
-    sampling_prepare(shared.sd_model.forge_objects.unet, x=x)
+    sampling_prepare(shared.sd_model.forge_objects.unet, x=x, cfg_scale=cfg_denoiser.p.cfg_scale)
     return True
 
 
@@ -463,6 +494,14 @@ class Sampler:
             return state.current_latent
         finally:
             self.model_wrap_cfg.clear_conditioning_cache()
+            # A sampler can be interrupted between model calls, before the
+            # ordinary sampling_cleanup path is reached.
+            inner = getattr(getattr(self, "model_wrap", None), "inner_model", None)
+            forge = getattr(inner, "forge_objects", None)
+            unet = getattr(forge, "unet", None)
+            if unet is not None:
+                from backend.sampling.sampling_function import _release_parallel_cfg
+                _release_parallel_cfg(unet, preserve_cpu=sys.exc_info()[0] is None)
 
     def number_of_needed_noises(self, p):
         return p.steps

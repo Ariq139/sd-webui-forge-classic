@@ -244,7 +244,7 @@ class QwenImage21Transformer2DModel(nn.Module):
                 def block_wrap(args):
                     return {"img": block(args["img"], mod, args["pe"], attn_fn, prefix_len, args["transformer_options"])}
 
-                args = {"img": hidden_states, "vec": temb, "pe": pe, "mod": mod, "attn_fn": attn_fn, "prefix_len": prefix_len, "transformer_options": transformer_options}
+                args = {"img": hidden_states, "vec": temb.to(hidden_states.device) if shard else temb, "pe": pe, "mod": mod, "attn_fn": attn_fn, "prefix_len": prefix_len, "transformer_options": transformer_options}
                 hidden_states = blocks_replace[("single_block", i)](args, {"original_block": block_wrap})["img"]
             else:
                 with torch.cuda.device(hidden_states.device) if shard else nullcontext():

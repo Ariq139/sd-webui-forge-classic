@@ -689,15 +689,20 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if guess.nunchaku and backend.args.args.multi_gpu_anima is not None:
                 raise ValueError("Multi-GPU does not support Nunchaku models")
             sharded_model = cls_name in ("CosmosTransformer3DModel", "Krea2Transformer2DModel", "FluxTransformer2DModel", "Flux2Transformer2DModel", "UNet2DConditionModel", "MOSSImageTransformer", "QwenImageTransformer2DModel", "QwenImage21Transformer2DModel", "WanTransformer3DModel", "Lumina2Transformer2DModel", "ZImageTransformer2DModel", "ErnieImageTransformer2DModel", "ChromaTransformer2DModel", "PiDTransformer2DModel") and backend.args.args.multi_gpu_anima is not None
-
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
-            sharded_fp32 = sharded_model and (backend.args.args.force_fp32 or backend.args.args.fp32_unet or override_dtype == torch.float32 or torch.float16 not in guess.supported_inference_dtypes)
+            cfg_device = backend.args.args.parallel_cfg
+            parallel_model = (not guess.nunchaku and cfg_device is not None and 0 <= cfg_device < torch.cuda.device_count()
+                              and torch.device("cuda", cfg_device) != load_device and not backend.args.args.bf16_unet
+                              and override_dtype != torch.bfloat16 and backend.args.args.force_fp16)
+            multi_device_model = sharded_model or parallel_model
+
+            sharded_fp32 = multi_device_model and (backend.args.args.force_fp32 or backend.args.args.fp32_unet or override_dtype == torch.float32 or torch.float16 not in guess.supported_inference_dtypes)
 
             if guess.nunchaku:
                 storage_dtype = torch.bfloat16
                 logger.info(f"Using Nunchaku Model Data Type: {storage_dtype}")
             elif quant_config is not None:
-                storage_dtype = (torch.float32 if sharded_fp32 else torch.float16) if sharded_model else torch.bfloat16
+                storage_dtype = (torch.float32 if sharded_fp32 else torch.float16) if multi_device_model else torch.bfloat16
                 logger.info(f"Using {quant_config.pop('layout')} for Model")
             elif state_dict_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, "gguf"):
                 storage_dtype = state_dict_dtype
@@ -719,7 +724,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 computation_dtype = storage_dtype
             else:
                 computation_dtype = memory_management.inference_cast(weight_dtype=storage_dtype, inference_device=load_device, supported_dtypes=guess.supported_inference_dtypes)
-            if sharded_model:
+            if multi_device_model:
                 from backend.multi_gpu.precision import sharded_compute_dtype
                 computation_dtype = sharded_compute_dtype(torch.float32 if sharded_fp32 else computation_dtype, guess.supported_inference_dtypes)
 
@@ -739,10 +744,11 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 to_args = dict(device=initial_device, dtype=storage_dtype)
 
                 with no_init_weights():
-                    quant_devices = (torch.device("cuda", backend.args.args.multi_gpu_anima),) if sharded_model else ()
+                    second_index = backend.args.args.multi_gpu_anima if sharded_model else cfg_device
+                    quant_devices = (torch.device("cuda", second_index),) if multi_device_model else ()
                     with using_forge_operations(
                         **to_args, manual_cast_enabled=need_manual_cast, sd_dtype=state_dict_dtype,
-                        extra_dtype=quant_config, quant_compute_dtype=computation_dtype if sharded_model else None,
+                        extra_dtype=quant_config, quant_compute_dtype=computation_dtype if multi_device_model else None,
                         quant_devices=quant_devices,
                     ):
                         model = model_loader(unet_config)

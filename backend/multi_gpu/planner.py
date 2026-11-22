@@ -21,7 +21,7 @@ class Budget:
         return max(0, self.free_bytes - self.reserve_bytes)
 
 
-def contiguous_split(block_sizes, first_budget, second_budget, *, first_fixed=0, second_fixed=0):
+def contiguous_split(block_sizes, first_budget, second_budget, *, first_fixed=0, second_fixed=0, policy="balanced_memory"):
     """Return the split index with the smallest maximum budget utilization.
 
     Fixed allocations and reserves must include all non-block weights and
@@ -29,6 +29,8 @@ def contiguous_split(block_sizes, first_budget, second_budget, *, first_fixed=0,
     values or guarantee that a generation fits.
     """
     sizes = tuple(block_sizes)
+    if policy not in ("balanced_memory", "prefer_primary"):
+        raise ValueError(f"Unknown multi-GPU split policy: {policy}")
     if len(sizes) < 2 or any(size < 0 for size in sizes) or min(first_fixed, second_fixed) < 0:
         raise ValueError("At least two non-negative blocks and non-negative fixed costs are required")
     a, b = first_budget.available, second_budget.available
@@ -43,4 +45,6 @@ def contiguous_split(block_sizes, first_budget, second_budget, *, first_fixed=0,
             candidates.append((utilization, index))
     if not candidates:
         raise InsufficientDeviceMemory("No contiguous split fits both device budgets")
+    if policy == "prefer_primary":
+        return max(index for _, index in candidates)
     return min(candidates)[1]

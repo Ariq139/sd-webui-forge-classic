@@ -5,6 +5,7 @@
 import collections
 import contextlib
 import math
+import weakref
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,6 +23,42 @@ from backend.sampling.condition import (
     repeat_to_batch_size,
 )
 from modules import shared
+
+
+_parallel_cfg_cache = None
+
+
+def _discard_parallel_cfg_cache():
+    global _parallel_cfg_cache
+    cached = _parallel_cfg_cache
+    if cached is None:
+        return True
+    replica = cached[1]
+    for loaded in list(memory_management.current_loaded_models):
+        if loaded.model is replica:
+            try:
+                loaded.model_unload()
+            except Exception:
+                memory_management.logger.exception("Failed to release the cached parallel CFG replica")
+                return False
+            memory_management.current_loaded_models.remove(loaded)
+    _parallel_cfg_cache = None
+    return True
+
+
+def _clear_parallel_cfg_cache(reference):
+    if _parallel_cfg_cache is not None and _parallel_cfg_cache[0] is reference:
+        _discard_parallel_cfg_cache()
+
+
+def _invalidate_parallel_cfg_cache(model):
+    if _parallel_cfg_cache is not None and _parallel_cfg_cache[0]() is model:
+        _discard_parallel_cfg_cache()
+
+
+def _parallel_cfg_patcher_eligible(unet):
+    return not (unet.object_patches or unet.controlnet_linked_list is not None
+                or unet.extra_model_patchers_during_sampling or unet.extra_concat_condition is not None)
 
 
 def condition_cache_allowed(model_options):
@@ -374,7 +411,7 @@ def conditioning_batch(control, indices, batch_size):
             value = None
 
 
-def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False, condition_cache=None):
+def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False, condition_cache=None, parallel_cfg=None):
     if any("batch_indices" in item for item in cond):
         edit_strength = x.new_zeros(x.shape[0])
         for item in cond:
@@ -401,6 +438,8 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     )
     if use_context:
         cond_pred, uncond_pred = dynamic_args.context_handler.execute(calc_cond_uncond_batch, model, [cond, uncond_], x, timestep, model_options)
+    elif parallel_cfg is not None and parallel_cfg.primary is model and parallel_cfg.eligible(cond, uncond_, model_options, x):
+        cond_pred, uncond_pred = parallel_cfg.predict(cond, uncond_, x, timestep, model_options)
     else:
         cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options, condition_cache, materialize_uncond=return_full or not direct_cond)
 
@@ -461,36 +500,172 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     for modifier in model_options.get("conditioning_modifiers", []):
         model, x, timestep, uncond, cond, cond_scale, model_options, seed = modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
 
-    return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache)
+    parallel_cfg = getattr(unet_patcher, "_experimental_parallel_cfg", None)
+    if parallel_cfg is not None:
+        replica = getattr(unet_patcher, "_experimental_cfg_replica", None)
+        if (replica is None or replica.patches_uuid != unet_patcher.patches_uuid
+                or parallel_cfg.primary is not model or math.isclose(cond_scale, 1.0)
+                or not _parallel_cfg_patcher_eligible(unet_patcher)
+                or not parallel_cfg.eligible(cond, uncond, model_options, x)):
+            _release_parallel_cfg(unet_patcher)
+            parallel_cfg = None
+    if parallel_cfg is None and not math.isclose(cond_scale, 1.0):
+        parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x)
+    try:
+        return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
+    except BaseException as error:
+        _release_parallel_cfg(unet_patcher)
+        if parallel_cfg is not None and isinstance(error, Exception) and memory_management.is_oom(error):
+            try:
+                memory_management.free_memory(float("inf"), unet_patcher.load_device)
+            except Exception:
+                memory_management.logger.exception("Failed to release the primary model after parallel CFG OOM")
+        raise
 
 
-def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor):
-    shape = list(x.shape)
-    mem_shape = [(2 if shared.batch_cond_uncond else 1) * shape[0]] + shape[1:]
+def _release_parallel_cfg(unet, preserve_cpu=False):
+    global _parallel_cfg_cache
+    adapter = getattr(unet, "_experimental_parallel_cfg", None)
+    if adapter is not None:
+        adapter.close()
+        unet._experimental_parallel_cfg = None
+    replica = getattr(unet, "_experimental_cfg_replica", None)
+    if replica is None:
+        return
+    if (preserve_cpu and adapter is not None and args.parallel_cfg_keep_resident
+            and replica.patches_uuid == unet.patches_uuid
+            and any(loaded.model is replica for loaded in memory_management.current_loaded_models)
+            and _discard_parallel_cfg_cache()):
+        unet._experimental_cfg_replica = None
+        unet._experimental_cfg_needs_rollback = False
+        _parallel_cfg_cache = (weakref.ref(unet.model, _clear_parallel_cfg_cache), replica)
+        return
+    tracked = False
+    for loaded in list(memory_management.current_loaded_models):
+        if loaded.model is replica:
+            tracked = True
+            try:
+                loaded.model_unload()
+            except Exception:
+                memory_management.logger.exception("Failed to unload the parallel CFG replica")
+                return
+            memory_management.current_loaded_models.remove(loaded)
+    if not tracked and (getattr(unet, "_experimental_cfg_loading", False) or getattr(unet, "_experimental_cfg_needs_rollback", False)):
+        try:
+            replica.detach()
+        except Exception:
+            unet._experimental_cfg_needs_rollback = True
+            memory_management.logger.exception("Failed to roll back the parallel CFG replica")
+            return
+    unet._experimental_cfg_needs_rollback = False
+    unet._experimental_cfg_replica = None
+    if preserve_cpu and adapter is not None and replica.patches_uuid == unet.patches_uuid and _discard_parallel_cfg_cache():
+        _parallel_cfg_cache = (weakref.ref(unet.model, _clear_parallel_cfg_cache), replica)
 
-    unet_inference_memory = unet.memory_required(mem_shape)
-    additional_inference_memory = unet.extra_preserved_memory_during_sampling
-    additional_model_patchers = unet.extra_model_patchers_during_sampling
 
-    if unet.controlnet_linked_list is not None:
-        additional_inference_memory += unet.controlnet_linked_list.inference_memory_requirements(unet.model_dtype())
-        additional_model_patchers += unet.controlnet_linked_list.get_models()
+def _load_parallel_cfg(unet, cond, uncond, model_options, x):
+    from backend.multi_gpu.parallel import ParallelCFG
 
-    if unet.has_online_lora():
-        lora_memory = utils.nested_compute_size(unet.weight_wrapper_patches, element_size=utils.dtype_to_element_size(unet.model.computation_dtype))
-        additional_inference_memory += lora_memory
+    replica = getattr(unet, "_experimental_cfg_replica", None)
+    if replica is None or getattr(unet, "_experimental_cfg_needs_rollback", False) or not ParallelCFG.eligible(cond, uncond, model_options, x):
+        return None
+    if (replica.patches_uuid != unet.patches_uuid or not _parallel_cfg_patcher_eligible(unet)
+            or unet.model.model_lowvram or unet.loaded_size() < unet.model_size()):
+        _release_parallel_cfg(unet)
+        return None
+    try:
+        resident = replica.loaded_size() if getattr(replica, "current_device", None) == replica.load_device else 0
+        required = max(0, replica.model_size() - resident) + memory_management.minimum_inference_memory() + unet.memory_required(list(x.shape))
+        if memory_management.get_free_memory(replica.load_device) < required:
+            _release_parallel_cfg(unet)
+            return None
+        unet._experimental_cfg_loading = True
+        memory_management.load_models_gpu([unet, replica], memory_required=unet.memory_required(list(x.shape)), force_full_load=True)
+        unet._experimental_cfg_loading = False
+        if replica.model.model_lowvram or replica.loaded_size() < replica.model_size():
+            _release_parallel_cfg(unet)
+            return None
+        adapter = ParallelCFG(unet.model, replica.model, (unet.load_device, replica.load_device))
+        unet._experimental_parallel_cfg = adapter
+        memory_management.logger.info("Parallel CFG replicas ready on %s and %s", unet.load_device, replica.load_device)
+        return adapter
+    except BaseException as error:
+        _release_parallel_cfg(unet)
+        if isinstance(error, Exception) and memory_management.is_oom(error):
+            memory_management.logger.warning("Parallel CFG replica could not fit; using the normal sampler")
+            return None
+        raise
+    finally:
+        unet._experimental_cfg_loading = False
 
-    memory_management.load_models_gpu(models=[unet] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
 
-    real_model = unet.model
+def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None):
+    global _parallel_cfg_cache
+    _release_parallel_cfg(unet)
+    secondary_index = args.parallel_cfg
+    if getattr(unet, "_experimental_cfg_replica", None) is not None:
+        memory_management.logger.warning("Parallel CFG is disabled until the previous replica can be released")
+        secondary_index = None
+    if secondary_index is None or (cfg_scale is not None and math.isclose(cfg_scale, 1.0)):
+        _discard_parallel_cfg_cache()
+    if secondary_index is not None and (cfg_scale is None or not math.isclose(cfg_scale, 1.0)):
+        from backend.multi_gpu.replicas import UnsupportedReplica, clone_unet_patcher
+        try:
+            if secondary_index < 0:
+                raise UnsupportedReplica("A non-negative CUDA device index is required")
+            secondary = torch.device("cuda", secondary_index)
+            if unet.load_device.type != "cuda" or secondary == unet.load_device or secondary.index >= torch.cuda.device_count():
+                raise UnsupportedReplica("A distinct available secondary CUDA device is required")
+            if not _parallel_cfg_patcher_eligible(unet):
+                raise UnsupportedReplica("Control networks and object patches are unsupported")
+            cached = _parallel_cfg_cache
+            reusable = cached and cached[0]() is unet.model and cached[1].patches_uuid == unet.patches_uuid and cached[1].load_device == secondary
+            if cached and not reusable:
+                if not _discard_parallel_cfg_cache():
+                    raise UnsupportedReplica("The previous replica could not be released")
+                cached = None
+            resident = cached[1].loaded_size() if reusable and cached[1].current_device == secondary else 0
+            if memory_management.get_free_memory(secondary) < max(0, unet.model_size() - resident) + memory_management.minimum_inference_memory():
+                _discard_parallel_cfg_cache()
+                raise UnsupportedReplica("Not enough free memory for a secondary replica")
+            if reusable:
+                _parallel_cfg_cache = None
+                unet._experimental_cfg_replica = cached[1]
+                memory_management.logger.info("Reusing the cached parallel CFG replica")
+            else:
+                unet._experimental_cfg_replica = clone_unet_patcher(unet, secondary)
+        except UnsupportedReplica as error:
+            memory_management.logger.info("Parallel CFG unavailable: %s", error)
+    try:
+        shape = list(x.shape)
+        mem_shape = [(2 if shared.batch_cond_uncond else 1) * shape[0]] + shape[1:]
 
-    percent_to_timestep_function = lambda p: real_model.predictor.percent_to_sigma(p)
+        unet_inference_memory = unet.memory_required(mem_shape)
+        additional_inference_memory = unet.extra_preserved_memory_during_sampling
+        additional_model_patchers = unet.extra_model_patchers_during_sampling
 
-    for cnet in unet.list_controlnets():
-        cnet.pre_run(real_model, percent_to_timestep_function)
+        if unet.controlnet_linked_list is not None:
+            additional_inference_memory += unet.controlnet_linked_list.inference_memory_requirements(unet.model_dtype())
+            additional_model_patchers += unet.controlnet_linked_list.get_models()
+
+        if unet.has_online_lora():
+            lora_memory = utils.nested_compute_size(unet.weight_wrapper_patches, element_size=utils.dtype_to_element_size(unet.model.computation_dtype))
+            additional_inference_memory += lora_memory
+
+        memory_management.load_models_gpu(models=[unet] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
+
+        real_model = unet.model
+        percent_to_timestep_function = lambda p: real_model.predictor.percent_to_sigma(p)
+
+        for cnet in unet.list_controlnets():
+            cnet.pre_run(real_model, percent_to_timestep_function)
+    except BaseException:
+        _release_parallel_cfg(unet)
+        raise
 
 
 def sampling_cleanup(unet: "UnetPatcher"):
+    _release_parallel_cfg(unet, preserve_cpu=True)
     for cnet in unet.list_controlnets():
         cnet.cleanup()
 

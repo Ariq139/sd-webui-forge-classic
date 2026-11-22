@@ -26,6 +26,7 @@ class DevicePatch:
         self.original = callback
         self.callback = callback
         self.device = None
+        self.move_incomplete = False
 
     def _move(self, device):
         if hasattr(self.callback, "to"):
@@ -38,18 +39,21 @@ class DevicePatch:
     def __call__(self, *args, **kwargs):
         device = _tensor_device(args) or _tensor_device(kwargs)
         with torch.cuda.device(device) if device is not None and device.type == "cuda" else nullcontext():
-            if device is not None and device != self.device:
+            if device is not None and (self.move_incomplete or device != self.device):
+                self.move_incomplete = True
                 self._move(device)
                 self.device = device
+                self.move_incomplete = False
             return self.callback(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self.callback, name)
 
     def restore(self, device):
-        if self.device is not None and self.device != device and hasattr(self.callback, "to"):
+        if self.move_incomplete or (self.device is not None and self.device != device):
             with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
                 self._move(device)
+            self.move_incomplete = False
         self.device = device
 
 

@@ -27,6 +27,23 @@ class CopyingCallback:
 
 
 class CallbackMovementTests(unittest.TestCase):
+    def test_first_move_oom_still_offloads_partially_moved_callback(self):
+        class PartialMove:
+            def to(self, device):
+                self.device = device
+                if device.type == "meta":
+                    raise torch.OutOfMemoryError("partial move")
+
+            def __call__(self, value):
+                return value
+
+        original = PartialMove()
+        options = device_aware_options({"patches": {"test": [original]}})
+        with self.assertRaises(torch.OutOfMemoryError):
+            options["patches"]["test"][0](torch.empty(1, device="meta"))
+        restore_patch_devices(options, torch.device("cpu"))
+        self.assertEqual(original.device, torch.device("cpu"))
+
     def test_shared_copying_callback_stays_shared_during_model_moves(self):
         original = CopyingCallback()
         options = {"transformer_options": {"patches": {"one": [original]}, "patches_replace": {"dit": {("single_block", 0): original}}}, "model_function_wrapper": original}

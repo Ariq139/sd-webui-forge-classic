@@ -12,6 +12,9 @@ parser.add_argument("--disable-gpu-warning", action="store_true", help="Disable 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')
 parser.add_argument("--multi-gpu", "--multi-gpu-anima", dest="multi_gpu_anima", type=int, default=None, metavar="CUDA_ID", help="Experimentally shard supported denoisers onto this second CUDA device")
+parser.add_argument("--multi-gpu-split", choices=("balanced_memory", "prefer_primary"), default="balanced_memory", help="Choose a memory-balanced or primary-biased multi-GPU split")
+parser.add_argument("--parallel-cfg", type=int, default=None, metavar="CUDA_ID", help="Experimentally evaluate CFG branches on independent GPU replicas")
+parser.add_argument("--parallel-cfg-keep-resident", action="store_true", help="Keep an idle parallel CFG replica on its GPU when possible; it remains eligible for memory eviction")
 
 fp_group = parser.add_mutually_exclusive_group()
 fp_group.add_argument("--force-fp32", action="store_true", help="Force fp32")

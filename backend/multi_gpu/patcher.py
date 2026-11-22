@@ -106,7 +106,7 @@ class ShardedModelPatcher(UnetPatcher):
         secondary_free = mm.get_free_memory(self.secondary_device)
         patch_reserve = max((low_vram_patch_estimate_vram(self.model, key) for key in self.patches), default=0)
         scratch = max(runtime_reserve, patch_reserve)
-        split = contiguous_split(sizes, Budget(primary_free, int(reserve) + scratch), Budget(secondary_free, int(reserve) + scratch), first_fixed=fixed)
+        split = contiguous_split(sizes, Budget(primary_free, int(reserve) + scratch), Budget(secondary_free, int(reserve) + scratch), first_fixed=fixed, policy=args.multi_gpu_split)
         self._planned_split = split
         return {self.load_device: fixed + sum(sizes[:split]) + scratch, self.secondary_device: sum(sizes[split:]) + scratch}
 

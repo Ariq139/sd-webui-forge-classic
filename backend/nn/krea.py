@@ -313,10 +313,11 @@ class SingleStreamDiT(nn.Module):
             with torch.cuda.device(combined.device) if shard else nullcontext():
                 combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
 
+        combined = combined[:, txtlen + reflen : txtlen + reflen + imglen]
         if shard:
             combined = combined.to(shard[0])
 
-        out = self.last(combined[:, txtlen + reflen : txtlen + reflen + imglen], t)
+        out = self.last(combined, t)
         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_, w=w_, ph=patch, pw=patch, c=self.channels)
         out = out[:, :, :H_orig, :W_orig]
 

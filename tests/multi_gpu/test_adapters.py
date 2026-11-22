@@ -117,6 +117,10 @@ class AdapterTests(unittest.TestCase):
 
     def test_qwen21_patch_sees_input_on_block_device(self):
         seen = []
+        replacement_devices = []
+        def replace(values, helpers):
+            replacement_devices.append((values["img"].device, values["vec"].device))
+            return helpers["original_block"](values)
         def patch(values):
             seen.append((values["img"].device, values["x"].device))
             return values
@@ -131,7 +135,8 @@ class AdapterTests(unittest.TestCase):
             with mock.patch.object(patcher, "device_memory_requirements", return_value={torch.device("cuda:0"): 0, torch.device("cuda:1"): 0}):
                 mm.load_models_gpu([patcher])
             with torch.inference_mode():
-                model(x, t, context, transformer_options=device_aware_options({"patches": {"single_block": [patch]}}))
+                model(x, t, context, transformer_options=device_aware_options({"patches": {"single_block": [patch]}, "patches_replace": {"dit": {("single_block", 1): replace}}}))
+            self.assertEqual(replacement_devices, [(torch.device("cuda:1"), torch.device("cuda:1"))])
             self.assertEqual(seen, [(torch.device("cuda:0"), torch.device("cuda:0")), (torch.device("cuda:1"), torch.device("cuda:1")), (torch.device("cuda:1"), torch.device("cuda:1"))])
             mm.free_memory(float("inf"), torch.device("cuda:1"))
 
