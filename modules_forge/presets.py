@@ -136,7 +136,7 @@ _CAPABILITIES = {
     PresetArch.qwen.name: {"cfg": False, "negative_prompt": False},
     PresetArch.zit.name: {"cfg": False, "negative_prompt": False},
     PresetArch.wan.name: {"cfg": False, "negative_prompt": False, "hires": False},
-    PresetArch.ernie.name: {"cfg": False, "negative_prompt": False},
+    "ernie": {"cfg": False, "negative_prompt": False},
     PresetArch.pid.name: {
         "txt2img": False,
         "cfg": False,

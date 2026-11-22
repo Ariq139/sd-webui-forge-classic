@@ -470,7 +470,12 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     if use_context:
         cond_pred, uncond_pred = dynamic_args.context_handler.execute(calc_cond_uncond_batch, model, [cond, uncond_], x, timestep, model_options)
     elif parallel_cfg is not None and parallel_cfg.primary is model and parallel_cfg.eligible(cond, uncond_, model_options, x):
-        cond_pred, uncond_pred = parallel_cfg.predict(cond, uncond_, x, timestep, model_options)
+        from backend.multi_gpu.parallel import ParallelBatch
+        if direct_cond and type(parallel_cfg) is ParallelBatch:
+            cond_pred = parallel_cfg.predict_cond(cond, uncond_, x, timestep, model_options)
+            uncond_pred = None
+        else:
+            cond_pred, uncond_pred = parallel_cfg.predict(cond, uncond_, x, timestep, model_options)
     else:
         cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options, condition_cache, materialize_uncond=return_full or not direct_cond)
 
@@ -626,7 +631,10 @@ def _load_parallel_cfg(unet, cond, uncond, model_options, x, batch_mode=False):
         if replica.model.model_lowvram or replica.loaded_size() < replica.model_size():
             _release_parallel_cfg(unet)
             return None
-        adapter = adapter_type(unet.model, replica.model, (unet.load_device, replica.load_device))
+        if batch_mode:
+            adapter = adapter_type(unet.model, replica.model, (unet.load_device, replica.load_device), adaptive=args.parallel_batch_adaptive)
+        else:
+            adapter = adapter_type(unet.model, replica.model, (unet.load_device, replica.load_device))
         unet._experimental_parallel_cfg = adapter
         memory_management.logger.info("Parallel %s replicas ready on %s and %s", "batch" if batch_mode else "CFG", unet.load_device, replica.load_device)
         return adapter
@@ -656,7 +664,14 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None, cfg1_
         memory_management.logger.warning("Parallel CFG is disabled until the previous replica can be released")
         secondary_index = None
     if secondary_index is None or (cfg_scale is not None and math.isclose(cfg_scale, 1.0) and not batch_mode):
-        _discard_parallel_cfg_cache()
+        cached = _parallel_cfg_cache
+        retained_index = args.parallel_batch if cfg_scale is not None and math.isclose(cfg_scale, 1.0) and args.parallel_batch is not None else secondary_index
+        keep_cached = (args.parallel_cfg_keep_resident and retained_index is not None and retained_index >= 0 and cached
+                       and cached[0]() is unet.model and cached[1].patches_uuid == unet.patches_uuid
+                       and cached[1].load_device == torch.device("cuda", retained_index)
+                       and _parallel_cfg_patcher_eligible(unet))
+        if not keep_cached:
+            _discard_parallel_cfg_cache()
     if secondary_index is not None and (batch_mode or cfg_scale is None or not math.isclose(cfg_scale, 1.0)):
         from backend.multi_gpu.replicas import UnsupportedReplica, clone_unet_patcher
         try:

@@ -26,7 +26,11 @@ class UnetPatcher(ModelPatcher):
             from backend.nn.qwen21 import QwenImage21Transformer2DModel
             from backend.nn.wan import WanModel
             from backend.nn.lumina import NextDiT
-            from backend.nn.ernie import ErnieImageModel
+            from importlib.util import find_spec
+            if find_spec("backend.nn.ernie") is not None:
+                from backend.nn.ernie import ErnieImageModel
+            else:
+                ErnieImageModel = type(None)
             from backend.nn.chroma import IntegratedChromaTransformer2DModel
             from backend.nn.pixeldit.pid import PidNet
             if isinstance(model.diffusion_model, (Anima, SingleStreamDiT, IntegratedFluxTransformer2DModel, IntegratedUNet2DConditionModel, MOSSImage, QwenImageTransformer2DModel, QwenImage21Transformer2DModel, WanModel, NextDiT, ErnieImageModel, IntegratedChromaTransformer2DModel, PidNet)):

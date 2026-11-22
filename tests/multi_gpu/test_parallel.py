@@ -8,11 +8,36 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from backend.multi_gpu.parallel import ParallelBatch, ParallelCFG, ParallelPredictions, SplitLinear
+from backend.multi_gpu.parallel import BatchSplitProfile, ParallelBatch, ParallelCFG, ParallelPredictions, SplitLinear
 from backend.multi_gpu.replicas import ReplicaPair, UnsupportedReplica, clone_unet_patcher
 
 
 class ParallelPredictionTests(unittest.TestCase):
+    def test_adaptive_split_requires_samples_and_memory(self):
+        pair = BatchSplitProfile(2)
+        self.assertEqual(pair.choose(lambda split: self.fail("a two-image batch has no alternative split")), 1)
+        self.assertEqual(pair.selected, 1)
+        profile = BatchSplitProfile(3)
+        for _ in range(3):
+            self.assertEqual(profile.choose(lambda split: True), 2)
+            profile.observe(2, 20, 10)
+        self.assertEqual(profile.choose(lambda split: False), 2)
+        self.assertEqual(profile.selected, 2)
+        profile = BatchSplitProfile(3)
+        for _ in range(3):
+            profile.observe(2, 20, 10)
+        for _ in range(3):
+            self.assertEqual(profile.choose(lambda split: True), 1)
+            profile.observe(1, 10, 15)
+        self.assertEqual(profile.choose(lambda split: True), 1)
+        profile = BatchSplitProfile(4)
+        for _ in range(3):
+            profile.observe(2, 10, 20)
+        self.assertEqual(profile.choose(lambda split: True), 3)
+        for _ in range(3):
+            profile.observe(3, 19.5, 10)
+        self.assertEqual(profile.choose(lambda split: True), 2)
+
     def test_replica_copy_checks_host_memory_before_deepcopy(self):
         from backend import memory_management as mm
         from backend.patcher.unet import UnetPatcher
@@ -324,8 +349,54 @@ class SplitLinearTests(unittest.TestCase):
                             expected = sampling_function_inner(primary, x, timestep, None, cond, 1.0, return_full=True)
                         for observed, reference in zip(actual, expected):
                             torch.testing.assert_close(observed, reference)
+                        # A shared condition is repeated by the serial sampler;
+                        # it must not be sliced into an empty secondary branch.
+                        shared = compile_conditions(torch.full((1, 1, 1), 3.0))
+                        self.assertTrue(adapter.eligible(shared, None, {}, x))
+                        with torch.inference_mode(), mock.patch.object(adapter, "predict", wraps=adapter.predict) as full_predict:
+                            actual_direct = sampling_function_inner(primary, x, timestep, None, shared, 1.0, parallel_cfg=adapter)
+                            expected_direct = sampling_function_inner(primary, x, timestep, None, shared, 1.0)
+                            full_predict.assert_not_called()
+                            actual_full = sampling_function_inner(primary, x, timestep, None, shared, 1.0, return_full=True, parallel_cfg=adapter)
+                            expected_full = sampling_function_inner(primary, x, timestep, None, shared, 1.0, return_full=True)
+                            full_predict.assert_called_once()
+                        torch.testing.assert_close(actual_direct, expected_direct)
+                        for observed, reference in zip(actual_full, expected_full):
+                            torch.testing.assert_close(observed, reference)
                         self.assertFalse(adapter.eligible(cond, cond, {}, x))
                         self.assertFalse(adapter.eligible(cond, None, {"sampler_pre_cfg_function": [object()]}, x))
+            finally:
+                adapter.close()
+
+    def test_adaptive_batch_retries_balanced_split_after_oom(self):
+        from backend.sampling.condition import compile_conditions
+        from backend.sampling.sampling_function import sampling_function_inner
+
+        class Model(torch.nn.Module):
+            def memory_required(self, shape):
+                return 0
+            def apply_model(self, x, timestep, c_crossattn, **kwargs):
+                return x + c_crossattn[:, :1, :1, None]
+
+        with ReplicaPair(Model(), ("cuda:0", "cuda:1")) as pair:
+            adapter = ParallelBatch(*pair.models, pair.devices, adaptive=True)
+            cond = compile_conditions(torch.arange(3, dtype=torch.float32).reshape(3, 1, 1))
+            x = torch.zeros(3, 1, 2, 2, device="cuda:0")
+            timestep = torch.ones(3, device="cuda:0")
+            executor = adapter._executor.predict
+            calls = []
+            def fail_first(left, right):
+                calls.append(left[1].shape[0])
+                if len(calls) == 1:
+                    raise torch.OutOfMemoryError("injected")
+                return executor(left, right)
+            try:
+                with mock.patch.object(BatchSplitProfile, "choose", return_value=1), mock.patch.object(adapter._executor, "predict", side_effect=fail_first), torch.inference_mode():
+                    actual = sampling_function_inner(pair.models[0], x, timestep, None, cond, 1.0, parallel_cfg=adapter)
+                    expected = sampling_function_inner(pair.models[0], x, timestep, None, cond, 1.0)
+                self.assertEqual(calls, [1, 2])
+                self.assertEqual(adapter._profile.selected, 2)
+                torch.testing.assert_close(actual, expected)
             finally:
                 adapter.close()
 
@@ -359,6 +430,29 @@ class SplitLinearTests(unittest.TestCase):
             finally:
                 adapter.close()
             self.assertFalse(adapter._secondary_cache)
+
+    def test_adaptive_batch_split_preserves_odd_batch_results(self):
+        from backend.sampling.condition import compile_conditions
+        from backend.sampling.sampling_function import sampling_function_inner
+
+        class Model(torch.nn.Module):
+            def memory_required(self, shape):
+                return 0
+            def apply_model(self, x, timestep, c_crossattn, **kwargs):
+                return x + c_crossattn[:, :1, :1, None]
+
+        with ReplicaPair(Model(), ("cuda:0", "cuda:1")) as pair:
+            adapter = ParallelBatch(*pair.models, pair.devices, adaptive=True)
+            cond = compile_conditions(torch.arange(3, dtype=torch.float32).reshape(3, 1, 1))
+            x = torch.zeros(3, 1, 2, 2, device="cuda:0")
+            timestep = torch.ones(3, device="cuda:0")
+            try:
+                with mock.patch.object(BatchSplitProfile, "choose", return_value=1), torch.inference_mode():
+                    actual = sampling_function_inner(pair.models[0], x, timestep, None, cond, 1.0, parallel_cfg=adapter)
+                    expected = sampling_function_inner(pair.models[0], x, timestep, None, cond, 1.0)
+                torch.testing.assert_close(actual, expected)
+            finally:
+                adapter.close()
 
     def test_resident_replica_can_be_evicted_by_memory_manager(self):
         from backend import memory_management as mm
@@ -480,6 +574,10 @@ class SplitLinearTests(unittest.TestCase):
                 self.assertIsNone(unet._experimental_cfg_replica)
                 self.assertIsNone(unet._experimental_parallel_cfg)
                 self.assertIs(sampling_module._parallel_cfg_cache[1], replica)
+                with mock.patch.object(args, "parallel_cfg_keep_resident", True), mock.patch.object(args, "parallel_cfg", None), mock.patch.object(args, "parallel_batch", 1):
+                    sampling_prepare(unet, x, cfg_scale=1.0)
+                    self.assertIs(sampling_module._parallel_cfg_cache[1], replica)
+                    sampling_cleanup(unet)
                 sampling_prepare(unet, x)
                 try:
                     self.assertIs(unet._experimental_cfg_replica, replica)

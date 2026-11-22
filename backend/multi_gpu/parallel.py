@@ -5,6 +5,7 @@ Callers must own independent models and their lifecycle.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from statistics import median
 
 import torch
 import torch.nn.functional as F
@@ -147,10 +148,53 @@ class ParallelCFG:
         self._unconditional_sources = ()
 
 
+class BatchSplitProfile:
+    """Compare a balanced split with one neighboring split for this request."""
+
+    def __init__(self, batch_size, samples=3):
+        self.batch_size = batch_size
+        self.balanced = (batch_size + 1) // 2
+        self.samples = samples
+        self.measurements = {}
+        self.candidate = None
+        self.selected = None
+
+    def observe(self, split, left_ms, right_ms):
+        self.measurements.setdefault(split, []).append((left_ms, right_ms))
+
+    def choose(self, fits):
+        if self.selected is not None:
+            return self.selected
+        baseline = self.measurements.get(self.balanced, [])
+        if self.batch_size < 3:
+            self.selected = self.balanced
+            return self.selected
+        if len(baseline) < self.samples:
+            return self.balanced
+        if self.candidate is None:
+            left = median(row[0] for row in baseline[-self.samples:])
+            right = median(row[1] for row in baseline[-self.samples:])
+            if self.batch_size % 2:
+                candidate = self.batch_size - self.balanced
+            else:
+                candidate = self.balanced - 1 if left > right else self.balanced + 1
+            if candidate < 1 or candidate >= self.batch_size or not fits(candidate):
+                self.selected = self.balanced
+                return self.selected
+            self.candidate = candidate
+        trial = self.measurements.get(self.candidate, [])
+        if len(trial) < self.samples:
+            return self.candidate
+        base_time = median(max(row) for row in baseline[-self.samples:])
+        trial_time = median(max(row) for row in trial[-self.samples:])
+        self.selected = self.candidate if trial_time < 0.97 * base_time else self.balanced
+        return self.selected
+
+
 class ParallelBatch:
     """Split a simple CFG 1 prediction across two independent replicas."""
 
-    def __init__(self, primary, secondary, devices):
+    def __init__(self, primary, secondary, devices, adaptive=False):
         self.primary = primary
         self.secondary = secondary
         self.devices = tuple(torch.device(device) for device in devices)
@@ -160,6 +204,10 @@ class ParallelBatch:
         self._secondary_cache = {}
         self._primary_sources = ()
         self._secondary_sources = ()
+        self._adaptive = adaptive
+        self._profile = None
+        self._profile_shape = None
+        self._pending_timings = []
         self._executor = ParallelPredictions(self._primary, self._secondary)
 
     @staticmethod
@@ -168,11 +216,11 @@ class ParallelBatch:
             return False
         item = cond[0]
         for value in item["model_conds"].values():
-            if value.cond.ndim == 0 or value.cond.shape[0] != x.shape[0]:
+            if value.cond.ndim == 0 or value.cond.shape[0] not in (1, x.shape[0]):
                 return False
         for key in ("cross_attn", "pooled_output"):
             value = item.get(key)
-            if value is not None and (not isinstance(value, torch.Tensor) or value.ndim == 0 or value.shape[0] != x.shape[0]):
+            if value is not None and (not isinstance(value, torch.Tensor) or value.ndim == 0 or value.shape[0] not in (1, x.shape[0])):
                 return False
         return True
 
@@ -182,8 +230,8 @@ class ParallelBatch:
         sliced = {key: value for key, value in item.items() if key not in ("model_conds", "batch_indices")}
         for key in ("cross_attn", "pooled_output"):
             if sliced.get(key) is not None:
-                sliced[key] = sliced[key][start:end]
-        sliced["model_conds"] = {key: type(value)(value.cond[start:end], cache_key=value.cache_key) for key, value in item["model_conds"].items()}
+                sliced[key] = sliced[key] if sliced[key].shape[0] == 1 else sliced[key][start:end]
+        sliced["model_conds"] = {key: type(value)(value.cond if value.cond.shape[0] == 1 else value.cond[start:end], cache_key=value.cache_key) for key, value in item["model_conds"].items()}
         return [sliced]
 
     def _run(self, model, device, cond, x, timestep, model_options, cache):
@@ -193,25 +241,92 @@ class ParallelBatch:
             return calc_cond_uncond_batch(model, cond, None, x.to(device), timestep.to(device), {"transformer_options": options}, cache, materialize_uncond=False)[0]
 
     def _primary(self, cond, x, timestep, options, cache):
-        return self._run(self.primary, self.devices[0], cond, x, timestep, options, cache)
+        return self._timed_run(self.primary, self.devices[0], cond, x, timestep, options, cache)
 
     def _secondary(self, cond, x, timestep, options, cache):
-        return self._run(self.secondary, self.devices[1], cond, x, timestep, options, cache)
+        return self._timed_run(self.secondary, self.devices[1], cond, x, timestep, options, cache)
 
-    def predict(self, cond, uncond, x, timestep, model_options):
+    def _timed_run(self, model, device, cond, x, timestep, options, cache):
+        if not self._adaptive or (self._profile is not None and self._profile.selected is not None):
+            return self._run(model, device, cond, x, timestep, options, cache), None
+        with torch.cuda.device(device):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            result = self._run(model, device, cond, x, timestep, options, cache)
+            end.record()
+            return result, (start, end)
+
+    def _fits_split(self, split, x):
+        from backend import memory_management
+        try:
+            for model, device, count in zip((self.primary, self.secondary), self.devices, (split, x.shape[0] - split)):
+                shape = [count, *x.shape[1:]]
+                required = model.memory_required(shape) + memory_management.minimum_inference_memory()
+                if memory_management.get_free_memory(device) < required:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _choose_split(self, x):
+        shape = tuple(x.shape)
+        if shape != self._profile_shape:
+            self._profile_shape = shape
+            self._profile = BatchSplitProfile(x.shape[0])
+            self._pending_timings.clear()
+        remaining = []
+        for split, left, right in self._pending_timings:
+            if left[1].query() and right[1].query():
+                self._profile.observe(split, left[0].elapsed_time(left[1]), right[0].elapsed_time(right[1]))
+            else:
+                remaining.append((split, left, right))
+        self._pending_timings = remaining
+        previous_candidate = self._profile.candidate
+        previous_selection = self._profile.selected
+        split = self._profile.choose(lambda candidate: self._fits_split(candidate, x))
+        if self._profile.candidate != previous_candidate or self._profile.selected != previous_selection:
+            from backend import memory_management
+            memory_management.logger.info("Adaptive parallel batch %s split: %s + %s", "selected" if self._profile.selected is not None else "testing", split, x.shape[0] - split)
+        return split
+
+    def predict_cond(self, cond, uncond, x, timestep, model_options):
         if x.device != self.devices[0]:
             raise ValueError("Latents must be on the primary replica device")
         if timestep.ndim == 0 or timestep.shape[0] not in (1, x.shape[0]):
             raise ValueError("Unsupported timestep batch")
-        split = (x.shape[0] + 1) // 2
-        left_t = timestep[:split] if timestep.shape[0] == x.shape[0] else timestep
-        right_t = timestep[split:] if timestep.shape[0] == x.shape[0] else timestep
+        split = self._choose_split(x) if self._adaptive else (x.shape[0] + 1) // 2
         # Track the unsliced sources: newly created views have different object
         # identities each step, even when the underlying conditioning is stable.
         primary_cache = ParallelCFG._condition_cache(self, cond, "primary")
         secondary_cache = ParallelCFG._condition_cache(self, cond, "secondary")
-        left, right = self._executor.predict((self._slice(cond, 0, split), x[:split], left_t, model_options, primary_cache), (self._slice(cond, split, x.shape[0]), x[split:], right_t, model_options, secondary_cache))
-        result = torch.cat((left, right.to(self.devices[0])), dim=0)
+        def run(current_split):
+            left_t = timestep[:current_split] if timestep.shape[0] == x.shape[0] else timestep
+            right_t = timestep[current_split:] if timestep.shape[0] == x.shape[0] else timestep
+            return self._executor.predict((self._slice(cond, 0, current_split), x[:current_split], left_t, model_options, primary_cache), (self._slice(cond, current_split, x.shape[0]), x[current_split:], right_t, model_options, secondary_cache))
+
+        retry = False
+        try:
+            (left, left_time), (right, right_time) = run(split)
+        except Exception as error:
+            from backend import memory_management
+            if not self._adaptive or split == self._profile.balanced or not memory_management.is_oom(error):
+                raise
+            retry = True
+        if retry:
+            import gc
+            from backend import memory_management
+            split = self._profile.balanced
+            self._profile.selected = split
+            self._pending_timings.clear()
+            gc.collect()
+            memory_management.soft_empty_cache(force=True)
+            (left, left_time), (right, right_time) = run(split)
+        if left_time is not None and right_time is not None and self._profile.selected is None:
+            self._pending_timings.append((split, left_time, right_time))
+        return torch.cat((left, right.to(self.devices[0])), dim=0)
+
+    def predict(self, cond, uncond, x, timestep, model_options):
+        result = self.predict_cond(cond, uncond, x, timestep, model_options)
         return result, torch.zeros_like(result)
 
     def close(self):
@@ -220,6 +335,7 @@ class ParallelBatch:
         self._secondary_cache.clear()
         self._primary_sources = ()
         self._secondary_sources = ()
+        self._pending_timings.clear()
 
 
 class SplitLinear(torch.nn.Module):

@@ -15,6 +15,7 @@ parser.add_argument("--multi-gpu", "--multi-gpu-anima", dest="multi_gpu_anima", 
 parser.add_argument("--multi-gpu-split", choices=("balanced_memory", "prefer_primary"), default="balanced_memory", help="Choose a memory-balanced or primary-biased multi-GPU split")
 parser.add_argument("--parallel-cfg", type=int, default=None, metavar="CUDA_ID", help="Experimentally evaluate CFG branches on independent GPU replicas")
 parser.add_argument("--parallel-batch", type=int, default=None, metavar="CUDA_ID", help="Experimentally split eligible CFG 1 image batches across independent GPU replicas")
+parser.add_argument("--parallel-batch-adaptive", action="store_true", help="Experimentally measure and adjust the parallel batch split during sampling")
 parser.add_argument("--parallel-cfg-keep-resident", action="store_true", help="Keep an idle parallel CFG replica on its GPU when possible; it remains eligible for memory eviction")
 
 fp_group = parser.add_mutually_exclusive_group()

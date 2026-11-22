@@ -16,7 +16,11 @@ from backend.nn.qwen import QwenImageTransformer2DModel
 from backend.nn.qwen21 import QwenImage21Transformer2DModel
 from backend.nn.wan import WanModel
 from backend.nn.lumina import NextDiT
-from backend.nn.ernie import ErnieImageModel
+from importlib.util import find_spec
+if find_spec("backend.nn.ernie") is not None:
+    from backend.nn.ernie import ErnieImageModel
+else:
+    ErnieImageModel = None
 from backend.nn.chroma import IntegratedChromaTransformer2DModel
 from backend.nn.pixeldit.pid import PidNet
 from backend.args import dynamic_args
@@ -146,6 +150,7 @@ class AdapterTests(unittest.TestCase):
     def test_lumina(self):
         self.check_model(lambda: NextDiT(patch_size=2, in_channels=2, dim=32, n_layers=3, n_refiner_layers=1, n_heads=2, multiple_of=16, cap_feat_dim=32, axes_dims=[4, 6, 6], axes_lens=[16, 32, 32]), [torch.randn(1, 2, 4, 4), torch.ones(1), torch.randn(1, 3, 32)], [1, 2])
 
+    @unittest.skipIf(ErnieImageModel is None, "Ernie model implementation is not installed")
     def test_ernie(self):
         self.check_model(lambda: ErnieImageModel(hidden_size=32, num_attention_heads=2, num_layers=3, ffn_hidden_size=64, in_channels=2, out_channels=2, text_in_dim=32, rope_axes_dim=(4, 6, 6)), [torch.randn(1, 2, 4, 4), torch.ones(1), torch.randn(1, 3, 32)], [1, 2])
 
