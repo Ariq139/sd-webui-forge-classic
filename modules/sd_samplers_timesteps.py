@@ -68,7 +68,7 @@ class CompVisSampler(sd_samplers_common.Sampler):
     @sd_samplers_common.cleanup_replica_on_error
     def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
         unet_patcher = self.model_wrap.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, cfg_scale=p.cfg_scale)
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, cfg_scale=p.cfg_scale, cfg1_single_condition=sd_samplers_common.cfg1_single_condition_eligible(self, p, conditioning, unconditional_conditioning, x))
 
         self.model_wrap.inner_model.alphas_cumprod = self.model_wrap.inner_model.alphas_cumprod.to(x.device)
 
@@ -121,7 +121,7 @@ class CompVisSampler(sd_samplers_common.Sampler):
     @sd_samplers_common.cleanup_replica_on_error
     def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
         unet_patcher = self.model_wrap.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, cfg_scale=p.cfg_scale)
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x, cfg_scale=p.cfg_scale, cfg1_single_condition=sd_samplers_common.cfg1_single_condition_eligible(self, p, conditioning, unconditional_conditioning, x))
 
         self.model_wrap.inner_model.alphas_cumprod = self.model_wrap.inner_model.alphas_cumprod.to(x.device)
 

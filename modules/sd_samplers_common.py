@@ -34,6 +34,48 @@ from modules_forge import main_entry
 SamplerDataTuple = namedtuple("SamplerData", ["name", "constructor", "aliases", "options"])
 
 
+def cfg1_single_condition_eligible(sampler, p, conditioning, uncond, x):
+    """Use a single-batch memory estimate only for a known simple CFG 1 call."""
+    from backend import memory_management
+    from modules import prompt_parser, script_callbacks
+
+    def reject(reason):
+        memory_management.logger.debug("Using conservative CFG memory estimate: %s", reason)
+        return False
+
+    if p.cfg_scale != 1.0 or uncond is not None or not isinstance(conditioning, prompt_parser.MulticondLearnedConditioning):
+        return reject("CFG scale, negative conditioning, or conditioning type")
+    if len(conditioning.batch) != x.shape[0] or any(len(row) != 1 or row[0].weight != 1.0 for row in conditioning.batch):
+        return reject("composed or mismatched positive conditioning")
+    if getattr(p, "is_hr_pass", False) and getattr(p, "hr_cfg", None) != 1.0:
+        return reject("high-resolution CFG differs")
+    if getattr(p, "refiner_checkpoint", None) or getattr(p, "refiner_cfg", None) not in (None, 1.0):
+        return reject("refiner settings")
+    if getattr(p, "image_cfg_scale", None) not in (None, 1.0):
+        return reject("image CFG settings")
+    callbacks = script_callbacks.callback_map["callbacks_cfg_denoiser"]
+    if any(not getattr(getattr(entry, "callback", None), "_forge_preserves_cfg1_memory_plan", False) for entry in callbacks) or dynamic_args.context_handler is not None:
+        return reject("denoiser callback or context handler")
+    if (dynamic_args.ref_latents or dynamic_args.is_referencing or dynamic_args.concat_latent is not None
+            or any(value is not None for value in dynamic_args.lq_latent)
+            or dynamic_args.kontext or dynamic_args.edit or dynamic_args.klein or dynamic_args.wan or dynamic_args.pid
+            or (dynamic_args.qwen21 and dynamic_args.image_slots)
+            or (dynamic_args.moss and dynamic_args.get("moss_ref_kv") is not None)):
+        return reject("reference, edit, or specialized conditioning")
+    func = getattr(sampler, "func", None)
+    if getattr(func, "__module__", None) not in ("k_diffusion.sampling", "modules.sd_samplers_timesteps_impl"):
+        return reject("custom sampler")
+    unet = sampler.model_wrap.inner_model.forge_objects.unet
+    if unet.controlnet_linked_list is not None or unet.extra_concat_condition is not None or unet.object_patches or unet.extra_model_patchers_during_sampling:
+        return reject("control network, concatenated conditioning, or object patch")
+    options = unet.model_options
+    if set(options) - {"transformer_options"}:
+        return reject("model guidance options")
+    if set(options.get("transformer_options", {})) - {"sampling_sigmas"}:
+        return reject("transformer options")
+    return True
+
+
 def cleanup_replica_on_error(function):
     """Release prepared CFG replicas if sampler setup or execution fails."""
     @wraps(function)

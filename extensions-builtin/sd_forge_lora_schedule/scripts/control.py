@@ -90,4 +90,9 @@ class LoRAControl(scripts.Script):
                     lora.patch[0][0] = w
 
 
+# This callback only changes LoRA strengths; it does not add conditioning
+# branches or alter latent batch size.
+LoRAControl.adjust_lora.__func__._forge_preserves_cfg1_memory_plan = True
+# A live LoRA schedule mutates patch strengths after replicas are created.
+LoRAControl.adjust_lora.__func__._forge_parallel_batch_safe = lambda: not LoRAControl.mapping
 on_cfg_denoiser(LoRAControl.adjust_lora)

@@ -690,10 +690,26 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 raise ValueError("Multi-GPU does not support Nunchaku models")
             sharded_model = cls_name in ("CosmosTransformer3DModel", "Krea2Transformer2DModel", "FluxTransformer2DModel", "Flux2Transformer2DModel", "UNet2DConditionModel", "MOSSImageTransformer", "QwenImageTransformer2DModel", "QwenImage21Transformer2DModel", "WanTransformer3DModel", "Lumina2Transformer2DModel", "ZImageTransformer2DModel", "ErnieImageTransformer2DModel", "ChromaTransformer2DModel", "PiDTransformer2DModel") and backend.args.args.multi_gpu_anima is not None
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
-            cfg_device = backend.args.args.parallel_cfg
+            batch_classes = ("CosmosTransformer3DModel", "Krea2Transformer2DModel", "FluxTransformer2DModel",
+                             "Flux2Transformer2DModel", "ChromaTransformer2DModel", "UNet2DConditionModel",
+                             "MOSSImageTransformer", "QwenImageTransformer2DModel", "QwenImage21Transformer2DModel")
+            batch_device = backend.args.args.parallel_batch if cls_name in batch_classes else None
+            cfg_device = backend.args.args.parallel_cfg if backend.args.args.parallel_cfg is not None else batch_device
             parallel_model = (not guess.nunchaku and cfg_device is not None and 0 <= cfg_device < torch.cuda.device_count()
                               and torch.device("cuda", cfg_device) != load_device and not backend.args.args.bf16_unet
-                              and override_dtype != torch.bfloat16 and backend.args.args.force_fp16)
+                              and override_dtype != torch.bfloat16)
+            if parallel_model and not sharded_model and not backend.args.args.force_fp16:
+                # Keep the existing single-device precision if a full replica
+                # cannot fit even before activation memory is considered.
+                from backend.multi_gpu.precision import replica_fits_memory
+                try:
+                    free_bytes = memory_management.get_free_memory(torch.device("cuda", cfg_device))
+                except Exception:
+                    logger.exception("Could not check replica device memory; retaining single-device precision")
+                    parallel_model = False
+                else:
+                    if not replica_fits_memory(state_dict, free_bytes, memory_management.minimum_inference_memory()):
+                        parallel_model = False
             multi_device_model = sharded_model or parallel_model
 
             sharded_fp32 = multi_device_model and (backend.args.args.force_fp32 or backend.args.args.fp32_unet or override_dtype == torch.float32 or torch.float16 not in guess.supported_inference_dtypes)
@@ -702,7 +718,14 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 storage_dtype = torch.bfloat16
                 logger.info(f"Using Nunchaku Model Data Type: {storage_dtype}")
             elif quant_config is not None:
-                storage_dtype = (torch.float32 if sharded_fp32 else torch.float16) if multi_device_model else torch.bfloat16
+                if sharded_model:
+                    storage_dtype = torch.float32 if sharded_fp32 else torch.float16
+                elif parallel_model:
+                    from backend.multi_gpu.precision import replica_compute_dtype
+                    preferred = torch.float16 if backend.args.args.force_fp16 or backend.args.args.fp16_unet else torch.bfloat16
+                    storage_dtype = replica_compute_dtype(torch.float32 if sharded_fp32 else preferred, guess.supported_inference_dtypes, (load_device, torch.device("cuda", cfg_device)))
+                else:
+                    storage_dtype = torch.bfloat16
                 logger.info(f"Using {quant_config.pop('layout')} for Model")
             elif state_dict_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, "gguf"):
                 storage_dtype = state_dict_dtype
@@ -724,9 +747,13 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 computation_dtype = storage_dtype
             else:
                 computation_dtype = memory_management.inference_cast(weight_dtype=storage_dtype, inference_device=load_device, supported_dtypes=guess.supported_inference_dtypes)
-            if multi_device_model:
+            if sharded_model:
                 from backend.multi_gpu.precision import sharded_compute_dtype
                 computation_dtype = sharded_compute_dtype(torch.float32 if sharded_fp32 else computation_dtype, guess.supported_inference_dtypes)
+            elif parallel_model:
+                from backend.multi_gpu.precision import replica_compute_dtype
+                computation_dtype = replica_compute_dtype(torch.float32 if sharded_fp32 else computation_dtype, guess.supported_inference_dtypes, (load_device, torch.device("cuda", cfg_device)))
+                logger.info("Replica compute dtype selected: %s", computation_dtype)
 
             backend.args.dynamic_args.ops = None
 

@@ -1,13 +1,38 @@
 import unittest
+from contextlib import nullcontext
+from unittest import mock
 
 import torch
 
 from backend.multi_gpu.planner import Budget, contiguous_split
 from backend.multi_gpu.residency import Residency
-from backend.multi_gpu.precision import sharded_compute_dtype
+from backend.multi_gpu.precision import replica_compute_dtype, replica_fits_memory, replica_memory_requirement, sharded_compute_dtype
 
 
 class MultiGpuFoundationTests(unittest.TestCase):
+    def test_replica_memory_preflight_scales_to_larger_cards(self):
+        gib = 1024 ** 3
+        state = {"weight": torch.empty((7 * gib,), dtype=torch.uint8, device="meta"), "metadata": "ignored"}
+        required = replica_memory_requirement(state, int(1.2 * gib))
+        self.assertGreater(required, 8 * gib)
+        self.assertLess(required, 12 * gib)
+        self.assertLess(required, 24 * gib)
+        self.assertFalse(replica_fits_memory(state, 8 * gib, int(1.2 * gib)))
+        self.assertTrue(replica_fits_memory(state, 12 * gib, int(1.2 * gib)))
+        self.assertTrue(replica_fits_memory(state, 24 * gib, int(1.2 * gib)))
+
+    def test_replica_precision_respects_device_capabilities(self):
+        devices = (torch.device("cuda:0"), torch.device("cuda:1"))
+        supported = [torch.float16, torch.bfloat16, torch.float32]
+        with mock.patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()), mock.patch.object(torch.cuda, "is_bf16_supported", side_effect=[True, False]):
+            self.assertEqual(replica_compute_dtype(torch.bfloat16, supported, devices), torch.float16)
+        with mock.patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()), mock.patch.object(torch.cuda, "is_bf16_supported", return_value=True):
+            self.assertEqual(replica_compute_dtype(torch.bfloat16, supported, devices), torch.bfloat16)
+        with mock.patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()), mock.patch.object(torch.cuda, "is_bf16_supported", return_value=False):
+            self.assertEqual(replica_compute_dtype(torch.bfloat16, [torch.bfloat16, torch.float32], devices), torch.float32)
+        self.assertEqual(replica_compute_dtype(torch.float32, supported, devices), torch.float32)
+        self.assertEqual(replica_compute_dtype(torch.float16, supported, devices), torch.float16)
+
     def test_sharded_precision_preserves_fp32_and_model_capabilities(self):
         self.assertEqual(sharded_compute_dtype(torch.float32, [torch.float16, torch.float32]), torch.float32)
         self.assertEqual(sharded_compute_dtype(torch.bfloat16, [torch.bfloat16, torch.float32]), torch.float32)

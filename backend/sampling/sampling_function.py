@@ -61,6 +61,37 @@ def _parallel_cfg_patcher_eligible(unet):
                 or unet.extra_model_patchers_during_sampling or unet.extra_concat_condition is not None)
 
 
+def _parallel_batch_callbacks_safe():
+    from modules import script_callbacks
+
+    for entry in script_callbacks.callback_map["callbacks_cfg_denoiser"]:
+        predicate = getattr(getattr(entry, "callback", None), "_forge_parallel_batch_safe", None)
+        if not callable(predicate):
+            return False
+        try:
+            if not predicate():
+                return False
+        except Exception:
+            memory_management.logger.exception("Parallel batch callback safety check failed")
+            return False
+    return True
+
+
+def _parallel_batch_model_supported(unet):
+    from backend.nn.anima import Anima
+    from backend.nn.chroma import IntegratedChromaTransformer2DModel
+    from backend.nn.flux import IntegratedFluxTransformer2DModel
+    from backend.nn.krea import SingleStreamDiT
+    from backend.nn.moss_image import MOSSImage
+    from backend.nn.qwen import QwenImageTransformer2DModel
+    from backend.nn.qwen21 import QwenImage21Transformer2DModel
+    from backend.nn.unet import IntegratedUNet2DConditionModel
+
+    supported = (Anima, SingleStreamDiT, IntegratedFluxTransformer2DModel, IntegratedChromaTransformer2DModel,
+                 IntegratedUNet2DConditionModel, MOSSImage, QwenImageTransformer2DModel, QwenImage21Transformer2DModel)
+    return type(getattr(unet.model, "diffusion_model", None)) in supported
+
+
 def condition_cache_allowed(model_options):
     return not any(
         model_options.get(option)
@@ -501,16 +532,20 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
         model, x, timestep, uncond, cond, cond_scale, model_options, seed = modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
 
     parallel_cfg = getattr(unet_patcher, "_experimental_parallel_cfg", None)
+    from backend.multi_gpu.parallel import ParallelBatch
+
+    batch_mode = bool(getattr(unet_patcher, "_experimental_cfg_batch_mode", False)) and cond_scale == 1.0 and _parallel_batch_callbacks_safe()
     if parallel_cfg is not None:
         replica = getattr(unet_patcher, "_experimental_cfg_replica", None)
         if (replica is None or replica.patches_uuid != unet_patcher.patches_uuid
-                or parallel_cfg.primary is not model or math.isclose(cond_scale, 1.0)
+                or parallel_cfg.primary is not model or isinstance(parallel_cfg, ParallelBatch) != batch_mode
+                or (not batch_mode and math.isclose(cond_scale, 1.0))
                 or not _parallel_cfg_patcher_eligible(unet_patcher)
                 or not parallel_cfg.eligible(cond, uncond, model_options, x)):
             _release_parallel_cfg(unet_patcher)
             parallel_cfg = None
-    if parallel_cfg is None and not math.isclose(cond_scale, 1.0):
-        parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x)
+    if parallel_cfg is None and (batch_mode or (args.parallel_cfg is not None and not math.isclose(cond_scale, 1.0))):
+        parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x, batch_mode=batch_mode)
     try:
         return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
     except BaseException as error:
@@ -563,11 +598,17 @@ def _release_parallel_cfg(unet, preserve_cpu=False):
         _parallel_cfg_cache = (weakref.ref(unet.model, _clear_parallel_cfg_cache), replica)
 
 
-def _load_parallel_cfg(unet, cond, uncond, model_options, x):
-    from backend.multi_gpu.parallel import ParallelCFG
+def _load_parallel_cfg(unet, cond, uncond, model_options, x, batch_mode=False):
+    from backend.multi_gpu.parallel import ParallelBatch, ParallelCFG
 
     replica = getattr(unet, "_experimental_cfg_replica", None)
-    if replica is None or getattr(unet, "_experimental_cfg_needs_rollback", False) or not ParallelCFG.eligible(cond, uncond, model_options, x):
+    adapter_type = ParallelBatch if batch_mode else ParallelCFG
+    if replica is None or getattr(unet, "_experimental_cfg_needs_rollback", False):
+        return None
+    if not adapter_type.eligible(cond, uncond, model_options, x):
+        if batch_mode and not getattr(unet, "_experimental_batch_fallback_reported", False):
+            memory_management.logger.info("Parallel batch unavailable for this conditioning; using the normal sampler")
+            unet._experimental_batch_fallback_reported = True
         return None
     if (replica.patches_uuid != unet.patches_uuid or not _parallel_cfg_patcher_eligible(unet)
             or unet.model.model_lowvram or unet.loaded_size() < unet.model_size()):
@@ -585,9 +626,9 @@ def _load_parallel_cfg(unet, cond, uncond, model_options, x):
         if replica.model.model_lowvram or replica.loaded_size() < replica.model_size():
             _release_parallel_cfg(unet)
             return None
-        adapter = ParallelCFG(unet.model, replica.model, (unet.load_device, replica.load_device))
+        adapter = adapter_type(unet.model, replica.model, (unet.load_device, replica.load_device))
         unet._experimental_parallel_cfg = adapter
-        memory_management.logger.info("Parallel CFG replicas ready on %s and %s", unet.load_device, replica.load_device)
+        memory_management.logger.info("Parallel %s replicas ready on %s and %s", "batch" if batch_mode else "CFG", unet.load_device, replica.load_device)
         return adapter
     except BaseException as error:
         _release_parallel_cfg(unet)
@@ -599,16 +640,24 @@ def _load_parallel_cfg(unet, cond, uncond, model_options, x):
         unet._experimental_cfg_loading = False
 
 
-def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None):
+def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None, cfg1_single_condition=False):
     global _parallel_cfg_cache
     _release_parallel_cfg(unet)
-    secondary_index = args.parallel_cfg
+    batch_mode = (cfg1_single_condition and cfg_scale == 1.0 and x.shape[0] > 1 and args.parallel_batch is not None
+                  and (args.parallel_cfg is None or args.parallel_cfg == args.parallel_batch)
+                  and _parallel_batch_model_supported(unet)
+                  and _parallel_batch_callbacks_safe())
+    unet._experimental_cfg_batch_mode = batch_mode
+    unet._experimental_batch_fallback_reported = False
+    if args.parallel_batch is not None and cfg_scale == 1.0 and x.shape[0] > 1 and not batch_mode:
+        memory_management.logger.info("Parallel batch unavailable for this model or conditioning; using the normal sampler")
+    secondary_index = args.parallel_batch if batch_mode else args.parallel_cfg
     if getattr(unet, "_experimental_cfg_replica", None) is not None:
         memory_management.logger.warning("Parallel CFG is disabled until the previous replica can be released")
         secondary_index = None
-    if secondary_index is None or (cfg_scale is not None and math.isclose(cfg_scale, 1.0)):
+    if secondary_index is None or (cfg_scale is not None and math.isclose(cfg_scale, 1.0) and not batch_mode):
         _discard_parallel_cfg_cache()
-    if secondary_index is not None and (cfg_scale is None or not math.isclose(cfg_scale, 1.0)):
+    if secondary_index is not None and (batch_mode or cfg_scale is None or not math.isclose(cfg_scale, 1.0)):
         from backend.multi_gpu.replicas import UnsupportedReplica, clone_unet_patcher
         try:
             if secondary_index < 0:
@@ -625,7 +674,12 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None):
                     raise UnsupportedReplica("The previous replica could not be released")
                 cached = None
             resident = cached[1].loaded_size() if reusable and cached[1].current_device == secondary else 0
-            if memory_management.get_free_memory(secondary) < max(0, unet.model_size() - resident) + memory_management.minimum_inference_memory():
+            try:
+                secondary_free = memory_management.get_free_memory(secondary)
+            except Exception as error:
+                _discard_parallel_cfg_cache()
+                raise UnsupportedReplica("Unable to check secondary-device memory") from error
+            if secondary_free < max(0, unet.model_size() - resident) + memory_management.minimum_inference_memory():
                 _discard_parallel_cfg_cache()
                 raise UnsupportedReplica("Not enough free memory for a secondary replica")
             if reusable:
@@ -633,14 +687,27 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None):
                 unet._experimental_cfg_replica = cached[1]
                 memory_management.logger.info("Reusing the cached parallel CFG replica")
             else:
+                # A previous non-parallel request can leave this model resident,
+                # possibly through another patcher sharing the same model. Undo
+                # its patches before making the independent CPU replica.
+                for loaded in list(memory_management.current_loaded_models):
+                    owner = loaded.model
+                    if owner is not None and owner.model is unet.model:
+                        if not loaded.model_unload():
+                            raise UnsupportedReplica("The source model could not be fully offloaded")
+                        memory_management.current_loaded_models.remove(loaded)
                 unet._experimental_cfg_replica = clone_unet_patcher(unet, secondary)
         except UnsupportedReplica as error:
-            memory_management.logger.info("Parallel CFG unavailable: %s", error)
+            memory_management.logger.info("Parallel %s unavailable: %s", "batch" if batch_mode else "CFG", error)
     try:
         shape = list(x.shape)
-        mem_shape = [(2 if shared.batch_cond_uncond else 1) * shape[0]] + shape[1:]
+        single_condition = cfg1_single_condition and cfg_scale == 1.0
+        mem_shape = [(2 if shared.batch_cond_uncond and not single_condition else 1) * shape[0]] + shape[1:]
 
         unet_inference_memory = unet.memory_required(mem_shape)
+        memory_management.logger.debug("Sampling memory plan: CFG=%s, latent batch=%s, estimated batch=%s, inference bytes=%s", cfg_scale, shape[0], mem_shape[0], unet_inference_memory)
+        if single_condition and shared.batch_cond_uncond:
+            memory_management.logger.info("CFG 1 memory plan uses batch %s (single conditioning branch)", shape[0])
         additional_inference_memory = unet.extra_preserved_memory_during_sampling
         additional_model_patchers = unet.extra_model_patchers_during_sampling
 

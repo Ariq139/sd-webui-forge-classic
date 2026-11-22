@@ -12,7 +12,7 @@ class UnsupportedReplica(ValueError):
 def clone_unet_patcher(unet, secondary):
     """Create a CPU replica with independent patches and model state."""
     from backend.operations_gguf import ParameterGGUF
-    from backend import memory_management
+    from backend import memory_management, utils
     from backend.operations import ForgeOperationsFP8, _get_disabled_quants
     from backend.patcher.base import OnlineLoRAPatch
     from backend.patcher.unet import UnetPatcher
@@ -45,6 +45,14 @@ def clone_unet_patcher(unet, secondary):
         with torch.cuda.device(secondary):
             if not torch.cuda.is_bf16_supported(including_emulation=False):
                 raise UnsupportedReplica("The secondary device does not support BF16")
+    # Replicas are first deep-copied on the host. A large GPU alone is not
+    # sufficient if the system cannot safely hold another model in RAM.
+    patch_bytes = utils.nested_compute_size(unet.patches, element_size=4)
+    patch_bytes += sum(utils.nested_compute_size(wrapper.patch, element_size=4)
+                       for wrappers in unet.weight_wrapper_patches.values() for wrapper in wrappers)
+    host_required = unet.model_size() + patch_bytes + 512 * 1024 ** 2
+    if memory_management.get_free_memory(torch.device("cpu")) < host_required:
+        raise UnsupportedReplica("Not enough available system memory to copy the model and LoRA state")
     try:
         memo = {}
         for tensor in tensors:

@@ -8,11 +8,147 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from backend.multi_gpu.parallel import ParallelCFG, ParallelPredictions, SplitLinear
+from backend.multi_gpu.parallel import ParallelBatch, ParallelCFG, ParallelPredictions, SplitLinear
 from backend.multi_gpu.replicas import ReplicaPair, UnsupportedReplica, clone_unet_patcher
 
 
 class ParallelPredictionTests(unittest.TestCase):
+    def test_replica_copy_checks_host_memory_before_deepcopy(self):
+        from backend import memory_management as mm
+        from backend.patcher.unet import UnetPatcher
+
+        class Model(torch.nn.Linear):
+            computation_dtype = torch.float32
+
+        unet = UnetPatcher(Model(2, 2), torch.device("cuda:0"), torch.device("cpu"))
+        with mock.patch.object(mm, "get_free_memory", return_value=0), mock.patch("backend.multi_gpu.replicas.copy.deepcopy") as deepcopy:
+            with self.assertRaisesRegex(UnsupportedReplica, "system memory"):
+                clone_unet_patcher(unet, torch.device("cuda:1"))
+            deepcopy.assert_not_called()
+
+    def test_parallel_batch_rejects_unchecked_or_active_callbacks(self):
+        from backend.sampling import sampling_function as sampling_module
+        from modules import script_callbacks
+        safe = SimpleNamespace(callback=SimpleNamespace(_forge_parallel_batch_safe=lambda: True))
+        active = SimpleNamespace(callback=SimpleNamespace(_forge_parallel_batch_safe=lambda: False))
+        with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [safe]}):
+            self.assertTrue(sampling_module._parallel_batch_callbacks_safe())
+        with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [safe, active]}):
+            self.assertFalse(sampling_module._parallel_batch_callbacks_safe())
+        with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [SimpleNamespace(callback=lambda: None)]}):
+            self.assertFalse(sampling_module._parallel_batch_callbacks_safe())
+
+    def test_cfg1_memory_estimate_uses_single_batch_only_when_explicit(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+        unet = SimpleNamespace(memory_required=mock.Mock(return_value=0), extra_preserved_memory_during_sampling=0,
+                               extra_model_patchers_during_sampling=[], controlnet_linked_list=None, has_online_lora=lambda: False,
+                               model=SimpleNamespace(predictor=SimpleNamespace(percent_to_sigma=lambda value: value)), list_controlnets=lambda: [])
+        x = torch.ones(3, 1, 2, 2)
+        with mock.patch.object(args, "parallel_cfg", None), mock.patch.dict(sampling_module.shared.opts.data, {"batch_cond_uncond": True}), mock.patch.object(mm, "load_models_gpu"), mock.patch.object(sampling_module, "_parallel_cfg_cache", None):
+            for cfg, allowed, expected in ((1.0, True, 3), (1.0, False, 6), (2.0, True, 6), (None, True, 6)):
+                with self.subTest(cfg=cfg, allowed=allowed):
+                    sampling_module.sampling_prepare(unet, x, cfg_scale=cfg, cfg1_single_condition=allowed)
+                    self.assertEqual(unet.memory_required.call_args.args[0][0], expected)
+
+    def test_parallel_batch_does_not_clone_untested_model_types(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+        unet = SimpleNamespace(memory_required=mock.Mock(return_value=0), extra_preserved_memory_during_sampling=0,
+                               extra_model_patchers_during_sampling=[], controlnet_linked_list=None, has_online_lora=lambda: False,
+                               model=SimpleNamespace(predictor=SimpleNamespace(percent_to_sigma=lambda value: value)), list_controlnets=lambda: [])
+        with mock.patch.object(args, "parallel_cfg", None), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(mm, "load_models_gpu"), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch("backend.multi_gpu.replicas.clone_unet_patcher") as clone:
+            sampling_module.sampling_prepare(unet, torch.ones(3, 1, 2, 2), cfg_scale=1.0, cfg1_single_condition=True)
+            self.assertFalse(unet._experimental_cfg_batch_mode)
+            clone.assert_not_called()
+
+    def test_replica_memory_probe_failure_falls_back_to_primary(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+        unet = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 1,
+                               memory_required=mock.Mock(return_value=0), extra_preserved_memory_during_sampling=0,
+                               extra_model_patchers_during_sampling=[], controlnet_linked_list=None, extra_concat_condition=None,
+                               object_patches={}, has_online_lora=lambda: False,
+                               model=SimpleNamespace(predictor=SimpleNamespace(percent_to_sigma=lambda value: value)), list_controlnets=lambda: [])
+        with mock.patch.object(args, "parallel_cfg", None), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(torch.cuda, "device_count", return_value=2), mock.patch.object(sampling_module, "_parallel_batch_model_supported", return_value=True), mock.patch.object(sampling_module, "_parallel_batch_callbacks_safe", return_value=True), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(mm, "get_free_memory", side_effect=RuntimeError("probe failed")), mock.patch.object(mm, "load_models_gpu") as load, mock.patch("backend.multi_gpu.replicas.clone_unet_patcher") as clone:
+            sampling_module.sampling_prepare(unet, torch.ones(3, 1, 2, 2), cfg_scale=1.0, cfg1_single_condition=True)
+            clone.assert_not_called()
+            load.assert_called_once()
+
+    def test_large_model_replica_uses_actual_secondary_memory(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+        gib = 1024 ** 3
+        for free, should_clone in ((8 * gib, False), (12 * gib, True), (24 * gib, True)):
+            with self.subTest(free=free):
+                unet = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 7 * gib,
+                                       memory_required=mock.Mock(return_value=0), extra_preserved_memory_during_sampling=0,
+                                       extra_model_patchers_during_sampling=[], controlnet_linked_list=None, extra_concat_condition=None,
+                                       object_patches={}, has_online_lora=lambda: False,
+                                       model=SimpleNamespace(predictor=SimpleNamespace(percent_to_sigma=lambda value: value)), list_controlnets=lambda: [])
+                replica = object()
+                with mock.patch.object(args, "parallel_cfg", None), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(torch.cuda, "device_count", return_value=2), mock.patch.object(sampling_module, "_parallel_batch_model_supported", return_value=True), mock.patch.object(sampling_module, "_parallel_batch_callbacks_safe", return_value=True), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(mm, "get_free_memory", return_value=free), mock.patch.object(mm, "minimum_inference_memory", return_value=2 * gib), mock.patch.object(mm, "load_models_gpu"), mock.patch("backend.multi_gpu.replicas.clone_unet_patcher", return_value=replica) as clone:
+                    sampling_module.sampling_prepare(unet, torch.ones(3, 1, 2, 2), cfg_scale=1.0, cfg1_single_condition=True)
+                    self.assertEqual(clone.called, should_clone)
+                    self.assertIs(getattr(unet, "_experimental_cfg_replica", None), replica if should_clone else None)
+
+    def test_failed_source_offload_keeps_tracking_and_falls_back(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+
+        model = SimpleNamespace(predictor=SimpleNamespace(percent_to_sigma=lambda value: value))
+        unet = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 1,
+                               memory_required=lambda shape: 0, extra_preserved_memory_during_sampling=0,
+                               extra_model_patchers_during_sampling=[], controlnet_linked_list=None,
+                               extra_concat_condition=None, object_patches={}, has_online_lora=lambda: False,
+                               model=model, list_controlnets=lambda: [])
+        loaded = SimpleNamespace(model=SimpleNamespace(model=model), model_unload=mock.Mock(return_value=False))
+        unrelated = SimpleNamespace(model=SimpleNamespace(model=object()), model_unload=mock.Mock())
+        with mock.patch.object(args, "parallel_cfg", 1), mock.patch.object(mm, "current_loaded_models", [loaded, unrelated]), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(torch.cuda, "device_count", return_value=2), mock.patch.object(mm, "get_free_memory", return_value=10**12), mock.patch.object(mm, "load_models_gpu") as load, mock.patch("backend.multi_gpu.replicas.clone_unet_patcher") as clone:
+            sampling_module.sampling_prepare(unet, torch.ones(1, 1, 2, 2), cfg_scale=2.0)
+            self.assertEqual(mm.current_loaded_models, [loaded, unrelated])
+            loaded.model_unload.assert_called_once()
+            unrelated.model_unload.assert_not_called()
+            clone.assert_not_called()
+            load.assert_called_once()
+
+    def test_cfg1_memory_plan_rejects_complex_or_mutable_conditioning(self):
+        from backend.args import dynamic_args
+        from modules import prompt_parser, script_callbacks, sd_samplers_common
+        unet = SimpleNamespace(controlnet_linked_list=None, extra_concat_condition=None, object_patches={}, extra_model_patchers_during_sampling=[], model_options={"transformer_options": {}})
+        sampler = SimpleNamespace(func=SimpleNamespace(__module__="k_diffusion.sampling"), model_wrap=SimpleNamespace(inner_model=SimpleNamespace(forge_objects=SimpleNamespace(unet=unet))))
+        p = SimpleNamespace(cfg_scale=1.0, is_hr_pass=False, refiner_checkpoint=None, refiner_cfg=None, image_cfg_scale=None)
+        cond = prompt_parser.MulticondLearnedConditioning((2,), [[SimpleNamespace(weight=1.0)], [SimpleNamespace(weight=1.0)]])
+        x = torch.ones(2, 1, 2, 2)
+        check = sd_samplers_common.cfg1_single_condition_eligible
+        with mock.patch.object(dynamic_args, "context_handler", None), mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": []}):
+            self.assertTrue(check(sampler, p, cond, None, x))
+            self.assertFalse(check(sampler, p, cond, object(), x))
+            with mock.patch.object(p, "cfg_scale", 2.0):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            with mock.patch.object(p, "is_hr_pass", True), mock.patch.object(p, "hr_cfg", 2.0, create=True):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            with mock.patch.object(p, "refiner_cfg", 2.0):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            with mock.patch.object(dynamic_args, "ref_latents", [torch.ones(1)]):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            with mock.patch.dict(unet.model_options, {"conditioning_modifiers": [object()]}):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [object()]}):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            safe_callback = SimpleNamespace(callback=SimpleNamespace(_forge_preserves_cfg1_memory_plan=True))
+            with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [safe_callback]}):
+                self.assertTrue(check(sampler, p, cond, None, x))
+            with mock.patch.dict(script_callbacks.callback_map, {"callbacks_cfg_denoiser": [safe_callback, object()]}):
+                self.assertFalse(check(sampler, p, cond, None, x))
+            cond.batch[0].append(SimpleNamespace(weight=1.0))
+            self.assertFalse(check(sampler, p, cond, None, x))
+
     def test_sampler_setup_failures_release_prepared_replica(self):
         from modules import sd_samplers_common, sd_samplers_kdiffusion, sd_samplers_timesteps
         from backend.sampling import sampling_function as sampling_module
@@ -158,6 +294,72 @@ class ParallelPredictionTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2, "two CUDA devices required")
 class SplitLinearTests(unittest.TestCase):
+    def test_parallel_cfg1_batch_preserves_even_and_odd_image_order(self):
+        from backend.args import dynamic_args
+        from backend.sampling.condition import compile_conditions
+        from backend.sampling.sampling_function import sampling_function_inner
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(0.25))
+            def memory_required(self, shape):
+                return 0
+            def apply_model(self, x, timestep, c_crossattn, **kwargs):
+                return x * self.scale + c_crossattn[:, :1, :1, None]
+
+        with mock.patch.object(dynamic_args, "context_handler", None), ReplicaPair(Model(), ("cuda:0", "cuda:1")) as pair:
+            primary, secondary = pair.models
+            adapter = ParallelBatch(primary, secondary, pair.devices)
+            try:
+                for count in (2, 3):
+                    with self.subTest(batch=count):
+                        cond = compile_conditions(torch.arange(count, dtype=torch.float32).reshape(count, 1, 1))
+                        cond[0]["batch_indices"] = list(range(count))
+                        x = torch.arange(count, dtype=torch.float32, device="cuda:0").reshape(count, 1, 1, 1).expand(count, 1, 2, 2)
+                        timestep = torch.ones(count, device="cuda:0")
+                        self.assertTrue(adapter.eligible(cond, None, {}, x))
+                        with torch.inference_mode():
+                            actual = sampling_function_inner(primary, x, timestep, None, cond, 1.0, return_full=True, parallel_cfg=adapter)
+                            expected = sampling_function_inner(primary, x, timestep, None, cond, 1.0, return_full=True)
+                        for observed, reference in zip(actual, expected):
+                            torch.testing.assert_close(observed, reference)
+                        self.assertFalse(adapter.eligible(cond, cond, {}, x))
+                        self.assertFalse(adapter.eligible(cond, None, {"sampler_pre_cfg_function": [object()]}, x))
+            finally:
+                adapter.close()
+
+    def test_parallel_batch_reuses_and_invalidates_conditioning(self):
+        from backend.sampling.condition import compile_conditions
+
+        class Model(torch.nn.Module):
+            def memory_required(self, shape):
+                return 0
+            def apply_model(self, x, timestep, c_crossattn, **kwargs):
+                return x + c_crossattn[:, :1, :1, None]
+
+        with ReplicaPair(Model(), ("cuda:0", "cuda:1")) as pair:
+            adapter = ParallelBatch(*pair.models, pair.devices)
+            source = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1)
+            cond = compile_conditions(source)
+            x = torch.zeros(3, 1, 2, 2, device="cuda:0")
+            timestep = torch.ones(3, device="cuda:0")
+            try:
+                with torch.inference_mode():
+                    first, _ = adapter.predict(cond, None, x, timestep, {})
+                    cached = next(iter(adapter._secondary_cache.values()))
+                    repeated, _ = adapter.predict(cond, None, x, timestep, {})
+                self.assertIs(cached, next(iter(adapter._secondary_cache.values())))
+                torch.testing.assert_close(first, repeated)
+                source.add_(10)
+                with torch.inference_mode():
+                    updated, _ = adapter.predict(cond, None, x, timestep, {})
+                self.assertIsNot(cached, next(iter(adapter._secondary_cache.values())))
+                torch.testing.assert_close(updated, first + 10)
+            finally:
+                adapter.close()
+            self.assertFalse(adapter._secondary_cache)
+
     def test_resident_replica_can_be_evicted_by_memory_manager(self):
         from backend import memory_management as mm
         from backend.args import args
@@ -201,6 +403,25 @@ class SplitLinearTests(unittest.TestCase):
         self.assertNotEqual(replica.model.weight._qdata.data_ptr(), original.model.weight._qdata.data_ptr())
         self.assertNotEqual(replica.model.weight._params.scale.data_ptr(), original.model.weight._params.scale.data_ptr())
 
+    def test_replica_clones_fp8_weights_without_changing_storage(self):
+        from backend.patcher.unet import UnetPatcher
+        from backend.quant_ops import QuantizedTensor
+
+        for layout in ("TensorCoreFP8E4M3Layout", "TensorCoreFP8E5M2Layout"):
+            with self.subTest(layout=layout):
+                class Model(torch.nn.Module):
+                    computation_dtype = torch.float32
+
+                    def __init__(self):
+                        super().__init__()
+                        self.weight = torch.nn.Parameter(QuantizedTensor.from_float(torch.randn(16, 16), layout), requires_grad=False)
+
+                original = UnetPatcher(Model(), torch.device("cuda:0"), torch.device("cpu"))
+                replica = clone_unet_patcher(original, torch.device("cuda:1"))
+                self.assertEqual(replica.model.weight._qdata.dtype, original.model.weight._qdata.dtype)
+                self.assertNotEqual(replica.model.weight._qdata.data_ptr(), original.model.weight._qdata.data_ptr())
+                torch.testing.assert_close(replica.model.weight.dequantize(), original.model.weight.dequantize())
+
     def test_sampling_lifecycle_loads_and_unloads_independent_lora_replica(self):
         from backend import memory_management as mm
         from backend.args import args, dynamic_args
@@ -237,6 +458,11 @@ class SplitLinearTests(unittest.TestCase):
             with self.subTest(online=online), mock.patch.object(args, "parallel_cfg", 1), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(dynamic_args, "ref_latents", []), mock.patch.object(dynamic_args, "context_handler", None):
                 unet = UnetPatcher(Model(), torch.device("cuda:0"), torch.device("cpu"))
                 unet.add_patches({"diffusion_model.weight": (torch.ones(2, 2),)}, strength_patch=0.02, online_mode=online)
+                # A CFG 1 request leaves the primary model resident without a
+                # replica; the next request must still enable parallel CFG.
+                sampling_prepare(unet, x, cfg_scale=1.0)
+                self.assertIsNone(getattr(unet, "_experimental_cfg_replica", None))
+                sampling_cleanup(unet)
                 sampling_prepare(unet, x)
                 try:
                     replica = unet._experimental_cfg_replica
@@ -262,7 +488,8 @@ class SplitLinearTests(unittest.TestCase):
                     sampling_cleanup(unet)
                 unet.add_patches({"diffusion_model.weight": (torch.ones(2, 2),)}, strength_patch=0.01, online_mode=online)
                 sampling_prepare(unet, x)
-                self.assertIsNone(unet._experimental_cfg_replica)
+                self.assertIsNotNone(unet._experimental_cfg_replica)
+                self.assertIsNot(unet._experimental_cfg_replica, replica)
                 self.assertIsNone(sampling_module._parallel_cfg_cache)
                 try:
                     sampling_cleanup(unet)
@@ -289,6 +516,33 @@ class SplitLinearTests(unittest.TestCase):
                 sampling_prepare(unet, torch.ones(1, 1, 2, 2, device="cuda:0"), cfg_scale=1.0)
                 clone.assert_not_called()
             finally:
+                mm.free_memory(float("inf"), torch.device("cuda:0"))
+
+    def test_single_image_followed_by_parallel_batch_creates_replica(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.patcher.unet import UnetPatcher
+        from backend.sampling import sampling_function as sampling_module
+
+        class Model(torch.nn.Linear):
+            computation_dtype = torch.float32
+            predictor = SimpleNamespace(percent_to_sigma=lambda value: value)
+            def get_dtype(self):
+                return torch.float32
+            def memory_required(self, input_shape):
+                return 0
+
+        unet = UnetPatcher(Model(2, 2), torch.device("cuda:0"), torch.device("cpu"))
+        with mock.patch.object(args, "parallel_cfg", 1), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(sampling_module, "_parallel_batch_model_supported", return_value=True), mock.patch.object(sampling_module, "_parallel_batch_callbacks_safe", return_value=True):
+            try:
+                sampling_module.sampling_prepare(unet, torch.ones(1, 1, 2, 2, device="cuda:0"), cfg_scale=1.0, cfg1_single_condition=True)
+                sampling_module.sampling_cleanup(unet)
+                self.assertGreater(unet.loaded_size(), 0)
+                sampling_module.sampling_prepare(unet, torch.ones(2, 1, 2, 2, device="cuda:0"), cfg_scale=1.0, cfg1_single_condition=True)
+                self.assertIsNotNone(unet._experimental_cfg_replica)
+                self.assertIsNot(unet._experimental_cfg_replica.model, unet.model)
+            finally:
+                sampling_module.sampling_cleanup(unet)
                 mm.free_memory(float("inf"), torch.device("cuda:0"))
 
     def test_primary_load_failure_releases_pending_cpu_replica(self):
@@ -424,6 +678,13 @@ class SplitLinearTests(unittest.TestCase):
         self.assertEqual(updated.item(), 2)
         cache["sentinel"] = 1
         adapter._condition_cache(compile_conditions(tensor.clone()), "conditional")
+        self.assertFalse(cache)
+        cache["sentinel"] = 1
+        changed_key = compile_conditions(tensor.clone())
+        adapter._condition_cache(changed_key, "conditional")
+        cache["sentinel"] = 1
+        changed_key[0]["model_conds"]["c_crossattn"].cache_key = ("changed",)
+        adapter._condition_cache(changed_key, "conditional")
         self.assertFalse(cache)
         with torch.inference_mode():
             inference_cond = compile_conditions(torch.ones(1, 1, 1))

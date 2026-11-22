@@ -227,6 +227,25 @@ class AnimaShardingTests(unittest.TestCase):
             model._anima_residency.validate(model)
             mm.free_memory(float("inf"), torch.device("cuda:1"))
 
+    def test_resident_shards_survive_when_other_models_can_be_evicted(self):
+        model = Model().eval()
+        primary, secondary = torch.device("cuda:0"), torch.device("cuda:1")
+        with mock.patch.object(args, "multi_gpu_anima", 1), mock.patch.object(mm, "current_loaded_models", []):
+            patcher = ShardedAnimaPatcher(model, primary, torch.device("cpu"))
+            mm.load_models_gpu([patcher])
+            protected = list(mm.current_loaded_models)
+            with mock.patch.object(patcher, "_runtime_scratch", return_value=0), mock.patch.object(mm, "get_free_memory", side_effect=[100, 0, 100]), mock.patch.object(mm, "free_memory") as reclaim, mock.patch.object(patcher, "detach", wraps=patcher.detach) as detach:
+                patcher.prepare_sharded_load(protected, reserve=10)
+            reclaim.assert_called_once_with(10, secondary, keep_loaded=protected)
+            detach.assert_not_called()
+            model._anima_residency.validate(model)
+            with mock.patch.object(patcher, "_runtime_scratch", return_value=0), mock.patch.object(mm, "get_free_memory", side_effect=[100, 0]), mock.patch.object(mm, "free_memory", side_effect=RuntimeError("reclaim failed")), mock.patch.object(patcher, "detach", wraps=patcher.detach) as detach:
+                with self.assertRaisesRegex(RuntimeError, "reclaim failed"):
+                    patcher.prepare_sharded_load(protected, reserve=10)
+            detach.assert_not_called()
+            model._anima_residency.validate(model)
+            mm.free_memory(float("inf"), secondary)
+
     def test_resident_shards_are_replanned_when_headroom_shrinks(self):
         model = Model().eval()
         primary, secondary = torch.device("cuda:0"), torch.device("cuda:1")
@@ -237,7 +256,7 @@ class AnimaShardingTests(unittest.TestCase):
 
             def free_memory(device, *args, **kwargs):
                 if device == secondary and model._anima_shard is not None:
-                    return 0
+                    return (0, 0) if kwargs.get("torch_free_too") else 0
                 return original_free(device, *args, **kwargs)
 
             with mock.patch.object(mm, "get_free_memory", side_effect=free_memory), mock.patch.object(patcher, "detach", wraps=patcher.detach) as detach:

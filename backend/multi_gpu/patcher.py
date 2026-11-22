@@ -75,21 +75,38 @@ class ShardedModelPatcher(UnetPatcher):
         if self.object_patches:
             raise RuntimeError("Multi-GPU does not support object patches")
         if self.model._anima_shard:
-            rebuild = (force_patch_weights or self.model.current_weight_patches_uuid != self.patches_uuid
-                       or getattr(self.model, "_multi_gpu_force_cast_weights", None) != self.force_cast_weights)
+            reason = None
+            if force_patch_weights:
+                reason = "forced weight patching"
+            elif self.model.current_weight_patches_uuid != self.patches_uuid:
+                reason = "weight patch revision changed"
+            elif getattr(self.model, "_multi_gpu_force_cast_weights", None) != self.force_cast_weights:
+                reason = "weight casting changed"
             residency = getattr(self.model, "_anima_residency", None)
-            if not rebuild:
+            if reason is None:
                 try:
                     if residency is None:
                         raise ValueError("Missing multi-GPU residency record")
                     residency.validate(self.model)
-                except ValueError:
-                    rebuild = True
-            if not rebuild:
+                except ValueError as error:
+                    reason = f"invalid residency: {error}"
+            if reason is None:
                 scratch = self._runtime_scratch()
-                rebuild = any(mm.get_free_memory(device) < reserve + scratch for device in (self.load_device, self.secondary_device))
-            if rebuild:
+                for device in (self.load_device, self.secondary_device):
+                    free = mm.get_free_memory(device)
+                    if free < reserve + scratch:
+                        # Reclaim other models before discarding a valid
+                        # sharded placement. The active model stays protected.
+                        mm.free_memory(reserve + scratch, device, keep_loaded=keep_loaded)
+                        free = mm.get_free_memory(device)
+                    if free < reserve + scratch:
+                        reason = f"insufficient headroom on {device}: {free} bytes free, {reserve + scratch} required"
+                        break
+            if reason is not None:
+                mm.logger.debug("Rebuilding sharded model: %s", reason)
                 self.detach()
+            else:
+                mm.logger.debug("Reusing sharded model with verified residency on %s and %s", self.load_device, self.secondary_device)
         if isinstance(self.model.diffusion_model, SingleStreamDiT) and not self.model._anima_shard:
             # Krea's text encoder can otherwise occupy several GiB while the
             # denoiser is resident. Release it before budgeting both cards.
