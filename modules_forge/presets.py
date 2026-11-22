@@ -11,7 +11,6 @@ class PresetArch(Enum):
     zit = 7  # Z-Image-Turbo
     wan = 8  # Wan2.2
     anima = 9  # Anima
-    ernie = 10  # Ernie-Image
     pid = 11  # PiD
     krea = 12  # Krea2
     qwen21 = 15  # Qwen-Image-2.1
@@ -34,7 +33,6 @@ SAMPLERS = {
     PresetArch.zit: "Euler",
     PresetArch.wan: "Euler",
     PresetArch.anima: "ER SDE",
-    PresetArch.ernie: "Euler",
     PresetArch.pid: "LCM",
     PresetArch.krea: "Euler",
     PresetArch.qwen21: "Euler",
@@ -53,7 +51,6 @@ SCHEDULERS = {
     PresetArch.zit: "Beta",
     PresetArch.wan: "Simple",
     PresetArch.anima: "Beta",
-    PresetArch.ernie: "Simple",
     PresetArch.pid: "Simple",
     PresetArch.krea: "Simple",
     PresetArch.qwen21: "Simple",
@@ -72,7 +69,6 @@ STEPS = {
     PresetArch.zit: 9,
     PresetArch.wan: 4,
     PresetArch.anima: 32,
-    PresetArch.ernie: 8,
     PresetArch.pid: 4,
     PresetArch.krea: 8,
     PresetArch.qwen21: 32,
@@ -91,7 +87,6 @@ CFG = {
     PresetArch.zit: 1.0,
     PresetArch.wan: 1.0,
     PresetArch.anima: 4.0,
-    PresetArch.ernie: 1.0,
     PresetArch.pid: 1.0,
     PresetArch.krea: 1.0,
     PresetArch.qwen21: 2.5,
@@ -110,7 +105,6 @@ SHIFT = {
     PresetArch.zit: 9.0,
     PresetArch.wan: 5.0,
     PresetArch.anima: 3.0,
-    PresetArch.ernie: 3.0,
     PresetArch.pid: -1.5,
     PresetArch.krea: -1.15,
     PresetArch.moss: 5.0,
