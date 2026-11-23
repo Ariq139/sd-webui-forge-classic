@@ -660,7 +660,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             unet_config = guess.unet_config.copy()
             state_dict_parameters = utils.calculate_parameters(state_dict)
             quant_config = "nunchaku" if guess.nunchaku else detect_quantization(state_dict, is_unet=True)
-            if guess.nunchaku and backend.args.args.multi_gpu_anima is not None:
+            auto_multi_gpu = backend.args.args.multi_gpu_auto and backend.args.args.multi_gpu_anima is not None
+            if guess.nunchaku and backend.args.args.multi_gpu_anima is not None and not auto_multi_gpu:
                 raise ValueError("Multi-GPU does not support Nunchaku models")
             sharded_model = cls_name in ("CosmosTransformer3DModel", "Krea2Transformer2DModel", "FluxTransformer2DModel", "Flux2Transformer2DModel", "UNet2DConditionModel", "MOSSImageTransformer", "QwenImageTransformer2DModel", "QwenImage21Transformer2DModel", "WanTransformer3DModel", "Lumina2Transformer2DModel", "ZImageTransformer2DModel", "ErnieImageTransformer2DModel", "ChromaTransformer2DModel", "PiDTransformer2DModel") and backend.args.args.multi_gpu_anima is not None
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
@@ -672,6 +673,29 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             parallel_model = (not guess.nunchaku and cfg_device is not None and 0 <= cfg_device < torch.cuda.device_count()
                               and torch.device("cuda", cfg_device) != load_device and not backend.args.args.bf16_unet
                               and override_dtype != torch.bfloat16)
+            auto_mode = None
+            if auto_multi_gpu:
+                from backend.multi_gpu.precision import automatic_multi_gpu_mode
+                secondary_index = backend.args.args.multi_gpu_anima
+                valid_devices = (load_device.type == "cuda" and 0 <= secondary_index < torch.cuda.device_count()
+                                 and torch.device("cuda", secondary_index) != load_device)
+                can_shard = bool(sharded_model and valid_devices and not guess.nunchaku)
+                can_replicate = bool(parallel_model and cls_name in batch_classes and valid_devices
+                                     and cfg_device == secondary_index)
+                try:
+                    if not valid_devices:
+                        raise ValueError("two distinct CUDA devices are required")
+                    free_gpu = [memory_management.get_free_memory(load_device),
+                                memory_management.get_free_memory(torch.device("cuda", secondary_index))]
+                    free_host = memory_management.get_free_memory(torch.device("cpu"))
+                    auto_mode = automatic_multi_gpu_mode(state_dict, free_gpu, free_host, memory_management.minimum_inference_memory(),
+                                                         replicas_supported=can_replicate, sharding_supported=can_shard)
+                except Exception:
+                    logger.exception("Automatic multi-GPU memory check failed; using a single device")
+                    auto_mode = "single"
+                sharded_model = auto_mode == "sharding"
+                parallel_model = auto_mode == "replicas"
+                logger.info("Automatic multi-GPU selected %s for %s", auto_mode, cls_name)
             if parallel_model and not sharded_model and not backend.args.args.force_fp16:
                 # Keep the existing single-device precision if a full replica
                 # cannot fit even before activation memory is considered.
@@ -755,6 +779,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = model_loader(unet_config)
 
             model = pre_func(model)
+            if auto_mode is not None:
+                model._forge_auto_multi_gpu_mode = auto_mode
             model.storage_dtype = storage_dtype
             load_state_dict(model, state_dict)
             # model = post_func(model)

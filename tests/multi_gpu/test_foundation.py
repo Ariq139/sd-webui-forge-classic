@@ -6,10 +6,81 @@ import torch
 
 from backend.multi_gpu.planner import Budget, contiguous_split
 from backend.multi_gpu.residency import Residency
-from backend.multi_gpu.precision import replica_compute_dtype, replica_fits_memory, replica_memory_requirement, sharded_compute_dtype
+from backend.multi_gpu.precision import automatic_multi_gpu_mode, replica_compute_dtype, replica_fits_memory, replica_memory_requirement, sharded_compute_dtype
 
 
 class MultiGpuFoundationTests(unittest.TestCase):
+    def test_multi_gpu_option_enables_automatic_paths(self):
+        from backend.args import configure_multi_gpu, parser
+
+        automatic = configure_multi_gpu(parser.parse_args(["--multi-gpu"]))
+        self.assertEqual(automatic.multi_gpu_anima, 1)
+        self.assertTrue(automatic.multi_gpu_auto)
+        self.assertEqual(automatic.parallel_cfg, 1)
+        self.assertEqual(automatic.parallel_batch, 1)
+        self.assertTrue(automatic.parallel_batch_adaptive)
+        self.assertTrue(automatic.parallel_cfg_keep_resident)
+        selected = configure_multi_gpu(parser.parse_args(["--multi-gpu", "3"]))
+        self.assertEqual((selected.multi_gpu_anima, selected.parallel_cfg, selected.parallel_batch), (3, 3, 3))
+        sharded = configure_multi_gpu(parser.parse_args(["--multi-gpu", "--multi-gpu-sharding"]))
+        self.assertFalse(sharded.multi_gpu_auto)
+        self.assertIsNone(sharded.parallel_cfg)
+        self.assertIsNone(sharded.parallel_batch)
+        off = configure_multi_gpu(parser.parse_args([]))
+        self.assertIsNone(off.multi_gpu_anima)
+        self.assertFalse(off.multi_gpu_auto)
+
+    def test_automatic_mode_uses_each_device_and_host_memory(self):
+        gib = 1024 ** 3
+        state = {"weight": torch.empty((7 * gib,), dtype=torch.uint8, device="meta")}
+        def choose(gpus, host=32 * gib, replicas=True, sharding=True):
+            return automatic_multi_gpu_mode(state, gpus, host, int(1.2 * gib), replicas_supported=replicas, sharding_supported=sharding)
+        self.assertEqual(choose([8 * gib, 8 * gib]), "sharding")
+        self.assertEqual(choose([12 * gib, 24 * gib]), "replicas")
+        self.assertEqual(choose([24 * gib, 8 * gib]), "sharding")
+        self.assertEqual(choose([12 * gib, 12 * gib], host=7 * gib), "sharding")
+        self.assertEqual(choose([24 * gib, 24 * gib], replicas=False), "sharding")
+        self.assertEqual(choose([8 * gib, 8 * gib], sharding=False), "single")
+
+    def test_automatic_mode_uses_checkpoint_size_not_model_family(self):
+        gib = 1024 ** 3
+        for family, checkpoint_size, expected in (
+            ("large Anima", 7 * gib, "sharding"),
+            ("small Krea", 2 * gib, "replicas"),
+            ("small Anima", 2 * gib, "replicas"),
+            ("large Krea", 7 * gib, "sharding"),
+        ):
+            with self.subTest(model=family):
+                state = {"weight": torch.empty((checkpoint_size,), dtype=torch.uint8, device="meta")}
+                self.assertEqual(
+                    automatic_multi_gpu_mode(state, [8 * gib, 8 * gib], 32 * gib, int(1.2 * gib),
+                                             replicas_supported=True, sharding_supported=True),
+                    expected,
+                )
+
+    def test_automatic_mode_checks_memory_boundaries_and_unknown_sizes(self):
+        gib = 1024 ** 3
+        reserve = gib
+        for model_size in (gib, 3 * gib, 7 * gib, 15 * gib):
+            state = {"weight": torch.empty(model_size, dtype=torch.uint8, device="meta")}
+            required = model_size + reserve
+            host_required = model_size + 512 * 1024 ** 2
+            with self.subTest(size=model_size):
+                for gpus, host, expected in (
+                    ([required, required], host_required, "replicas"),
+                    ([required - 1, required], host_required, "sharding"),
+                    ([required, required - 1], host_required, "sharding"),
+                    ([required, required], host_required - 1, "sharding"),
+                ):
+                    self.assertEqual(automatic_multi_gpu_mode(state, gpus, host, reserve, replicas_supported=True, sharding_supported=True), expected)
+        for state, gpus, host, reserve in (
+            ({}, [8 * gib, 8 * gib], 32 * gib, gib),
+            ({"weight": torch.ones(1)}, [8 * gib], 32 * gib, gib),
+            ({"weight": torch.ones(1)}, [8 * gib, -1], 32 * gib, gib),
+            ({"weight": torch.ones(1)}, [8 * gib, 8 * gib], -1, gib),
+            ({"weight": torch.ones(1)}, [8 * gib, 8 * gib], 32 * gib, -1),
+        ):
+            self.assertEqual(automatic_multi_gpu_mode(state, gpus, host, reserve, replicas_supported=True, sharding_supported=True), "single")
     def test_replica_memory_preflight_scales_to_larger_cards(self):
         gib = 1024 ** 3
         state = {"weight": torch.empty((7 * gib,), dtype=torch.uint8, device="meta"), "metadata": "ignored"}

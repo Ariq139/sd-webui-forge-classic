@@ -13,6 +13,26 @@ from backend.multi_gpu.replicas import ReplicaPair, UnsupportedReplica, clone_un
 
 
 class ParallelPredictionTests(unittest.TestCase):
+    def test_automatic_placement_routes_to_the_selected_patcher(self):
+        from backend.args import args
+        from backend.nn.anima import Anima
+        from backend.patcher.unet import UnetPatcher
+
+        diffusion = Anima.__new__(Anima)
+        torch.nn.Module.__init__(diffusion)
+        diffusion.load_device = torch.device("cuda:0")
+        diffusion.initial_device = diffusion.offload_device = torch.device("cpu")
+        wrapped = SimpleNamespace(diffusion_model=diffusion)
+        with mock.patch.object(args, "multi_gpu_anima", 1), mock.patch("backend.patcher.unet.KModel", return_value=wrapped), mock.patch("backend.multi_gpu.patcher.ShardedModelPatcher") as sharded:
+            for mode in ("replicas", "single"):
+                with self.subTest(mode=mode):
+                    diffusion._forge_auto_multi_gpu_mode = mode
+                    self.assertIsInstance(UnetPatcher.from_model(diffusion, None, None), UnetPatcher)
+                    sharded.assert_not_called()
+            diffusion._forge_auto_multi_gpu_mode = "sharding"
+            self.assertIs(UnetPatcher.from_model(diffusion, None, None), sharded.return_value)
+            sharded.assert_called_once()
+
     def test_adaptive_split_requires_samples_and_memory(self):
         pair = BatchSplitProfile(2)
         self.assertEqual(pair.choose(lambda split: self.fail("a two-image batch has no alternative split")), 1)
@@ -141,6 +161,106 @@ class ParallelPredictionTests(unittest.TestCase):
             unrelated.model_unload.assert_not_called()
             clone.assert_not_called()
             load.assert_called_once()
+
+    def test_automatic_modes_do_not_clone_when_replicas_are_not_selected(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+
+        for mode in ("sharding", "single"):
+            with self.subTest(mode=mode):
+                model = SimpleNamespace(diffusion_model=SimpleNamespace(_forge_auto_multi_gpu_mode=mode), predictor=SimpleNamespace(percent_to_sigma=lambda value: value))
+                unet = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 1,
+                                       memory_required=lambda shape: 0, extra_preserved_memory_during_sampling=0,
+                                       extra_model_patchers_during_sampling=[], controlnet_linked_list=None,
+                                       extra_concat_condition=None, object_patches={}, has_online_lora=lambda: False,
+                                       model=model, list_controlnets=lambda: [])
+                with mock.patch.object(args, "parallel_cfg", 1), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(sampling_module, "_parallel_batch_model_supported", return_value=True), mock.patch.object(sampling_module, "_parallel_batch_callbacks_safe", return_value=True), mock.patch.object(mm, "load_models_gpu") as load, mock.patch("backend.multi_gpu.replicas.clone_unet_patcher") as clone:
+                    sampling_module.sampling_prepare(unet, torch.ones(2, 1, 2, 2), cfg_scale=1.0, cfg1_single_condition=True)
+                    clone.assert_not_called()
+                    load.assert_called_once()
+
+    def test_automatic_replica_copy_failure_runs_primary_model(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.sampling import sampling_function as sampling_module
+
+        model = SimpleNamespace(diffusion_model=SimpleNamespace(_forge_auto_multi_gpu_mode="replicas"), predictor=SimpleNamespace(percent_to_sigma=lambda value: value))
+        unet = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 1,
+                               memory_required=lambda shape: 0, extra_preserved_memory_during_sampling=0,
+                               extra_model_patchers_during_sampling=[], controlnet_linked_list=None,
+                               extra_concat_condition=None, object_patches={}, has_online_lora=lambda: False,
+                               model=model, list_controlnets=lambda: [])
+        with mock.patch.object(args, "parallel_cfg", 1), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(sampling_module, "_parallel_cfg_cache", None), mock.patch.object(torch.cuda, "device_count", return_value=2), mock.patch.object(mm, "get_free_memory", return_value=10**12), mock.patch.object(mm, "load_models_gpu") as load, mock.patch("backend.multi_gpu.replicas.clone_unet_patcher", side_effect=UnsupportedReplica("injected failure")) as clone:
+            sampling_module.sampling_prepare(unet, torch.ones(1, 1, 2, 2), cfg_scale=2.0)
+            clone.assert_called_once()
+            self.assertIsNone(getattr(unet, "_experimental_cfg_replica", None))
+            self.assertIs(load.call_args.kwargs["models"][0], unet)
+
+    def test_auto_sharded_fallback_copies_and_refreshes_patcher_state(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.patcher.unet import UnetPatcher
+        from backend.sampling import sampling_function as sampling_module
+
+        class ToyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.diffusion_model = torch.nn.Linear(2, 2)
+                self.diffusion_model._forge_auto_multi_gpu_mode = "replicas"
+                self.computation_dtype = torch.float32
+
+        model = ToyModel()
+        unet = UnetPatcher(model, torch.device("cuda:0"), torch.device("cpu"))
+        unet.add_patches({"diffusion_model.weight": (torch.ones_like(model.diffusion_model.weight),)}, strength_patch=0.25)
+        with mock.patch.object(args, "multi_gpu_anima", 1), mock.patch.object(torch.cuda, "device_count", return_value=2), mock.patch.object(mm, "current_loaded_models", []):
+            fallback = sampling_module._auto_sharded_fallback(unet)
+            self.assertIs(fallback.model, model)
+            self.assertEqual(fallback.patches_uuid, unet.patches_uuid)
+            self.assertEqual(fallback.patches.keys(), unet.patches.keys())
+            self.assertIs(sampling_module._auto_sharded_fallback(unet), fallback)
+            unet.add_patches({"diffusion_model.weight": (torch.ones_like(model.diffusion_model.weight),)}, strength_patch=0.1)
+            updated = sampling_module._auto_sharded_fallback(unet)
+            self.assertIsNot(updated, fallback)
+            self.assertEqual(updated.patches_uuid, unet.patches_uuid)
+            self.assertEqual(len(updated.patches["diffusion_model.weight"]), 2)
+            unet.add_patches({"diffusion_model.bias": (torch.ones_like(model.diffusion_model.bias),)}, strength_patch=0.1, online_mode=True)
+            online = sampling_module._auto_sharded_fallback(unet)
+            self.assertIsNot(online, updated)
+            self.assertEqual(online.patches_uuid, unet.patches_uuid)
+            self.assertEqual(online.weight_wrapper_patches.keys(), unet.weight_wrapper_patches.keys())
+            original_revision = unet.patches_uuid
+            unet.weight_wrapper_patches["diffusion_model.bias"].append(object())
+            self.assertEqual(unet.patches_uuid, original_revision)
+            self.assertIsNot(sampling_module._auto_sharded_fallback(unet), online)
+
+    def test_failed_sharded_fallback_restores_primary(self):
+        from backend import memory_management as mm
+        from backend.sampling import sampling_function as sampling_module
+
+        model = SimpleNamespace(_anima_shard=None)
+        unet = SimpleNamespace(model=model)
+        fallback = SimpleNamespace(detach=mock.Mock())
+        model._forge_auto_sharded_fallback = fallback
+        with mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(mm.logger, "exception"), mock.patch.object(mm, "load_models_gpu", side_effect=[torch.OutOfMemoryError("injected"), None]) as load:
+            self.assertFalse(sampling_module._load_auto_sharded_fallback(unet, fallback, 123))
+            fallback.detach.assert_called_once()
+            self.assertIsNone(model._forge_auto_sharded_fallback)
+            self.assertEqual(load.call_args_list[0].args[0], [fallback])
+            self.assertEqual(load.call_args_list[1].args[0], [unet])
+
+    def test_late_replica_memory_failure_attempts_sharding(self):
+        from backend import memory_management as mm
+        from backend.multi_gpu.parallel import ParallelCFG
+        from backend.sampling import sampling_function as sampling_module
+
+        replica = SimpleNamespace(patches_uuid="revision", load_device=torch.device("cuda:1"), model_size=lambda: 1)
+        unet = SimpleNamespace(_experimental_cfg_replica=replica, patches_uuid="revision", model=SimpleNamespace(model_lowvram=False), loaded_size=lambda: 1, model_size=lambda: 1, memory_required=lambda shape: 1, extra_preserved_memory_during_sampling=0, object_patches={}, controlnet_linked_list=None, extra_model_patchers_during_sampling=[], extra_concat_condition=None)
+        fallback = object()
+        with mock.patch.object(ParallelCFG, "eligible", return_value=True), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(mm, "get_free_memory", return_value=0), mock.patch.object(sampling_module, "_auto_sharded_fallback", return_value=fallback), mock.patch.object(sampling_module, "_load_auto_sharded_fallback") as load:
+            self.assertIsNone(sampling_module._load_parallel_cfg(unet, [], [], {}, torch.ones(1, 1, 2, 2)))
+            self.assertIsNone(unet._experimental_cfg_replica)
+            self.assertIs(load.call_args.args[1], fallback)
 
     def test_cfg1_memory_plan_rejects_complex_or_mutable_conditioning(self):
         from backend.args import dynamic_args

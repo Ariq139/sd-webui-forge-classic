@@ -12,6 +12,18 @@ def replica_fits_memory(state_dict, free_bytes, reserve_bytes):
     return free_bytes >= replica_memory_requirement(state_dict, reserve_bytes)
 
 
+def automatic_multi_gpu_mode(state_dict, gpu_free_bytes, host_free_bytes, reserve_bytes, *, replicas_supported, sharding_supported):
+    """Choose a conservative placement from current memory, not GPU capacity labels."""
+    size = replica_memory_requirement(state_dict, 0)
+    if size <= 0 or len(gpu_free_bytes) != 2 or reserve_bytes < 0 or host_free_bytes < 0 or any(free < 0 for free in gpu_free_bytes):
+        return "single"
+    if (replicas_supported
+            and all(free >= size + reserve_bytes for free in gpu_free_bytes)
+            and host_free_bytes >= size + 512 * 1024 ** 2):
+        return "replicas"
+    return "sharding" if sharding_supported else "single"
+
+
 def sharded_compute_dtype(primary_dtype, supported_dtypes):
     """Keep FP32 requests and avoid FP16 for models that do not support it."""
     if primary_dtype == torch.float32 or torch.float16 not in supported_dtypes:

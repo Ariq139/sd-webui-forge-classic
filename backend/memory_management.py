@@ -552,18 +552,19 @@ class LoadedModel:
         ):
             return model.model
 
-        self.model.model_patches_to(self.device)
-        self.model.model_patches_to(self.model.model_dtype())
+        with torch.cuda.device(self.device) if is_device_cuda(self.device) else nullcontext():
+            self.model.model_patches_to(self.device)
+            self.model.model_patches_to(self.model.model_dtype())
 
-        # if self.model.loaded_size() > 0:
-        use_more_vram = lowvram_model_memory
-        if use_more_vram == 0:
-            use_more_vram = 1e32
-        self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
+            # if self.model.loaded_size() > 0:
+            use_more_vram = lowvram_model_memory
+            if use_more_vram == 0:
+                use_more_vram = 1e32
+            self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
 
-        real_model = self.model.model
+            real_model = self.model.model
 
-        bake_gguf_model(real_model)
+            bake_gguf_model(real_model)
 
         self.real_model = weakref.ref(real_model)
         if self.model_finalizer is not None:
@@ -595,7 +596,8 @@ class LoadedModel:
         return True
 
     def model_use_more_vram(self, extra_memory, force_patch_weights=False):
-        return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
+        with torch.cuda.device(self.device) if is_device_cuda(self.device) else nullcontext():
+            return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
 
     def __eq__(self, other):
         return self.model is other.model
@@ -780,7 +782,12 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
                 try:
                     requirements = loaded_model.model.device_memory_requirements(extra_mem)
                 except InsufficientDeviceMemory as error:
-                    raise torch.OutOfMemoryError("Multi-GPU model placement cannot fit within the available device memory") from error
+                    if not hasattr(loaded_model.model, "enable_cpu_offload_retry"):
+                        raise torch.OutOfMemoryError("Multi-GPU model placement cannot fit within the available device memory") from error
+                    try:
+                        requirements = loaded_model.model.device_memory_requirements(extra_mem, allow_offload=True)
+                    except InsufficientDeviceMemory as offload_error:
+                        raise torch.OutOfMemoryError("Multi-GPU model placement cannot fit even with CPU offloading") from offload_error
             sharded_devices.update(requirements)
         else:
             requirements = {loaded_model.device: loaded_model.model_memory_required(loaded_model.device)}

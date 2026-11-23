@@ -50,6 +50,25 @@ class ModelResidencyTests(unittest.TestCase):
         load.assert_called_once()
         self.assertEqual(p.loaded_size(), p.model_size())
 
+    def test_revisiting_resident_weight_does_not_apply_lora_twice(self):
+        from backend.operations import using_forge_operations
+        from backend.patcher.base import LowVramPatch
+
+        with using_forge_operations(device=torch.device("cpu"), dtype=torch.float32):
+            model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+        torch.nn.init.eye_(model[0].weight)
+        p = ModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+        p.add_patches({"0.weight": (torch.ones_like(model[0].weight),)}, strength_patch=0.1)
+        p.load(torch.device("cpu"), lowvram_model_memory=100000, full_load=True)
+        expected = model(torch.ones(1, 4)).detach().clone()
+        # A later budget calculation can classify an already-loaded module as
+        # low-VRAM. Its merged weight must not also get a low-VRAM callback.
+        p.load(torch.device("cpu"), lowvram_model_memory=1, full_load=False)
+        self.assertTrue(model[0].forge_patched_weights)
+        self.assertFalse(any(isinstance(f, LowVramPatch) for f in model[0].weight_function))
+        torch.testing.assert_close(model(torch.ones(1, 4)), expected)
+        self.assertEqual(p.loaded_size(), p.model_size())
+
     def test_gguf_resident_weights_are_not_rebaked(self):
         from backend.operations_gguf import ParameterGGUF
         from gguf import GGMLQuantizationType

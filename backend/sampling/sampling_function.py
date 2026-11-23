@@ -603,6 +603,139 @@ def _release_parallel_cfg(unet, preserve_cpu=False):
         _parallel_cfg_cache = (weakref.ref(unet.model, _clear_parallel_cfg_cache), replica)
 
 
+def _auto_sharded_fallback(unet):
+    """Create or reuse a sharded patcher for an automatic replica placement."""
+    from backend.patcher.unet import UnetPatcher
+    from backend.multi_gpu.patcher import ShardedModelPatcher
+
+    model = getattr(unet, "model", None)
+    diffusion = getattr(model, "diffusion_model", None)
+    if (type(unet) is not UnetPatcher or getattr(diffusion, "_forge_auto_multi_gpu_mode", None) != "replicas"
+            or args.multi_gpu_anima is None or not _parallel_cfg_patcher_eligible(unet)
+            or getattr(unet, "_experimental_cfg_needs_rollback", False)):
+        return None
+    previous = getattr(model, "_forge_auto_sharded_fallback", None)
+    wrappers_match = (previous is not None and previous.weight_wrapper_patches.keys() == unet.weight_wrapper_patches.keys()
+                      and all(len(previous.weight_wrapper_patches[key]) == len(values)
+                              and all(old is new for old, new in zip(previous.weight_wrapper_patches[key], values))
+                              for key, values in unet.weight_wrapper_patches.items()))
+    if (previous is not None and previous.patches_uuid == unet.patches_uuid
+            and previous.force_cast_weights == unet.force_cast_weights and wrappers_match):
+        previous.model_options = utils.deepcopy_(unet.model_options)
+        previous.extra_preserved_memory_during_sampling = unet.extra_preserved_memory_during_sampling
+        return previous
+    # A source may be tracked by a different clone of this patcher. Restore its
+    # original weights before handing ownership to the sharded patcher.
+    for loaded in list(memory_management.current_loaded_models):
+        owner = loaded.model
+        if owner is not None and owner.model is model:
+            if not loaded.model_unload():
+                return None
+            memory_management.current_loaded_models.remove(loaded)
+    try:
+        fallback = ShardedModelPatcher(model, unet.load_device, unet.offload_device, unet.model_size(),
+                                       current_device=unet.current_device, weight_inplace_update=unet.weight_inplace_update)
+    except (ValueError, RuntimeError):
+        memory_management.logger.exception("Could not prepare the automatic sharded fallback")
+        return None
+    fallback.patches = {key: value[:] for key, value in unet.patches.items()}
+    fallback.weight_wrapper_patches = {key: value[:] for key, value in unet.weight_wrapper_patches.items()}
+    fallback.patches_uuid = unet.patches_uuid
+    fallback.model_options = utils.deepcopy_(unet.model_options)
+    fallback.force_cast_weights = unet.force_cast_weights
+    fallback.controlnet_linked_list = unet.controlnet_linked_list
+    fallback.extra_preserved_memory_during_sampling = unet.extra_preserved_memory_during_sampling
+    fallback.extra_model_patchers_during_sampling = unet.extra_model_patchers_during_sampling.copy()
+    fallback.extra_concat_condition = unet.extra_concat_condition
+    model._forge_auto_sharded_fallback = fallback
+    memory_management.logger.info("Using automatic model sharding after replica setup failed")
+    return fallback
+
+
+def _load_auto_sharded_fallback(unet, fallback, memory_required, minimum_memory_required=None):
+    """Load shards or restore the ordinary patcher if sharding cannot fit."""
+    try:
+        memory_management.load_models_gpu([fallback], memory_required=memory_required,
+                                          minimum_memory_required=minimum_memory_required)
+        if not getattr(unet.model, "_anima_shard", None):
+            raise RuntimeError("The sharded model was not loaded")
+        return True
+    except Exception:
+        memory_management.logger.exception("Automatic sharding failed; restoring the normal model")
+        tracked = False
+        for loaded in list(memory_management.current_loaded_models):
+            if loaded.model is fallback:
+                tracked = True
+                if not loaded.model_unload():
+                    raise RuntimeError("Could not unload the failed sharded fallback")
+                memory_management.current_loaded_models.remove(loaded)
+        if not tracked:
+            fallback.detach()
+        unet.model._forge_auto_sharded_fallback = None
+        memory_management.load_models_gpu([unet], memory_required=memory_required,
+                                          minimum_memory_required=minimum_memory_required)
+        return False
+
+
+def _auto_single_device_fallback(unet):
+    """Use the normal offloading patcher when automatic sharding cannot fit."""
+    from backend.multi_gpu.patcher import ShardedModelPatcher
+    from backend.patcher.unet import UnetPatcher
+
+    model = getattr(unet, "model", None)
+    diffusion = getattr(model, "diffusion_model", None)
+    if not isinstance(unet, ShardedModelPatcher) or getattr(diffusion, "_forge_auto_multi_gpu_mode", None) != "sharding":
+        return None
+    previous = getattr(model, "_forge_auto_single_fallback", None)
+    wrappers_match = (previous is not None and previous.weight_wrapper_patches.keys() == unet.weight_wrapper_patches.keys()
+                      and all(len(previous.weight_wrapper_patches[key]) == len(values)
+                              and all(old is new for old, new in zip(previous.weight_wrapper_patches[key], values))
+                              for key, values in unet.weight_wrapper_patches.items()))
+    objects_match = (previous is not None and previous.object_patches.keys() == unet.object_patches.keys()
+                     and all(previous.object_patches[key] is value for key, value in unet.object_patches.items()))
+    if (previous is not None and previous.patches_uuid == unet.patches_uuid
+            and previous.force_cast_weights == unet.force_cast_weights and wrappers_match
+            and objects_match):
+        previous.model_options = utils.deepcopy_(unet.model_options)
+        return previous
+
+    tracked = False
+    for loaded in list(memory_management.current_loaded_models):
+        owner = loaded.model
+        if owner is not None and owner.model is model:
+            tracked = True
+            if not loaded.model_unload():
+                raise RuntimeError("Could not unload the model before single-device fallback")
+            memory_management.current_loaded_models.remove(loaded)
+    if not tracked and (getattr(model, "_anima_shard", None) or unet.loaded_size()):
+        unet.detach()
+
+    fallback = UnetPatcher(model, unet.load_device, unet.offload_device, unet.model_size(),
+                           current_device=unet.offload_device, weight_inplace_update=unet.weight_inplace_update)
+    fallback.patches = {key: value[:] for key, value in unet.patches.items()}
+    fallback.weight_wrapper_patches = {key: value[:] for key, value in unet.weight_wrapper_patches.items()}
+    fallback.patches_uuid = unet.patches_uuid
+    fallback.model_options = utils.deepcopy_(unet.model_options)
+    fallback.object_patches = unet.object_patches.copy()
+    fallback.force_cast_weights = unet.force_cast_weights
+    fallback.controlnet_linked_list = unet.controlnet_linked_list
+    fallback.extra_preserved_memory_during_sampling = unet.extra_preserved_memory_during_sampling
+    fallback.extra_model_patchers_during_sampling = unet.extra_model_patchers_during_sampling.copy()
+    fallback.extra_concat_condition = unet.extra_concat_condition
+    model._forge_auto_single_fallback = fallback
+    return fallback
+
+
+def _fallback_after_replica_load_failure(unet, x):
+    _release_parallel_cfg(unet)
+    if getattr(unet, "_experimental_cfg_replica", None) is not None:
+        return
+    fallback = _auto_sharded_fallback(unet)
+    if fallback is not None:
+        required = unet.memory_required(list(x.shape)) + unet.extra_preserved_memory_during_sampling
+        _load_auto_sharded_fallback(unet, fallback, required)
+
+
 def _load_parallel_cfg(unet, cond, uncond, model_options, x, batch_mode=False):
     from backend.multi_gpu.parallel import ParallelBatch, ParallelCFG
 
@@ -617,19 +750,25 @@ def _load_parallel_cfg(unet, cond, uncond, model_options, x, batch_mode=False):
         return None
     if (replica.patches_uuid != unet.patches_uuid or not _parallel_cfg_patcher_eligible(unet)
             or unet.model.model_lowvram or unet.loaded_size() < unet.model_size()):
-        _release_parallel_cfg(unet)
+        _fallback_after_replica_load_failure(unet, x)
         return None
     try:
         resident = replica.loaded_size() if getattr(replica, "current_device", None) == replica.load_device else 0
         required = max(0, replica.model_size() - resident) + memory_management.minimum_inference_memory() + unet.memory_required(list(x.shape))
-        if memory_management.get_free_memory(replica.load_device) < required:
-            _release_parallel_cfg(unet)
+        try:
+            available = memory_management.get_free_memory(replica.load_device)
+        except Exception:
+            memory_management.logger.exception("Could not check replica memory")
+            _fallback_after_replica_load_failure(unet, x)
+            return None
+        if available < required:
+            _fallback_after_replica_load_failure(unet, x)
             return None
         unet._experimental_cfg_loading = True
         memory_management.load_models_gpu([unet, replica], memory_required=unet.memory_required(list(x.shape)), force_full_load=True)
         unet._experimental_cfg_loading = False
         if replica.model.model_lowvram or replica.loaded_size() < replica.model_size():
-            _release_parallel_cfg(unet)
+            _fallback_after_replica_load_failure(unet, x)
             return None
         if batch_mode:
             adapter = adapter_type(unet.model, replica.model, (unet.load_device, replica.load_device), adaptive=args.parallel_batch_adaptive)
@@ -639,10 +778,11 @@ def _load_parallel_cfg(unet, cond, uncond, model_options, x, batch_mode=False):
         memory_management.logger.info("Parallel %s replicas ready on %s and %s", "batch" if batch_mode else "CFG", unet.load_device, replica.load_device)
         return adapter
     except BaseException as error:
-        _release_parallel_cfg(unet)
         if isinstance(error, Exception) and memory_management.is_oom(error):
-            memory_management.logger.warning("Parallel CFG replica could not fit; using the normal sampler")
+            memory_management.logger.warning("Parallel CFG replica could not fit; trying automatic sharding")
+            _fallback_after_replica_load_failure(unet, x)
             return None
+        _release_parallel_cfg(unet)
         raise
     finally:
         unet._experimental_cfg_loading = False
@@ -657,9 +797,19 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None, cfg1_
                   and _parallel_batch_callbacks_safe())
     unet._experimental_cfg_batch_mode = batch_mode
     unet._experimental_batch_fallback_reported = False
+    fallback = None
+    if getattr(unet.model, "_forge_auto_sharded_fallback", None) is not None:
+        fallback = _auto_sharded_fallback(unet)
+    single_fallback = None
+    if getattr(unet.model, "_forge_auto_single_fallback", None) is not None:
+        single_fallback = _auto_single_device_fallback(unet)
     if args.parallel_batch is not None and cfg_scale == 1.0 and x.shape[0] > 1 and not batch_mode:
         memory_management.logger.info("Parallel batch unavailable for this model or conditioning; using the normal sampler")
     secondary_index = args.parallel_batch if batch_mode else args.parallel_cfg
+    if fallback is not None:
+        secondary_index = None
+    if getattr(getattr(unet.model, "diffusion_model", None), "_forge_auto_multi_gpu_mode", None) in ("sharding", "single"):
+        secondary_index = None
     if getattr(unet, "_experimental_cfg_replica", None) is not None:
         memory_management.logger.warning("Parallel CFG is disabled until the previous replica can be released")
         secondary_index = None
@@ -714,6 +864,7 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None, cfg1_
                 unet._experimental_cfg_replica = clone_unet_patcher(unet, secondary)
         except UnsupportedReplica as error:
             memory_management.logger.info("Parallel %s unavailable: %s", "batch" if batch_mode else "CFG", error)
+            fallback = _auto_sharded_fallback(unet)
     try:
         shape = list(x.shape)
         single_condition = cfg1_single_condition and cfg_scale == 1.0
@@ -734,7 +885,35 @@ def sampling_prepare(unet: "UnetPatcher", x: torch.Tensor, cfg_scale=None, cfg1_
             lora_memory = utils.nested_compute_size(unet.weight_wrapper_patches, element_size=utils.dtype_to_element_size(unet.model.computation_dtype))
             additional_inference_memory += lora_memory
 
-        memory_management.load_models_gpu(models=[unet] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
+        if fallback is not None:
+            _load_auto_sharded_fallback(unet, fallback, unet_inference_memory + additional_inference_memory,
+                                        unet_inference_memory // 2 + additional_inference_memory)
+        else:
+            try:
+                memory_management.load_models_gpu(models=[single_fallback or unet] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
+            except Exception as error:
+                if single_fallback is not None or not memory_management.is_oom(error):
+                    raise
+                retry_offload = getattr(unet, "enable_cpu_offload_retry", None)
+                loaded_with_offload = False
+                if callable(retry_offload) and retry_offload():
+                    memory_management.logger.warning("Multi-GPU placement ran out of memory; retrying with CPU-offloaded stages")
+                    try:
+                        memory_management.soft_empty_cache(force=True)
+                        memory_management.load_models_gpu(models=[unet] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
+                        loaded_with_offload = True
+                    except Exception as retry_error:
+                        if not memory_management.is_oom(retry_error):
+                            raise
+                if loaded_with_offload:
+                    single_fallback = None
+                else:
+                    single_fallback = _auto_single_device_fallback(unet)
+                    if single_fallback is None:
+                        raise
+                    memory_management.logger.warning("Automatic sharding could not fit; using single-GPU CPU offloading")
+                    memory_management.soft_empty_cache(force=True)
+                    memory_management.load_models_gpu(models=[single_fallback] + additional_model_patchers, memory_required=unet_inference_memory + additional_inference_memory, minimum_memory_required=unet_inference_memory // 2 + additional_inference_memory)
 
         real_model = unet.model
         percent_to_timestep_function = lambda p: real_model.predictor.percent_to_sigma(p)

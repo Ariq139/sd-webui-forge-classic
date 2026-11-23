@@ -5,7 +5,7 @@ import uuid
 
 from backend import memory_management as mm
 from backend.args import args
-from backend.multi_gpu.planner import Budget, contiguous_split
+from backend.multi_gpu.planner import Budget, InsufficientDeviceMemory, contiguous_split, contiguous_split_with_offload
 from backend.multi_gpu.residency import Residency
 from backend.patcher.base import key_param_name_to_key, low_vram_patch_estimate_vram, wipe_lowvram_weight
 from backend.patcher.unet import UnetPatcher
@@ -35,6 +35,85 @@ class ShardedModelPatcher(UnetPatcher):
             self.current_device = self.offload_device
             self.model._anima_shard = None
         self._planned_split = None
+        self._planned_offloaded = frozenset()
+        self._planned_staging = (0, 0)
+        self._offload_retry_margin = 0
+
+    def enable_cpu_offload_retry(self):
+        """Replan a failed placement with extra GPU headroom."""
+        if not self._supports_cpu_offload() or self.model._anima_shard:
+            return False
+        self._planned_split = None
+        self._planned_offloaded = frozenset()
+        self._planned_staging = (0, 0)
+        self._offload_retry_margin = 512 * 1024 ** 2
+        return True
+    def _supports_cpu_offload(self):
+        # Only enable staging for architectures whose sharded forward calls
+        # each stage as a module. A replacement callback may bypass those calls.
+        supported = {
+            ("backend.nn.anima", "Anima"),
+            ("backend.nn.krea", "SingleStreamDiT"),
+            ("backend.nn.flux", "IntegratedFluxTransformer2DModel"),
+            ("backend.nn.chroma", "IntegratedChromaTransformer2DModel"),
+            ("backend.nn.unet", "IntegratedUNet2DConditionModel"),
+            ("backend.nn.moss_image", "MOSSImage"),
+            ("backend.nn.qwen", "QwenImageTransformer2DModel"),
+            ("backend.nn.qwen21", "QwenImage21Transformer2DModel"),
+            ("backend.nn.wan", "WanModel"),
+            ("backend.nn.lumina", "NextDiT"),
+            ("backend.nn.pixeldit.pid", "PidNet"),
+        }
+        model_type = type(self.model.diffusion_model)
+        options = self.model_options.get("transformer_options", {})
+        return ((model_type.__module__, model_type.__name__) in supported
+                and not any(options.get(key) for key in ("patches_replace", "patches", "block_modifiers")))
+    def _check_offload_aliases(self, stages, split, offloaded):
+        # Moving a shared tensor with one stage would also move it for another
+        # owner. Refuse such placements instead of silently changing its device.
+        seen = {}
+        tensors = list(self.model.named_parameters(remove_duplicate=False))
+        tensors.extend(self.model.named_buffers(remove_duplicate=False))
+        for name, tensor in tensors:
+            location = self._device_for_name(name, split, stages)
+            for index in offloaded:
+                prefix = "diffusion_model." + stages[index][0]
+                if name == prefix or name.startswith(prefix + "."):
+                    location = self.offload_device
+                    break
+            previous = seen.setdefault(id(tensor), location)
+            if previous != location:
+                raise InsufficientDeviceMemory("Shared model tensors cannot be placed across offloaded stages")
+
+    def _remove_offload_hooks(self):
+        for handle in getattr(self.model, "_multi_gpu_offload_hooks", ()):
+            handle.remove()
+        self.model._multi_gpu_offload_hooks = []
+
+    def _install_offload_hooks(self, stages, split, offloaded):
+        self._remove_offload_hooks()
+        handles = self.model._multi_gpu_offload_hooks
+        for index in offloaded:
+            block = stages[index][1]
+            device = self.load_device if index < split else self.secondary_device
+
+            def load_block(module, inputs, target=device):
+                try:
+                    with torch.cuda.device(target):
+                        module.to(target)
+                except BaseException:
+                    try:
+                        module.to(torch.device("cpu"))
+                    except Exception:
+                        mm.logger.exception("Failed to restore an offloaded block after a load error")
+                    raise
+
+            def unload_block(module, inputs, output, target=device):
+                with torch.cuda.device(target):
+                    module.to(torch.device("cpu"))
+
+            handles.append(block.register_forward_pre_hook(load_block))
+            handles.append(block.register_forward_hook(unload_block, always_call=True))
 
     def _stages(self):
         dit = self.model.diffusion_model
@@ -82,6 +161,8 @@ class ShardedModelPatcher(UnetPatcher):
                 reason = "weight patch revision changed"
             elif getattr(self.model, "_multi_gpu_force_cast_weights", None) != self.force_cast_weights:
                 reason = "weight casting changed"
+            elif getattr(self.model, "_multi_gpu_offload_hooks", ()) and not self._supports_cpu_offload():
+                reason = "CPU offloading is incompatible with the current transformer patches"
             residency = getattr(self.model, "_anima_residency", None)
             if reason is None:
                 try:
@@ -92,15 +173,17 @@ class ShardedModelPatcher(UnetPatcher):
                     reason = f"invalid residency: {error}"
             if reason is None:
                 scratch = self._runtime_scratch()
-                for device in (self.load_device, self.secondary_device):
+                staging = getattr(self.model, "_multi_gpu_offload_staging", (0, 0))
+                for device, stage_bytes in zip((self.load_device, self.secondary_device), staging):
                     free = mm.get_free_memory(device)
-                    if free < reserve + scratch:
+                    required = reserve + scratch + stage_bytes + self._offload_retry_margin
+                    if free < required:
                         # Reclaim other models before discarding a valid
                         # sharded placement. The active model stays protected.
-                        mm.free_memory(reserve + scratch, device, keep_loaded=keep_loaded)
+                        mm.free_memory(required, device, keep_loaded=keep_loaded)
                         free = mm.get_free_memory(device)
-                    if free < reserve + scratch:
-                        reason = f"insufficient headroom on {device}: {free} bytes free, {reserve + scratch} required"
+                    if free < required:
+                        reason = f"insufficient headroom on {device}: {free} bytes free, {required} required"
                         break
             if reason is not None:
                 mm.logger.debug("Rebuilding sharded model: %s", reason)
@@ -112,10 +195,12 @@ class ShardedModelPatcher(UnetPatcher):
             # denoiser is resident. Release it before budgeting both cards.
             mm.free_memory(float("inf"), self.load_device, keep_loaded=keep_loaded)
 
-    def device_memory_requirements(self, reserve):
+    def device_memory_requirements(self, reserve, allow_offload=False):
         runtime_reserve = self._runtime_scratch()
         if self.model._anima_shard:
-            return {self.load_device: runtime_reserve, self.secondary_device: runtime_reserve}
+            staging = getattr(self.model, "_multi_gpu_offload_staging", (0, 0))
+            return {self.load_device: runtime_reserve + staging[0] + self._offload_retry_margin,
+                    self.secondary_device: runtime_reserve + staging[1] + self._offload_retry_margin}
         dit = self.model.diffusion_model
         sizes = [mm.module_size(block) for _, block in self._stages()]
         fixed = mm.module_size(self.model) - sum(sizes)
@@ -123,9 +208,32 @@ class ShardedModelPatcher(UnetPatcher):
         secondary_free = mm.get_free_memory(self.secondary_device)
         patch_reserve = max((low_vram_patch_estimate_vram(self.model, key) for key in self.patches), default=0)
         scratch = max(runtime_reserve, patch_reserve)
-        split = contiguous_split(sizes, Budget(primary_free, int(reserve) + scratch), Budget(secondary_free, int(reserve) + scratch), first_fixed=fixed, policy=args.multi_gpu_split)
+        primary_budget = Budget(primary_free, int(reserve) + scratch + self._offload_retry_margin)
+        secondary_budget = Budget(secondary_free, int(reserve) + scratch + self._offload_retry_margin)
+        try:
+            if self._offload_retry_margin:
+                raise InsufficientDeviceMemory("Retrying with CPU-offloaded stages")
+            split = contiguous_split(sizes, primary_budget, secondary_budget, first_fixed=fixed, policy=args.multi_gpu_split)
+            offloaded, staging = frozenset(), (0, 0)
+        except InsufficientDeviceMemory:
+            if not (allow_offload or self._offload_retry_margin) or not self._supports_cpu_offload():
+                raise
+            split, offloaded, staging = contiguous_split_with_offload(sizes, primary_budget, secondary_budget, first_fixed=fixed, policy=args.multi_gpu_split)
+            if self._offload_retry_margin and not offloaded:
+                raise InsufficientDeviceMemory("CPU offloading could not increase the available GPU headroom")
+            if offloaded:
+                self._check_offload_aliases(self._stages(), split, offloaded)
+            # Merged patches can leave an original CPU backup alongside the
+            # offloaded patched weights. Reserve space for that second copy.
+            if offloaded and self.patches:
+                host_required = sum(sizes[index] for index in offloaded) + 512 * 1024 ** 2
+                if mm.get_free_memory(torch.device("cpu")) < host_required:
+                    raise InsufficientDeviceMemory("Not enough system memory for offloaded patched blocks")
         self._planned_split = split
-        return {self.load_device: fixed + sum(sizes[:split]) + scratch, self.secondary_device: sum(sizes[split:]) + scratch}
+        self._planned_offloaded = offloaded
+        self._planned_staging = staging
+        return {self.load_device: fixed + sum(size for i, size in enumerate(sizes[:split]) if i not in offloaded) + scratch + staging[0] + self._offload_retry_margin,
+                self.secondary_device: sum(sizes[i] for i in range(split, len(sizes)) if i not in offloaded) + scratch + staging[1] + self._offload_retry_margin}
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         active = self.model._anima_shard
@@ -140,6 +248,15 @@ class ShardedModelPatcher(UnetPatcher):
         split = self._planned_split
         dit = self.model.diffusion_model
         stages = self._stages()
+        offloaded = self._planned_offloaded
+
+        def is_offloaded(name):
+            prefix = "diffusion_model."
+            if not name.startswith(prefix):
+                return False
+            relative = name[len(prefix):]
+            return any(relative == stages[i][0] or relative.startswith(stages[i][0] + ".") for i in offloaded)
+
         try:
             self.patch_model(load_weights=False)
             installed_wrappers = set()
@@ -176,8 +293,10 @@ class ShardedModelPatcher(UnetPatcher):
                         setattr(module, function_name, list(self.weight_wrapper_patches[key]))
                         installed_wrappers.add(key)
                 module.forge_patched_weights = True
+                if is_offloaded(name):
+                    module._apply(lambda tensor: tensor.to(self.offload_device), recurse=False)
             for name, module in parents:
-                device = self._device_for_name(name, split, stages)
+                device = self.offload_device if is_offloaded(name) else self._device_for_name(name, split, stages)
                 module._apply(lambda tensor: tensor.to(device), recurse=False)
             missing = self.weight_wrapper_patches.keys() - installed_wrappers
             if missing:
@@ -190,25 +309,31 @@ class ShardedModelPatcher(UnetPatcher):
                 if name not in stage_roots:
                     child.to(self.load_device)
             for index, (_, block) in enumerate(stages):
-                block.to(self.load_device if index < split else self.secondary_device)
+                block.to(self.offload_device if index in offloaded else (self.load_device if index < split else self.secondary_device))
             torch.cuda.synchronize(self.load_device)
             torch.cuda.synchronize(self.secondary_device)
             expected = {}
             for name, _ in list(self.model.named_parameters(remove_duplicate=False)) + list(self.model.named_buffers(remove_duplicate=False)):
-                expected[name] = self._device_for_name(name, split, stages)
+                expected[name] = self.offload_device if is_offloaded(name) else self._device_for_name(name, split, stages)
             residency = Residency(expected)
             residency.validate(self.model)
+            self._install_offload_hooks(stages, split, offloaded)
             dit._anima_shard_devices = (self.load_device, self.secondary_device, split)
             self.model._anima_shard = (self.load_device, self.secondary_device, split)
             self.model._anima_residency = residency
+            self.model._multi_gpu_offload_staging = self._planned_staging
             self.model._multi_gpu_force_cast_weights = self.force_cast_weights
-            self.model.model_loaded_weight_memory = self.model_size()
-            self.model.model_lowvram = False
+            offload_size = sum(mm.module_size(stages[index][1]) for index in offloaded)
+            self.model.model_loaded_weight_memory = max(0, self.model_size() - offload_size)
+            self.model.model_lowvram = bool(offloaded)
             self.model.current_weight_patches_uuid = self.patches_uuid
             self.current_device = self.load_device
             mm.logger.info("%s multi-GPU: stages 0-%d on %s, %d-%d on %s", type(dit).__name__, split - 1, self.load_device, split, len(stages) - 1, self.secondary_device)
+            if offloaded:
+                mm.logger.info("CPU offloading enabled for %d multi-GPU stages (%.2f GiB)", len(offloaded), offload_size / 1024 ** 3)
             return self.model.model_loaded_weight_memory
         except BaseException:
+            self._remove_offload_hooks()
             try:
                 self.unpatch_model(self.offload_device)
             except Exception:
@@ -230,6 +355,7 @@ class ShardedModelPatcher(UnetPatcher):
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights and device_to is not None:
+            self._remove_offload_hooks()
             for module in self.model.modules():
                 wipe_lowvram_weight(module)
             if hasattr(self.model.diffusion_model, "_anima_shard_devices"):
@@ -237,6 +363,7 @@ class ShardedModelPatcher(UnetPatcher):
             self.model._anima_shard = None
             self.model._anima_residency = None
             self.model._multi_gpu_force_cast_weights = None
+            self.model._multi_gpu_offload_staging = (0, 0)
         return super().unpatch_model(device_to, unpatch_weights)
 
     def detach(self, unpatch_all=True):
@@ -248,6 +375,9 @@ class ShardedModelPatcher(UnetPatcher):
             del dit._anima_shard_devices
         self.model._anima_shard = None
         self._planned_split = None
+        self._planned_offloaded = frozenset()
+        self._planned_staging = (0, 0)
+        self._offload_retry_margin = 0
         try:
             self.model_patches_to(self.offload_device)
         except BaseException:

@@ -11,7 +11,9 @@ parser.add_argument("--disable-gpu-warning", action="store_true", help="Disable 
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')
-parser.add_argument("--multi-gpu", "--multi-gpu-anima", dest="multi_gpu_anima", type=int, default=None, metavar="CUDA_ID", help="Experimentally shard supported denoisers onto this second CUDA device")
+parser.add_argument("--multi-gpu", "--multi-gpu-anima", dest="multi_gpu_anima", type=int, nargs="?", const=1, default=None, metavar="CUDA_ID", help="Automatically use a second CUDA device (default: 1)")
+parser.add_argument("--multi-gpu-auto", action="store_true", help="Choose replicas or model sharding when the model loads")
+parser.add_argument("--multi-gpu-sharding", action="store_true", help="Use model sharding instead of automatic multi-GPU selection")
 parser.add_argument("--multi-gpu-split", choices=("balanced_memory", "prefer_primary"), default="balanced_memory", help="Choose a memory-balanced or primary-biased multi-GPU split")
 parser.add_argument("--parallel-cfg", type=int, default=None, metavar="CUDA_ID", help="Experimentally evaluate CFG branches on independent GPU replicas")
 parser.add_argument("--parallel-batch", type=int, default=None, metavar="CUDA_ID", help="Experimentally split eligible CFG 1 image batches across independent GPU replicas")
@@ -106,7 +108,23 @@ sage = parser.add_argument_group(description="SageAttention")
 sage.add_argument("--sage-function", type=SageAttentionFuncs, default=SageAttentionFuncs.auto)
 
 
+def configure_multi_gpu(parsed):
+    """Expand the automatic multi-GPU option into the existing execution flags."""
+    if parsed.multi_gpu_anima is not None and not parsed.multi_gpu_sharding:
+        parsed.multi_gpu_auto = True
+        if parsed.parallel_cfg is None:
+            parsed.parallel_cfg = parsed.multi_gpu_anima
+        if parsed.parallel_batch is None:
+            parsed.parallel_batch = parsed.multi_gpu_anima
+        parsed.parallel_batch_adaptive = True
+        parsed.parallel_cfg_keep_resident = True
+    elif parsed.multi_gpu_sharding:
+        parsed.multi_gpu_auto = False
+    return parsed
+
+
 args, _ = parser.parse_known_args()
+configure_multi_gpu(args)
 
 from typing import TYPE_CHECKING
 

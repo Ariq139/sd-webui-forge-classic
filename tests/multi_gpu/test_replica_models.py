@@ -126,6 +126,42 @@ class ReplicaArchitectureTests(unittest.TestCase):
                         sampling_module._release_parallel_cfg(unet)
                         mm.free_memory(float("inf"), torch.device("cuda:0"))
 
+    def test_krea_replica_failure_falls_back_to_sharding(self):
+        from backend import memory_management as mm
+        from backend.args import args
+        from backend.multi_gpu.replicas import UnsupportedReplica
+        from backend.patcher.unet import UnetPatcher
+        from backend.sampling import sampling_function as sampling_module
+
+        for online in (False, True):
+            with self.subTest(online=online), using_forge_operations(device=torch.device("cpu"), dtype=torch.float32):
+                model = SingleStreamDiT(features=32, tdim=32, txtdim=32, heads=2, kvheads=2, multiplier=1, layers=3, patch=2, channels=2, txtlayers=2, txtheads=2, txtkvheads=2)
+                model._forge_auto_multi_gpu_mode = "replicas"
+                for parameter in model.parameters():
+                    torch.nn.init.uniform_(parameter, -0.02, 0.02)
+                unet = UnetPatcher(ReplicaModel(model.eval(), video_input=True), torch.device("cuda:0"), torch.device("cpu"))
+                key = "diffusion_model.blocks.0.attn.wq.weight"
+                unet.add_patches({key: (torch.full_like(model.blocks[0].attn.wq.weight, 0.01),)}, strength_patch=0.5, online_mode=online)
+                x = torch.randn(2, 2, 4, 4, device="cuda:0")
+                timestep = torch.ones(2, device="cuda:0")
+                cond = compile_conditions(torch.randn(2, 3, 2, 32))
+                with mock.patch.object(args, "multi_gpu_anima", 1), mock.patch.object(args, "parallel_batch", 1), mock.patch.object(args, "parallel_cfg", None), mock.patch.object(mm, "current_loaded_models", []), mock.patch.object(dynamic_args, "ref_latents", []), mock.patch.object(dynamic_args, "context_handler", None), mock.patch.object(sampling_module, "_parallel_batch_callbacks_safe", return_value=True), mock.patch.object(sampling_module, "_parallel_cfg_cache", None):
+                    try:
+                        sampling_module.sampling_prepare(unet, x, cfg_scale=1.0)
+                        with torch.inference_mode():
+                            expected = sampling_function_inner(unet.model, x, timestep, None, cond, 1.0)
+                        sampling_module.sampling_cleanup(unet)
+                        with mock.patch("backend.multi_gpu.replicas.clone_unet_patcher", side_effect=UnsupportedReplica("injected")):
+                            sampling_module.sampling_prepare(unet, x, cfg_scale=1.0, cfg1_single_condition=True)
+                        self.assertIsNotNone(unet.model._anima_shard)
+                        with torch.inference_mode():
+                            actual = sampling_function_inner(unet.model, x, timestep, None, cond, 1.0)
+                        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+                    finally:
+                        sampling_module.sampling_cleanup(unet)
+                        mm.free_memory(float("inf"), torch.device("cuda:0"))
+                        mm.free_memory(float("inf"), torch.device("cuda:1"))
+
     def test_flux_cfg_and_batch_replicas(self):
         self.check_replicas(lambda: IntegratedFluxTransformer2DModel(in_channels=2, out_channels=2, vec_in_dim=None, context_in_dim=32, hidden_size=32, mlp_ratio=2, num_heads=2, depth=2, depth_single_blocks=2, axes_dim=[4, 6, 6], theta=10000, patch_size=1, qkv_bias=True, guidance_embed=False), 2, (3, 32))
 

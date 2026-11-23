@@ -564,6 +564,19 @@ class ModelPatcher:
             weight_key = "{}.weight".format(n)
             bias_key = "{}.bias".format(n)
 
+            # A partially loaded model can be revisited with a tighter loading
+            # budget. Its already-resident weights are still patched; installing
+            # a low-VRAM patch on top of them would apply the LoRA twice.
+            # Actual eviction is handled by partially_unload, which restores
+            # the original weights before installing low-VRAM callbacks.
+            if not full_load and not lowvram_fits and getattr(m, "forge_patched_weights", False):
+                mem_counter += module_mem
+                if hasattr(m, "weight_function"):
+                    m.weight_function = [f for f in m.weight_function if not isinstance(f, LowVramPatch)]
+                if hasattr(m, "bias_function"):
+                    m.bias_function = [f for f in m.bias_function if not isinstance(f, LowVramPatch)]
+                continue
+
             if not full_load and hasattr(m, "parameters_manual_cast"):
                 if not lowvram_fits:
                     offload_buffer = potential_offload

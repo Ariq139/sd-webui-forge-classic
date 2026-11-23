@@ -48,3 +48,41 @@ def contiguous_split(block_sizes, first_budget, second_budget, *, first_fixed=0,
     if policy == "prefer_primary":
         return max(index for _, index in candidates)
     return min(candidates)[1]
+
+
+def contiguous_split_with_offload(block_sizes, first_budget, second_budget, *, first_fixed=0, second_fixed=0, policy="balanced_memory"):
+    """Choose a split and whole blocks to offload, reserving room for one block per device."""
+    sizes = tuple(block_sizes)
+    if policy not in ("balanced_memory", "prefer_primary"):
+        raise ValueError(f"Unknown multi-GPU split policy: {policy}")
+    if len(sizes) < 2 or any(size < 0 for size in sizes) or min(first_fixed, second_fixed) < 0:
+        raise ValueError("At least two non-negative blocks and non-negative fixed costs are required")
+
+    def fit(indices, available):
+        resident = sum(sizes[index] for index in indices)
+        offloaded = []
+        for index in sorted(indices, key=lambda value: sizes[value], reverse=True):
+            staging = max((sizes[value] for value in offloaded), default=0)
+            if resident + staging <= available:
+                return offloaded, resident, staging
+            resident -= sizes[index]
+            offloaded.append(index)
+        staging = max((sizes[value] for value in offloaded), default=0)
+        return (offloaded, resident, staging) if resident + staging <= available else None
+
+    candidates = []
+    for split in range(1, len(sizes)):
+        first = fit(range(split), first_budget.available - first_fixed)
+        second = fit(range(split, len(sizes)), second_budget.available - second_fixed)
+        if first is None or second is None:
+            continue
+        offloaded = frozenset(first[0] + second[0])
+        offload_bytes = sum(sizes[index] for index in offloaded)
+        utilization = max((first_fixed + first[1] + first[2]) / max(first_budget.available, 1),
+                          (second_fixed + second[1] + second[2]) / max(second_budget.available, 1))
+        candidates.append((offload_bytes, utilization, split, offloaded, (first[2], second[2])))
+    if not candidates:
+        raise InsufficientDeviceMemory("No split has enough room for a CPU-offloaded block")
+    key = (lambda item: (item[0], -item[2], item[1])) if policy == "prefer_primary" else (lambda item: item[:3])
+    _, _, split, offloaded, staging = min(candidates, key=key)
+    return split, offloaded, staging

@@ -14,7 +14,8 @@ class UnetPatcher(ModelPatcher):
     def from_model(cls, model, diffusers_scheduler, config, *, k_predictor=None):
         model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, config=config)
         from backend.args import args
-        if args.multi_gpu_anima is not None:
+        auto_mode = getattr(model.diffusion_model, "_forge_auto_multi_gpu_mode", None)
+        if args.multi_gpu_anima is not None and auto_mode not in ("replicas", "single"):
             if isinstance(model.diffusion_model, NunchakuModelMixin):
                 raise ValueError("Multi-GPU does not support Nunchaku models")
             from backend.nn.anima import Anima
