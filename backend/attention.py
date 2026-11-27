@@ -2,7 +2,7 @@
 
 import logging
 import math
-from functools import wraps
+from functools import lru_cache, wraps
 
 import torch
 from einops import rearrange, repeat
@@ -26,6 +26,62 @@ IS_SAGE_3 = False
 _RADIAL_WARNING_EMITTED = False
 _SAGE2_MASK_WARNING_EMITTED = False
 _SAGE2_ACCEPTS_MASK = None
+
+# Small attention workloads are dispatch-bound on the tested RTX 3060 Ti. Keep
+# PyTorch SDPA eligible only when its fallback score matrix remains bounded.
+_CK_INT8_SDPA_MAX_MACS = 1_500_000_000
+_CK_INT8_SDPA_MAX_SCORE_ELEMENTS = 32_000_000
+
+
+@lru_cache(maxsize=16)
+def _cuda_compute_capability(device: torch.device) -> tuple[int, int]:
+    """CUDA capability is fixed for a device during this process."""
+    return torch.cuda.get_device_capability(device)
+
+
+def _should_use_pytorch_for_ck_int8_attention(q, k, v, heads, mask, skip_reshape, kwargs):
+    if (
+        torch.version.cuda is None
+        or not q.is_cuda
+        or q.dtype not in (torch.float16, torch.bfloat16)
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+        or q.device != k.device
+        or q.device != v.device
+        or mask is not None
+        or kwargs.get("enable_gqa", False)
+        or not getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)()
+        or _cuda_compute_capability(q.device)[0] < 8
+    ):
+        return False
+
+    if skip_reshape:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            return False
+        batch, query_heads, query_length, head_dim = q.shape
+        if heads != query_heads or k.shape[0] != batch or k.shape[1] != query_heads or v.shape != k.shape:
+            return False
+        key_length = k.shape[2]
+        if k.shape[-1] != head_dim:
+            return False
+    else:
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or heads <= 0:
+            return False
+        batch, query_length, query_width = q.shape
+        if query_width % heads != 0 or k.shape[0] != batch or v.shape != k.shape or k.shape[-1] != query_width:
+            return False
+        query_heads = heads
+        head_dim = query_width // heads
+        key_length = k.shape[1]
+
+    if query_length == 0 or key_length == 0:
+        return False
+    if head_dim > 256 or head_dim % 8 != 0:
+        return False
+
+    score_elements = batch * query_heads * query_length * key_length
+    estimated_macs = score_elements * head_dim
+    return score_elements <= _CK_INT8_SDPA_MAX_SCORE_ELEMENTS and estimated_macs <= _CK_INT8_SDPA_MAX_MACS
 
 
 # region Wrap
@@ -146,34 +202,10 @@ if memory_management.ck_enabled():
     @wrap_attn
     @torch.compiler.disable
     def attention_comfy_kitchen_int8(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if _should_use_pytorch_for_ck_int8_attention(q, k, v, heads, mask, skip_reshape, kwargs):
+            return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
         q, k, v, mask, b, dim_head = _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False))
         out = ck.int8_attention(q, k, v, scale=kwargs.get("scale", None), attn_mask=mask)
-        if not skip_output_reshape:
-            out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-        return out
-
-
-if memory_management.ck_enabled():
-    from backend.quant_ops import ck
-
-    def _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, enable_gqa):
-        dim_head = q.shape[-1] if skip_reshape else q.shape[-1] // heads
-        b = q.shape[0]
-        if not skip_reshape:
-            q, k, v = _reshape_qkv_to_heads(q, k, v, b, heads, dim_head, enable_gqa, expand_kv=False)
-            q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
-
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask.unsqueeze(0)
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
-
-        return q, k, v, mask, b, dim_head
-
-    def attention_comfy_kitchen_int8(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-        q, k, v, mask, b, dim_head = _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False))
-        out = ck.int8_attention(q, k, v, scale=kwargs.get("scale"), attn_mask=mask)
         if not skip_output_reshape:
             out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out

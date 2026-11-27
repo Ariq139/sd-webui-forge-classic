@@ -26,6 +26,7 @@ import modules.sd_vae as sd_vae
 import modules.shared as shared
 from backend import args, memory_management
 from backend.logging import setup_logger
+from backend.performance import record_region
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
 from modules.latent_retention import retain_latents, scripts_require_latents
@@ -613,7 +614,8 @@ class DecodedSamples(list):
 
 
 def decode_latent_batch(model, batch, target_device=None, check_for_nans=False, as_tensor=False):
-    samples_pytorch = decode_first_stage(model, batch, output_device=target_device)
+    with record_region("forge::vae_decode"):
+        samples_pytorch = decode_first_stage(model, batch, output_device=target_device)
     if as_tensor:
         return samples_pytorch
 
@@ -1254,7 +1256,18 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sigmas_backup = p.sd_model.forge_objects.unet.model.predictor.sigmas
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
-            samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
+            from backend.sampling.krea_cache import sampling_krea_cache_scope
+
+            unet_patcher = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
+            model = getattr(unet_patcher, "model", None)
+            cache_namespace = (
+                id(model),
+                id(unet_patcher),
+                getattr(unet_patcher, "patches_uuid", None),
+            )
+            position_embedder = getattr(getattr(model, "diffusion_model", None), "pe_embedder", None)
+            with sampling_krea_cache_scope(cache_namespace, position_embedder=position_embedder):
+                samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
             for sample_index, x_sample in enumerate(samples_ddim):
                 p.latents_after_sampling.append(x_sample)

@@ -11,6 +11,8 @@ import torch
 
 from backend import memory_management, stream, utils
 from backend.args import args, dynamic_args
+from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
+from backend.performance import record_region
 
 
 def gqa_repeat_factor(query_heads: int, key_heads: int, value_heads: int) -> int:
@@ -146,6 +148,7 @@ def weights_manual_cast(
     bias_fn: Callable = None,
     skip_weight_dtype: bool = False,
     skip_bias_dtype: bool = False,
+    skip_weight_functions: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
     """
     Cast layer to input dtype/device
@@ -161,7 +164,7 @@ def weights_manual_cast(
     weight, bias = None, None
 
     fp8_scale = getattr(layer, "weight_scale", None)
-    weight_has_function: bool = len(layer.weight_function) > 0 or weight_fn is not None or fp8_scale is not None
+    weight_has_function: bool = (len(layer.weight_function) > 0 and not skip_weight_functions) or weight_fn is not None or fp8_scale is not None
     bias_has_function: bool = len(layer.bias_function) > 0 or bias_fn is not None
 
     weight_args = dict(device=target_device, dtype=dtype or target_dtype, non_blocking=non_blocking)
@@ -172,7 +175,11 @@ def weights_manual_cast(
     if skip_bias_dtype or bias_has_function:
         bias_args.pop("dtype")
 
-    if stream.should_use_stream():
+    needs_offload_transfer = (
+        layer.weight is not None and layer.weight.device != target_device
+        or layer.bias is not None and layer.bias.device != target_device
+    )
+    if needs_offload_transfer and stream.should_use_stream():
         offload_stream = memory_management.get_offload_stream(target_device)
         context = stream.stream_context()(offload_stream)
     else:
@@ -180,22 +187,27 @@ def weights_manual_cast(
         context = None
 
     if layer.weight is not None:
-        weight = memory_management.cast_to(
-            layer.weight,
-            **weight_args,
-            copy=weight_has_function,
-            context=context if layer.weight.device != target_device else None,
-        )
+        region = "forge::weight_transfer" if layer.weight.device != target_device else "forge::weight_prepare"
+        with record_region(region):
+            weight = memory_management.cast_to(
+                layer.weight,
+                **weight_args,
+                copy=weight_has_function,
+                context=context if layer.weight.device != target_device else None,
+            )
 
     if layer.bias is not None:
-        bias = memory_management.cast_to(
-            layer.bias,
-            **bias_args,
-            copy=bias_has_function,
-            context=context if layer.bias.device != target_device else None,
-        )
+        region = "forge::weight_transfer" if layer.bias.device != target_device else "forge::weight_prepare"
+        with record_region(region):
+            bias = memory_management.cast_to(
+                layer.bias,
+                **bias_args,
+                copy=bias_has_function,
+                context=context if layer.bias.device != target_device else None,
+            )
 
-    memory_management.sync_stream(target_device, offload_stream)
+    if offload_stream is not None:
+        memory_management.sync_stream(target_device, offload_stream)
 
     weight_a = weight
     bias_a = bias
@@ -210,8 +222,9 @@ def weights_manual_cast(
             weight = weight_fn(weight)
         if not skip_weight_dtype:
             weight = weight.to(dtype=target_dtype)
-        for f in layer.weight_function:
-            weight = f(weight)
+        if not skip_weight_functions:
+            for f in layer.weight_function:
+                weight = f(weight)
 
     if bias_has_function:
         if bias_fn is not None:
@@ -224,21 +237,24 @@ def weights_manual_cast(
     return weight, bias, (offload_stream, weight_a, bias_a)
 
 
-@contextlib.contextmanager
 def main_stream_worker(weight, bias, offload_stream: tuple[torch.Stream, torch.Tensor, torch.Tensor]):
+    if offload_stream is None or offload_stream[0] is None:
+        return contextlib.nullcontext()
+    return _main_stream_worker_offload(weight, bias, offload_stream)
+
+
+@contextlib.contextmanager
+def _main_stream_worker_offload(weight, bias, offload_stream):
     yield
-    if offload_stream is None:
-        return
     os, weight_a, bias_a = offload_stream
-    if os is None:
-        return
     if weight_a is not None:
         device = weight_a.device
     elif bias_a is not None:
         device = bias_a.device
     else:
         return
-    os.wait_stream(memory_management.current_stream(device))
+    with record_region("forge::weight_transfer_wait"):
+        os.wait_stream(memory_management.current_stream(device))
 
 
 current_device: torch.device = None
@@ -267,13 +283,22 @@ class ForgeOperations:
             return None
 
         def forward(self, x):
+            activation_loras = activation_space_lora_patches(self.weight_function, self.bias_function, self.in_features, self.out_features) if args.activation_space_lora else None
             if self.parameters_manual_cast:
-                weight, bias, signal = weights_manual_cast(self, x)
+                weight, bias, signal = weights_manual_cast(self, x, skip_weight_functions=activation_loras is not None)
                 with main_stream_worker(weight, bias, signal):
-                    return torch.nn.functional.linear(x, weight, bias)
+                    with record_region("forge::linear"):
+                        output = torch.nn.functional.linear(x, weight, bias)
             else:
-                weight, bias = get_weight_and_bias(self)
-                return torch.nn.functional.linear(x, weight, bias)
+                if activation_loras is None:
+                    weight, bias = get_weight_and_bias(self)
+                else:
+                    weight, bias = self.weight, self.bias
+                with record_region("forge::linear"):
+                    output = torch.nn.functional.linear(x, weight, bias)
+            if activation_loras is not None:
+                output = apply_activation_space_lora(output, x, activation_loras)
+            return output
 
     class Conv1d(torch.nn.Conv1d, ForgeWeights):
 
@@ -437,7 +462,7 @@ class ForgeOperations:
 # region GGUF
 
 
-from backend.operations_gguf import dequantize_tensor, try_llamacpp_cuda_embedding, try_llamacpp_cuda_linear
+from backend.operations_gguf import can_use_llamacpp_cuda_linear, dequantize_tensor, try_llamacpp_cuda_embedding, try_llamacpp_cuda_linear
 
 
 def _gguf_nvfp4_to_tensorcore(weight, device, dtype):
@@ -521,17 +546,31 @@ class ForgeOperationsGGUF(ForgeOperations):
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
                 return output
 
-            if getattr(self.weight, "gguf_cls", None) is not None:
-                weight, bias, signal = weights_manual_cast(self, x, weight_fn=lambda value: value, skip_bias_dtype=True)
+            if (
+                getattr(self.weight, "gguf_cls", None) is not None
+                and not self.weight_function
+                and not self.bias_function
+                and can_use_llamacpp_cuda_linear(self.weight, x, self.bias)
+            ):
+                # Keep the transferred copy packed and byte-exact. The copy is
+                # temporary, so a failed kernel can bake/dequantize it in place.
+                weight, bias, signal = weights_manual_cast(
+                    self, x, weight_fn=lambda value: value, skip_weight_dtype=True, skip_bias_dtype=True
+                )
                 fast_output = try_llamacpp_cuda_linear(weight, x, bias)
                 if fast_output is not None:
                     with main_stream_worker(weight, bias, signal):
                         return fast_output
+                with record_region("forge::gguf_dequantize_fallback"):
+                    weight = dequantize_tensor(weight, input=x) if args.enable_triton_backend else dequantize_tensor(weight)
+                with main_stream_worker(weight, bias, signal):
+                    return torch.nn.functional.linear(x, weight, bias)
 
             weight_fn = (lambda weight: dequantize_tensor(weight, input=x)) if args.enable_triton_backend else dequantize_tensor
             weight, bias, signal = weights_manual_cast(self, x, weight_fn=weight_fn, skip_bias_dtype=True)
             with main_stream_worker(weight, bias, signal):
-                return torch.nn.functional.linear(x, weight, bias)
+                with record_region("forge::gguf_dequantized_linear"):
+                    return torch.nn.functional.linear(x, weight, bias)
 
     class Conv2d(torch.nn.Conv2d, ForgeWeights):
         def __init__(self, *args, **kwargs):

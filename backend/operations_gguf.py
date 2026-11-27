@@ -1,11 +1,14 @@
 import logging
 import os
+from collections import OrderedDict
+from threading import RLock
 
 import torch
 import gguf
 from gguf import GGMLQuantizationType
 
 from backend import memory_management
+from backend.performance import record_region
 from modules_forge.packages.gguf import quants
 
 QUANTS_MAPPING: dict[GGMLQuantizationType, type[quants.TorchQuant]] = {
@@ -51,6 +54,10 @@ class _FallbackGGUFQuant:
 logger = logging.getLogger("operations_gguf")
 _CUDA_MODULE = None
 _CUDA_PROBED = False
+_CUDA_LINEAR_QTYPE_SUPPORT = {}
+_CUDA_LINEAR_FAILURES = OrderedDict()
+_CUDA_LINEAR_FAILURE_LIMIT = 128
+_CUDA_LINEAR_CACHE_LOCK = RLock()
 
 
 def _llamacpp_cuda_module():
@@ -76,24 +83,102 @@ def _llamacpp_cuda_module():
     return _CUDA_MODULE
 
 
-def try_llamacpp_cuda_linear(weight, input_tensor, bias):
-    if input_tensor.device.type != "cuda" or getattr(weight, "gguf_cls", None) is None:
+def gguf_cuda_linear_layout_compatible(weight) -> bool:
+    """Only pass original packed GGUF bytes to kernels expecting GGUF blocks."""
+    raw_weight = getattr(weight, "data", None)
+    return (
+        getattr(weight, "gguf_cls", None) is not None
+        and not getattr(weight, "baked", False)
+        and raw_weight is not None
+        and raw_weight.dtype == torch.uint8
+        and raw_weight.is_contiguous()
+    )
+
+
+def _gguf_cuda_linear_candidate(weight, input_tensor, bias=None):
+    if input_tensor.device.type != "cuda" or not gguf_cuda_linear_layout_compatible(weight):
         return None
 
     module = _llamacpp_cuda_module()
     tensor_type = getattr(weight, "tensor_type", None)
     qtype_name = getattr(tensor_type, "name", None)
-    raw_weight = getattr(weight, "data", None)
-    if module is None or not qtype_name or raw_weight is None or not raw_weight.is_contiguous():
+    support_check = getattr(module, "may_support_linear_qtype_name", None) if module is not None else None
+    if module is None or not qtype_name or not callable(getattr(module, "linear", None)) or not callable(support_check):
         return None
 
-    try:
-        if not module.may_support_linear_qtype_name(qtype_name):
+    support_key = (id(module), qtype_name)
+    with _CUDA_LINEAR_CACHE_LOCK:
+        if support_key not in _CUDA_LINEAR_QTYPE_SUPPORT:
+            try:
+                _CUDA_LINEAR_QTYPE_SUPPORT[support_key] = bool(support_check(qtype_name))
+            except Exception as error:
+                if memory_management.is_oom(error):
+                    raise
+                _CUDA_LINEAR_QTYPE_SUPPORT[support_key] = False
+                logger.debug("Could not check GGUF CUDA linear support for %s", qtype_name, exc_info=True)
+            if len(_CUDA_LINEAR_QTYPE_SUPPORT) > 128:
+                _CUDA_LINEAR_QTYPE_SUPPORT.pop(next(iter(_CUDA_LINEAR_QTYPE_SUPPORT)))
+        qtype_supported = _CUDA_LINEAR_QTYPE_SUPPORT[support_key]
+    if not qtype_supported:
+        return None
+
+    raw_weight = weight.data
+    signature = (
+        str(input_tensor.device), qtype_name, type(getattr(weight, "gguf_cls", None)),
+        tuple(getattr(weight, "real_shape", ())), raw_weight.dtype,
+        tuple(raw_weight.shape), tuple(raw_weight.stride()),
+        input_tensor.dtype, tuple(input_tensor.shape), tuple(input_tensor.stride()),
+        None if bias is None else (bias.dtype, tuple(bias.shape)),
+    )
+    with _CUDA_LINEAR_CACHE_LOCK:
+        if signature in _CUDA_LINEAR_FAILURES:
+            _CUDA_LINEAR_FAILURES.move_to_end(signature)
             return None
-        return module.linear(raw_weight, qtype_name, tuple(weight.real_shape), input_tensor, bias, input_tensor.dtype)
+    return module, qtype_name, signature
+
+
+def can_use_llamacpp_cuda_linear(weight, input_tensor, bias=None) -> bool:
+    """Check kernel availability before copying a packed weight to the GPU."""
+    return _gguf_cuda_linear_candidate(weight, input_tensor, bias) is not None
+
+
+def _remember_linear_failure(signature, reason):
+    with _CUDA_LINEAR_CACHE_LOCK:
+        _CUDA_LINEAR_FAILURES[signature] = str(reason)
+        _CUDA_LINEAR_FAILURES.move_to_end(signature)
+        while len(_CUDA_LINEAR_FAILURES) > _CUDA_LINEAR_FAILURE_LIMIT:
+            _CUDA_LINEAR_FAILURES.popitem(last=False)
+
+
+def _cache_linear_failure(signature, error):
+    message = str(error).lower()
+    stable_rejection = any(
+        marker in message
+        for marker in ("unsupported", "not supported", "not implemented", "invalid argument", "invalid shape", "alignment", "dtype", "shape")
+    )
+    if not stable_rejection:
+        return
+    _remember_linear_failure(signature, error)
+
+
+def try_llamacpp_cuda_linear(weight, input_tensor, bias):
+    candidate = _gguf_cuda_linear_candidate(weight, input_tensor, bias)
+    if candidate is None:
+        return None
+    module, qtype_name, signature = candidate
+    raw_weight = weight.data
+
+    try:
+        with record_region("forge::gguf_cuda_linear"):
+            output = module.linear(raw_weight, qtype_name, tuple(weight.real_shape), input_tensor, bias, input_tensor.dtype)
+        if output is None:
+            _remember_linear_failure(signature, "kernel returned no output")
+            return None
+        return output
     except Exception as error:
         if memory_management.is_oom(error):
             raise
+        _cache_linear_failure(signature, error)
         logger.debug("GGUF CUDA linear failed for %s; using dequantization", qtype_name, exc_info=True)
         return None
 
@@ -175,13 +260,14 @@ def dequantize_tensor(tensor: "ParameterGGUF", *, input: torch.Tensor = None) ->
         return tensor
 
     if (gguf_cls := tensor.gguf_cls) is not None:
-        if not getattr(tensor, "baked", False):
-            gguf_cls.bake(tensor)
-        if input is not None and input.is_cuda and gguf_cls in (quants.Q2_K, quants.Q3_K, quants.Q4_K, quants.Q5_K, quants.Q6_K):
-            from modules_forge.packages.gguf.kquant_triton import try_dequantize
+        with record_region("forge::gguf_dequantize"):
+            if not getattr(tensor, "baked", False):
+                gguf_cls.bake(tensor)
+            if input is not None and input.is_cuda and gguf_cls in (quants.Q2_K, quants.Q3_K, quants.Q4_K, quants.Q5_K, quants.Q6_K):
+                from modules_forge.packages.gguf.kquant_triton import try_dequantize
 
-            if (weight := try_dequantize(tensor, input)) is not None:
-                return weight
-        return gguf_cls.dequantize_pytorch(tensor)
+                if (weight := try_dequantize(tensor, input)) is not None:
+                    return weight
+            return gguf_cls.dequantize_pytorch(tensor)
 
     return tensor

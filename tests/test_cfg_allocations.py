@@ -5,7 +5,7 @@ import torch
 
 from backend.args import dynamic_args
 from backend.sampling.condition import compile_conditions
-from backend.sampling.sampling_function import calc_cond_uncond_batch, sampling_function_inner
+from backend.sampling.sampling_function import calc_cond_uncond_batch, sampling_function_inner, shared as sampling_shared
 
 
 class Model:
@@ -25,6 +25,11 @@ class CFGAllocationTests(unittest.TestCase):
         self.patch = mock.patch.object(dynamic_args, "context_handler", None)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        self.batch_cond_patch = mock.patch.object(
+            type(sampling_shared), "batch_cond_uncond", new_callable=mock.PropertyMock, return_value=True
+        )
+        self.batch_cond_patch.start()
+        self.addCleanup(self.batch_cond_patch.stop)
 
     def run_cfg(self, scale=1.0, **kwargs):
         return sampling_function_inner(Model(), self.x, self.sigma, self.uncond, self.cond, scale, **kwargs)

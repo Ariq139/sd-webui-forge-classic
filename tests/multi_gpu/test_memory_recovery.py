@@ -259,8 +259,8 @@ class MemoryRecoveryTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in free.call_args_list], [torch.device("cuda:0"), torch.device("cuda:1")])
 
     def test_gguf_kernel_oom_does_not_fall_back_to_dequantization(self):
-        weight = SimpleNamespace(gguf_cls=object(), tensor_type=SimpleNamespace(name="Q4_0"), data=torch.ones(2), real_shape=(2,))
-        input_tensor = SimpleNamespace(device=torch.device("cuda:1"), dtype=torch.float16)
+        weight = SimpleNamespace(gguf_cls=object(), tensor_type=SimpleNamespace(name="Q4_0"), data=torch.ones(2, dtype=torch.uint8), real_shape=(2,))
+        input_tensor = SimpleNamespace(device=torch.device("cuda:1"), dtype=torch.float16, shape=(1, 2), stride=lambda: (2, 1))
         module = SimpleNamespace(may_support_linear_qtype_name=lambda name: True, may_support_embedding_qtype_name=lambda name: True, linear=mock.Mock(side_effect=torch.OutOfMemoryError("kernel OOM")), embedding=mock.Mock(side_effect=torch.OutOfMemoryError("kernel OOM")))
         with mock.patch.object(operations_gguf, "_llamacpp_cuda_module", return_value=module):
             with self.assertRaisesRegex(torch.OutOfMemoryError, "kernel OOM"):

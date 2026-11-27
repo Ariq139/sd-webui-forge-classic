@@ -1,8 +1,11 @@
 # https://github.com/Comfy-Org/ComfyUI/blob/v0.26.1/comfy/ldm/krea2/model.py
 # https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py
 
+from collections import OrderedDict
+from threading import RLock
 from typing import Optional
 from contextlib import nullcontext
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.nn as nn
@@ -15,16 +18,80 @@ from backend.memory_management import cast_to
 from backend.misc.image_resize import adaptive_resize
 from backend.nn.flux import EmbedND, timestep_embedding
 from backend.operations import repeat_kv_for_gqa
+from backend.performance import record_region
 from backend.quant_ops import ck
+from backend.sampling.krea_cache import cached_krea_text_features
 from backend.utils import pad_to_patch_size
+
+
+_KREA_POSITION_CACHE = WeakKeyDictionary()
+_KREA_POSITION_CACHE_LOCK = RLock()
+_KREA_POSITION_CACHE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _imgids(bs: int, frame: int, h_: int, w_: int, device: torch.device) -> torch.Tensor:
     ids = torch.zeros(h_, w_, 3, device=device, dtype=torch.float32)
-    ids[..., 0] = frame
+    if frame:
+        ids[..., 0] = frame
     ids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
     ids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
-    return ids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
+    # The IDs are read only and immediately concatenated into a new tensor.
+    return ids.reshape(1, h_ * w_, 3).expand(bs, -1, -1)
+
+
+def clear_krea_position_cache(embedder=None):
+    """Release cached Krea positional embeddings, optionally for one embedder."""
+    with _KREA_POSITION_CACHE_LOCK:
+        if embedder is None:
+            _KREA_POSITION_CACHE.clear()
+        else:
+            _KREA_POSITION_CACHE.pop(embedder, None)
+
+
+def krea_position_frequencies(embedder, text_length, height, width, ref_grids, device):
+    ref_grids = tuple(tuple(int(axis) for axis in grid) for grid in ref_grids)
+    key = (device.type, device.index, int(text_length), int(height), int(width), ref_grids)
+
+    def compute():
+        text_ids = torch.zeros(1, text_length, 3, device=device, dtype=torch.float32)
+        if ref_grids:
+            ref_ids = [_imgids(1, index + 1, grid_h, grid_w, device) for index, (grid_h, grid_w) in enumerate(ref_grids)]
+            image_ids = _imgids(1, 0, height, width, device)
+            position_ids = torch.cat((text_ids, *ref_ids, image_ids), dim=1)
+        else:
+            image_ids = _imgids(1, 0, height, width, device)
+            position_ids = torch.cat((text_ids, image_ids), dim=1)
+        return embedder(position_ids)
+
+    if torch.is_grad_enabled():
+        return compute()
+
+    with _KREA_POSITION_CACHE_LOCK:
+        cache = _KREA_POSITION_CACHE.get(embedder)
+        cached = cache["entries"].get(key) if cache is not None else None
+        if cached is not None:
+            cache["entries"].move_to_end(key)
+            with record_region("forge::krea_position_cache_hit"):
+                return cached
+
+    frequencies = compute()
+    size = frequencies.numel() * frequencies.element_size()
+    if size <= 0 or size > _KREA_POSITION_CACHE_MAX_BYTES:
+        return frequencies
+
+    with _KREA_POSITION_CACHE_LOCK:
+        cache = _KREA_POSITION_CACHE.setdefault(embedder, {"entries": OrderedDict(), "bytes": 0})
+        cached = cache["entries"].get(key)
+        if cached is not None:
+            cache["entries"].move_to_end(key)
+            with record_region("forge::krea_position_cache_hit"):
+                return cached
+        while cache["entries"] and cache["bytes"] + size > _KREA_POSITION_CACHE_MAX_BYTES:
+            _, evicted = cache["entries"].popitem(last=False)
+            cache["bytes"] -= evicted.numel() * evicted.element_size()
+        cache["entries"][key] = frequencies
+        cache["bytes"] += size
+    return frequencies
 
 
 class RMSNorm(nn.Module):
@@ -277,8 +344,15 @@ class SingleStreamDiT(nn.Module):
         t = self.tmlp(timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
         tvec = self.tproj(t)
 
-        context = self.txtfusion(context, mask=None, transformer_options=transformer_options)
-        context = self.txtmlp(context)
+        def compute_text_features():
+            with record_region("forge::krea_text_fusion"):
+                fused = self.txtfusion(context, mask=None, transformer_options=transformer_options)
+                return self.txtmlp(fused)
+
+        if _edit:
+            context = compute_text_features()
+        else:
+            context = cached_krea_text_features(self, context, transformer_options, compute_text_features)
 
         txtlen, imglen = context.shape[1], img.shape[1]
         if _edit:
@@ -289,20 +363,7 @@ class SingleStreamDiT(nn.Module):
             combined = torch.cat((context, img), dim=1)
 
         device = combined.device
-        txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
-
-        if _edit:
-            refids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(ref_grids)]
-            imgids = _imgids(bs, 0, h_, w_, device)
-            pos = torch.cat((txtpos, *refids, imgids), dim=1)
-        else:
-            imgids = torch.zeros(h_, w_, 3, device=device, dtype=torch.float32)
-            imgids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
-            imgids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
-            imgpos = imgids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
-            pos = torch.cat((txtpos, imgpos), dim=1)
-
-        freqs = self.pe_embedder(pos)
+        freqs = krea_position_frequencies(self.pe_embedder, txtlen, h_, w_, ref_grids if _edit else (), device)
 
         shard = getattr(self, "_anima_shard_devices", None)
         for index, block in enumerate(self.blocks):

@@ -1,6 +1,7 @@
 import torch
 
-from backend.sampling.sampling_function import sampling_function
+from backend.performance import record_region
+from backend.sampling.sampling_function import sampling_function, should_skip_unconditional
 from modules import prompt_parser, script_callbacks, sd_samplers_common
 from modules.script_callbacks import AfterCFGCallbackParams, CFGDenoiserParams, cfg_after_cfg_callback, cfg_denoiser_callback
 from modules.shared import opts, state
@@ -173,7 +174,7 @@ class CFGDenoiser(torch.nn.Module):
         if 0 < self.step / self.total_steps <= opts.skip_early_cond:
             cond_scale = 1.0
             self.p.extra_generation_params["Skip Early CFG"] = opts.skip_early_cond
-        elif (self.step % 2 or opts.s_min_uncond_all) and (0 < sigma[0] < s_min_uncond):
+        elif should_skip_unconditional(self.step, sigma, s_min_uncond, opts.s_min_uncond_all):
             cond_scale = 1.0
             self.p.extra_generation_params["NGMS"] = s_min_uncond
             if opts.s_min_uncond_all:
@@ -183,17 +184,18 @@ class CFGDenoiser(torch.nn.Module):
         condition_cache = None
         if not script_callbacks.callback_map["callbacks_cfg_denoiser"]:
             condition_cache = self._conditioning_device_cache
-        denoised = sampling_function(
-            self,
-            denoiser_params=denoiser_params,
-            cond_scale=cond_scale,
-            cond_composition=cond_composition,
-            extra_model_options=extra_model_options,
-            condition_cache=condition_cache,
-            cond_cache_key=cond_cache_key,
-            uncond_cache_key=uncond_cache_key,
-            return_full=False,
-        )
+        with record_region("forge::denoiser_eval"):
+            denoised = sampling_function(
+                self,
+                denoiser_params=denoiser_params,
+                cond_scale=cond_scale,
+                cond_composition=cond_composition,
+                extra_model_options=extra_model_options,
+                condition_cache=condition_cache,
+                cond_cache_key=cond_cache_key,
+                uncond_cache_key=uncond_cache_key,
+                return_full=False,
+            )
 
         if self.mask is not None:
             blended_latent = denoised * self.nmask + self.init_latent * self.mask

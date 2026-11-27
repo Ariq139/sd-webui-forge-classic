@@ -6,6 +6,7 @@ import collections
 import contextlib
 import math
 import weakref
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,6 +23,12 @@ from backend.sampling.condition import (
     compile_weighted_conditions,
     repeat_to_batch_size,
 )
+from backend.sampling.krea_cache import (
+    clear_current_krea_cache,
+    krea_text_fusion_condition,
+    krea_text_fusion_revision,
+)
+from backend.performance import record_region
 from modules import shared
 
 
@@ -132,9 +139,18 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
             mask = mask[batch_indices]
         assert mask.shape[1] == x_in.shape[2]
         assert mask.shape[2] == x_in.shape[3]
-        mask = mask[:, area[2] : area[0] + area[2], area[3] : area[1] + area[3]] * mask_strength
-        mask = mask.unsqueeze(1).repeat(input_x.shape[0] // mask.shape[0], input_x.shape[1], 1, 1)
-        mult = mask * strength
+        mask = mask[:, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
+        if mask.shape[0] == 1 and input_x.shape[0] > 1:
+            mask = mask.expand(input_x.shape[0], -1, -1)
+        elif mask.shape[0] != input_x.shape[0]:
+            mask = repeat_to_batch_size(mask, input_x.shape[0])
+        if not isinstance(mask_strength, (int, float)) or mask_strength != 1.0:
+            mask = mask * mask_strength
+        if not isinstance(strength, (int, float)) or strength != 1.0:
+            mask = mask * strength
+        # Every channel uses the same mask. Keep it as a read-only broadcast
+        # instead of materializing a second copy for each latent channel.
+        mult = mask.unsqueeze(1).expand(-1, input_x.shape[1], -1, -1)
     else:
         mult = torch.full_like(input_x, strength)
 
@@ -155,6 +171,14 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
 
     conditioning = {}
     model_conds = conds["model_conds"]
+    condition_cache_key = tuple((name, getattr(value, "cache_key", None)) for name, value in model_conds.items())
+    if not model_conds or any(key is None for _, key in condition_cache_key):
+        condition_cache_key = None
+    elif condition_cache_key is not None:
+        try:
+            hash(condition_cache_key)
+        except TypeError:
+            condition_cache_key = None
     for c in model_conds:
         value = model_conds[c]
         if batch_indices is not None and isinstance(value.cond, torch.Tensor) and value.cond.ndim > 0 and value.cond.shape[0] == batch_size:
@@ -164,8 +188,10 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
     control = conds.get("control", None)
 
     patches = None
-    cond_obj = collections.namedtuple("cond_obj", ["input_x", "mult", "conditioning", "area", "control", "patches", "batch_indices"])
-    return cond_obj(input_x, mult, conditioning, area, control, patches, batch_indices)
+    cond_obj = collections.namedtuple(
+        "cond_obj", ["input_x", "mult", "conditioning", "area", "control", "patches", "batch_indices", "condition_cache_key"]
+    )
+    return cond_obj(input_x, mult, conditioning, area, control, patches, batch_indices, condition_cache_key)
 
 
 def cond_equal_size(c1, c2):
@@ -224,27 +250,31 @@ def cond_cat(c_list):
 
 def compute_cond_mark(cond_or_uncond, sigmas):
     cond_or_uncond_size = int(sigmas.shape[0])
+    return sigmas.new_tensor(cond_or_uncond).repeat_interleave(cond_or_uncond_size)
 
-    cond_mark = []
-    for cx in cond_or_uncond:
-        cond_mark += [cx] * cond_or_uncond_size
 
-    cond_mark = torch.Tensor(cond_mark).to(sigmas)
-    return cond_mark
+def should_skip_unconditional(step, sigma, s_min_uncond, every_step=False):
+    """Check NGMS only when enabled, avoiding a disabled CUDA scalar read."""
+    if not (step % 2 or every_step) or not (s_min_uncond > 0):
+        return False
+    return 0 < sigma[0] < s_min_uncond
 
 
 def compute_cond_indices(cond_or_uncond, sigmas):
-    cl = int(sigmas.shape[0])
+    cond_indices, uncond_indices = _cached_cond_indices(tuple(cond_or_uncond), int(sigmas.shape[0]))
+    # Return fresh lists because model extensions receive these through
+    # transformer_options and may mutate them.
+    return list(cond_indices), list(uncond_indices)
 
+
+@lru_cache(maxsize=64)
+def _cached_cond_indices(cond_or_uncond, sigma_batch_size):
     cond_indices = []
     uncond_indices = []
     for i, cx in enumerate(cond_or_uncond):
-        if cx == 0:
-            cond_indices += list(range(i * cl, (i + 1) * cl))
-        else:
-            uncond_indices += list(range(i * cl, (i + 1) * cl))
-
-    return cond_indices, uncond_indices
+        target = cond_indices if cx == 0 else uncond_indices
+        target.extend(range(i * sigma_batch_size, (i + 1) * sigma_batch_size))
+    return tuple(cond_indices), tuple(uncond_indices)
 
 
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
@@ -313,6 +343,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
         area = []
         control = None
         patches = None
+        condition_parts = []
+        condition_parts_valid = condition_cache is not None and condition_cache_allowed(model_options)
         for x in to_batch:
             o = to_run.pop(x)
             p = o[0]
@@ -323,6 +355,16 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             cond_or_uncond.append(o[1])
             control = p.control
             patches = p.patches
+            indices = p.batch_indices
+            if indices is not None:
+                if isinstance(indices, (list, tuple)) and all(isinstance(value, int) for value in indices):
+                    indices = tuple(indices)
+                else:
+                    condition_parts_valid = False
+            if p.condition_cache_key is None or p.control is not None or p.patches is not None:
+                condition_parts_valid = False
+            else:
+                condition_parts.append((p.condition_cache_key, tuple(p.area), indices, o[1]))
 
         batch_chunks = len(cond_or_uncond)
         input_x = torch.cat(input_x)
@@ -354,6 +396,15 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 
         c["transformer_options"] = transformer_options
 
+        krea_condition_key = None
+        if condition_parts_valid and condition_parts:
+            candidate = (id(model), getattr(model, "patches_uuid", None), tuple(condition_parts))
+            try:
+                hash(candidate)
+                krea_condition_key = candidate
+            except TypeError:
+                pass
+
         batch_context = contextlib.nullcontext() if batch_indices is None else conditioning_batch(control, batch_indices, x_in.shape[0])
         with batch_context:
             if control is not None:
@@ -374,7 +425,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             if "model_function_wrapper" in model_options:
                 output = model_options["model_function_wrapper"](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
             else:
-                output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
+                with krea_text_fusion_condition(krea_condition_key):
+                    output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
         del input_x
 
         rows = slice(None) if batch_indices is None else batch_indices
@@ -393,6 +445,47 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
         out_uncond /= out_uncond_count
     del out_uncond_count
     return out_cond, out_uncond
+
+
+def single_condition_fast_path_eligible(model, cond, x, model_options, condition_cache):
+    if condition_cache is None or x.ndim != 4 or len(cond) != 1 or not condition_cache_allowed(model_options):
+        return False
+    if model_options.get("model_function_wrapper"):
+        return False
+    if getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None):
+        return False
+
+    item = cond[0]
+    if not isinstance(item.get("model_conds"), dict):
+        return False
+    if any(key in item for key in ("mask", "mask_strength", "batch_indices", "timestep_start", "timestep_end", "control", "patches")):
+        return False
+
+    area = item.get("area")
+    if area is not None and tuple(area) != (x.shape[2], x.shape[3], 0, 0):
+        return False
+    strength = item.get("strength", 1.0)
+    return isinstance(strength, (int, float)) and math.isclose(strength, 1.0)
+
+
+def calc_single_condition(model, cond, x, timestep, model_options, condition_cache=None):
+    """Run a single full-image condition without CFG accumulation buffers."""
+    item = cond[0]
+    area = (x.shape[2], x.shape[3], 0, 0)
+    conditioning = {
+        name: value.process_cond(batch_size=x.shape[0], device=x.device, area=area, cache=condition_cache)
+        for name, value in item["model_conds"].items()
+    }
+    c = cond_cat([conditioning])
+    transformer_options = model_options.get("transformer_options", {}).copy()
+    transformer_options["cond_or_uncond"] = [0]
+    transformer_options["sigmas"] = timestep
+    transformer_options["cond_mark"] = torch.zeros_like(timestep)
+    transformer_options["cond_indices"] = list(range(timestep.shape[0]))
+    transformer_options["uncond_indices"] = []
+    c["transformer_options"] = transformer_options
+    with record_region("forge::single_condition_cfg1"):
+        return model.apply_model(x, timestep, **c)
 
 
 @contextlib.contextmanager
@@ -476,6 +569,9 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
             uncond_pred = None
         else:
             cond_pred, uncond_pred = parallel_cfg.predict(cond, uncond_, x, timestep, model_options)
+    elif direct_cond and single_condition_fast_path_eligible(model, cond, x, model_options, condition_cache):
+        cond_pred = calc_single_condition(model, cond, x, timestep, model_options, condition_cache)
+        uncond_pred = None
     else:
         cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options, condition_cache, materialize_uncond=return_full or not direct_cond)
 
@@ -509,7 +605,8 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     uncond = compile_conditions(denoiser_params.text_uncond, cache_namespace=uncond_cache_key)
     cond = compile_weighted_conditions(denoiser_params.text_cond, cond_composition, cache_namespace=cond_cache_key)
     model_options = utils.join_dicts(unet_patcher.model_options, extra_model_options)
-    if not condition_cache_allowed(model_options):
+    if (not condition_cache_allowed(model_options) or unet_patcher.object_patches
+            or unet_patcher.extra_model_patchers_during_sampling):
         condition_cache = None
     seed = self.p.seeds[0]
 
@@ -552,8 +649,10 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     if parallel_cfg is None and (batch_mode or (args.parallel_cfg is not None and not math.isclose(cond_scale, 1.0))):
         parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x, batch_mode=batch_mode)
     try:
-        return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
+        with krea_text_fusion_revision((id(unet_patcher), unet_patcher.patches_uuid)):
+            return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
     except BaseException as error:
+        clear_current_krea_cache()
         _release_parallel_cfg(unet_patcher)
         if parallel_cfg is not None and isinstance(error, Exception) and memory_management.is_oom(error):
             try:

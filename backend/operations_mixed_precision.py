@@ -5,8 +5,10 @@ import json
 import torch
 
 from backend import memory_management
-from backend.args import args
+from backend.args import args as cli_args
 from backend.memory_management import cast_to_device, logger
+from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
+from backend.performance import record_region
 
 from .operations import (
     ForgeOperations,
@@ -209,7 +211,7 @@ def _load_quantized_module(module: torch.nn.Module, super_load, state_dict: dict
                 "scale": scale,
                 "convrot_groupsize": int(layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))),
                 "quant_group_size": 64,
-                "linear_dtype": "int8" if args.force_w4a8 else layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
+                "linear_dtype": "int8" if cli_args.force_w4a8 else layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
             }
         elif module.quant_format in _GROUPED_INT8_FORMATS:
             bits = _GROUPED_INT8_FORMATS[module.quant_format]
@@ -364,7 +366,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 input_shape = input.shape
                 reshaped_nd = False
 
-                _use_quantized = getattr(self, "layout_type", None) is not None and not isinstance(input, QuantizedTensor) and not self._full_precision_mm and not getattr(self, "forge_force_cast_weights", False) and len(self.weight_function) == 0 and len(self.bias_function) == 0
+                activation_loras = activation_space_lora_patches(self.weight_function, self.bias_function, self.in_features, self.out_features) if cli_args.activation_space_lora else None
+                _use_quantized = getattr(self, "layout_type", None) is not None and not isinstance(input, QuantizedTensor) and not self._full_precision_mm and not getattr(self, "forge_force_cast_weights", False) and (len(self.weight_function) == 0 or activation_loras is not None) and len(self.bias_function) == 0
+                lora_input = input
                 quantize_input = QUANT_ALGOS.get(getattr(self, "quant_format", None), {}).get("quantize_input", True)
 
                 assert not input.requires_grad
@@ -389,19 +393,23 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         return torch.nn.functional.linear(input, weight.to(dtype=input.dtype), bias)
 
                 if weight_only_quant:
-                    weight, bias, signal = weights_manual_cast(self, x=None, dtype=self.weight.dtype, device=input.device, bias_dtype=input.dtype)
+                    weight, bias, signal = weights_manual_cast(self, x=None, dtype=self.weight.dtype, device=input.device, bias_dtype=input.dtype, skip_weight_functions=activation_loras is not None)
                     weight = weight.to(dtype=input.dtype)
                 else:
-                    weight, bias, signal = weights_manual_cast(self, x=input)
+                    weight, bias, signal = weights_manual_cast(self, x=input, skip_weight_functions=activation_loras is not None)
 
                 with main_stream_worker(weight, bias, signal):
-                    if self._full_precision_mm and isinstance(weight, QuantizedTensor):
-                        weight = weight.dequantize()
-                    output = torch.nn.functional.linear(input, weight, bias)
+                    region = "forge::quantized_linear" if isinstance(weight, QuantizedTensor) and not self._full_precision_mm else "forge::linear"
+                    with record_region(region):
+                        if self._full_precision_mm and isinstance(weight, QuantizedTensor):
+                            weight = weight.dequantize()
+                        output = torch.nn.functional.linear(input, weight, bias)
 
                 if reshaped_nd:
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
 
+                if activation_loras is not None:
+                    output = apply_activation_space_lora(output, lora_input, activation_loras)
                 return output
 
             def convert_weight(self, weight, inplace=False, **kwargs):
@@ -679,17 +687,18 @@ def linear_input_act(linear: torch.nn.Linear, x: torch.Tensor, input_act: str, a
             return _residual_out(torch.nn.functional.linear(_eager_input_act(x, input_act, act_weight, act_eps), weight, bias))
 
         qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-        return ck.int8_linear(
-            x,
-            qdata,
-            scale,
-            bias,
-            x.dtype,
-            convrot=getattr(weight._params, "convrot", False),
-            convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
-            input_act=input_act,
-            input_act_weight=act_weight,
-            input_act_eps=act_eps,
-            residual=residual,
-            residual_scale=residual_scale,
-        )
+        with record_region("forge::int8_linear"):
+            return ck.int8_linear(
+                x,
+                qdata,
+                scale,
+                bias,
+                x.dtype,
+                convrot=getattr(weight._params, "convrot", False),
+                convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
+                input_act=input_act,
+                input_act_weight=act_weight,
+                input_act_eps=act_eps,
+                residual=residual,
+                residual_scale=residual_scale,
+            )

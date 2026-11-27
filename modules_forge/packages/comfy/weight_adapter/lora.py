@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 
 from backend import memory_management
+from backend.performance import record_region
 
 from .base import WeightAdapterBase, pad_tensor_to_shape, weight_decompose
 
@@ -123,20 +124,25 @@ class LoRAAdapter(WeightAdapterBase):
                 .transpose(0, 1)
             )
         try:
-            lora_diff = torch.mm(mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)).reshape(weight.shape)
-            del mat1, mat2
-            if dora_scale is not None:
-                weight = weight_decompose(
-                    dora_scale,
-                    weight,
-                    lora_diff,
-                    alpha,
-                    strength,
-                    intermediate_dtype,
-                    function,
-                )
-            else:
-                weight += function(((strength * alpha) * lora_diff).type(weight.dtype))
+            with record_region("forge::lora_merge"):
+                lora_diff = torch.mm(mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)).reshape(weight.shape)
+                del mat1, mat2
+                if dora_scale is not None:
+                    weight = weight_decompose(
+                        dora_scale,
+                        weight,
+                        lora_diff,
+                        alpha,
+                        strength,
+                        intermediate_dtype,
+                        function,
+                    )
+                else:
+                    scale = strength * alpha
+                    # The common unit-strength case needs no separate dense
+                    # multiplication or temporary tensor before applying the delta.
+                    scaled_diff = lora_diff if isinstance(scale, (int, float)) and scale == 1.0 else scale * lora_diff
+                    weight += function(scaled_diff.type(weight.dtype))
         except Exception as e:
             from backend.memory_management import is_oom
 
