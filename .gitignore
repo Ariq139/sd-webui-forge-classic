@@ -30,3 +30,9 @@ __pycache__
 /webui-user.bat
 /webui-user.sh
 notification.mp3
+
+# Local coding agent files
+/.agents/
+/.codex/
+/.codex-task-input/
+/AGENTS.md
