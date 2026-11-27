@@ -1,6 +1,7 @@
 import json
 import math
 import os.path
+import sys
 
 import gguf
 import safetensors
@@ -64,14 +65,13 @@ def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=F
     metadata = None
 
     if ckpt.lower().endswith((".safetensors", ".sft")):
+        # Windows charges the entire copy-on-write mapping against the commit limit.
+        # Read tensors directly to avoid reserving both mapped and allocated storage.
+        backend = "pread" if DISABLE_MMAP or sys.platform == "win32" else "mmap"
         try:
-            with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                sd = {}
-                for k in f.keys():
-                    tensor = f.get_tensor(k)
-                    if DISABLE_MMAP:
-                        tensor = tensor.to(device=device, copy=True)
-                    sd[k] = tensor
+            open_device = "cpu" if device.type == "cpu" else str(device)
+            with safetensors.safe_open(ckpt, framework="pt", device=open_device, backend=backend) as f:
+                sd = {key: f.get_tensor(key) for key in f.keys()}
                 if return_metadata:
                     metadata = f.metadata()
         except Exception as e:
