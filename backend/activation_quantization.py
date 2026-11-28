@@ -11,6 +11,7 @@ from backend.performance import record_region
 
 _ACTIVE = ContextVar("forge_shared_activation_quantization", default=None)
 _NATIVE_CACHE = object()
+_DESTINATIONS = object()
 
 
 @contextmanager
@@ -36,6 +37,10 @@ def shared_activation_scope(source, modules=()):
                     and "forward" not in vars(m) and "_forward" not in vars(m)
                     for m in modules)):
         cache[_NATIVE_CACHE] = {}
+        if (getattr(args, "shared_qkv_output", False) and len(modules) >= 3
+                and source.ndim >= 2 and source.shape[-1] and source.is_contiguous()):
+            from backend.projection_packing import ProjectionDestinations
+            cache[_DESTINATIONS] = ProjectionDestinations(source, [(m, m.out_features) for m in modules])
     # Only retain a single activation within an explicitly read-only group.
     token = _ACTIVE.set((source, cache) if enabled else None)
     try:
@@ -112,7 +117,7 @@ def _eager_linear_from_shared_rows(source, weight, weight_scale, bias, cache, qu
     return output.reshape(*source.shape[:-1], weight.shape[0])
 
 
-def try_shared_int8_linear(source, weight, weight_scale, bias, *, convrot=False, transposed=False):
+def try_shared_int8_linear(source, weight, weight_scale, bias, *, convrot=False, transposed=False, module=None):
     """Reuse rows only when the ordinary linear selects an audited backend."""
     active = _ACTIVE.get()
     native_cache = active[1].get(_NATIVE_CACHE) if active is not None else None
@@ -151,7 +156,9 @@ def try_shared_int8_linear(source, weight, weight_scale, bias, *, convrot=False,
                 or not weight_scale.is_contiguous() or weight_scale.data_ptr() % 16):
             return None
         with record_region("forge::shared_int8_cuda_linear"):
-            return try_native_cutlass(source, weight, weight_scale, bias, convrot, native_cache, cuda)
+            destinations = active[1].get(_DESTINATIONS)
+            return try_native_cutlass(source, weight, weight_scale, bias, convrot, native_cache, cuda,
+                                      destination_factory=None if destinations is None else lambda: destinations.take(module))
     if selected != "eager" or convrot:
         return None
     with record_region("forge::shared_int8_eager_linear"):

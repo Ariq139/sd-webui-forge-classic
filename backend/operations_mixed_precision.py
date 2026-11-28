@@ -412,7 +412,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                             raw_weight, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
                             output = try_shared_int8_linear(input, raw_weight, scale, bias,
                                                             convrot=getattr(weight._params, "convrot", False),
-                                                            transposed=getattr(weight._params, "transposed", False))
+                                                            transposed=getattr(weight._params, "transposed", False), module=self)
                         if output is None:
                             output = torch.nn.functional.linear(input, weight, bias)
 

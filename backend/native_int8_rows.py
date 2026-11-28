@@ -75,7 +75,7 @@ def _native_rows(cuda, flat, convrot, stream):
     return q, scales
 
 
-def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda):
+def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, destination_factory=None):
     if (not source.is_cuda or source.dtype not in (torch.float16, torch.bfloat16)
             or torch.cuda.get_device_capability(source.device) != (8, 6)
             or not source.is_contiguous() or source.data_ptr() % 16 or weight.data_ptr() % 16
@@ -103,7 +103,10 @@ def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda):
         weight_scale = weight_scale.reshape(1).expand(n).contiguous()
     bias_arg = (cuda._gemm_vector_arg(bias, source.device, source.dtype) if bias is not None
                 else cuda._empty_cuda_tensor(source.device, source.dtype))
-    out = torch.empty((m, n), device=source.device, dtype=source.dtype)
+    out = destination_factory() if destination_factory is not None else None
+    if (out is None or out.shape != (m, n) or out.dtype != source.dtype
+            or out.device != source.device or not out.is_contiguous() or out.data_ptr() % 16):
+        out = torch.empty((m, n), device=source.device, dtype=source.dtype)
     wrap = cuda._wrap_for_dlpack
     used = cuda._C.cutlass_int8_dequant(
         wrap(q), wrap(weight), wrap(row_scale), wrap(weight_scale), wrap(bias_arg),
