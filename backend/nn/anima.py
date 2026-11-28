@@ -29,6 +29,7 @@ from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
+from backend.fused_pointwise import affine_modulation
 from backend.utils import pad_to_patch_size
 
 BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
@@ -39,7 +40,7 @@ BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
 
 
 def _fn(x: torch.Tensor, _norm: nn.Module, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    return torch.addcmul(z, _norm(x), 1 + y)
+    return affine_modulation(_norm(x), y, z)
 
 
 # region DiT

@@ -9,19 +9,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
 
-from backend.attention import attention_function
+from backend.attention import attention_function, attention_pytorch
+from backend.args import args
 from backend.nn.flux import EmbedND
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
+from backend.fused_pointwise import silu_gate, scale_modulation
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
 
 def modulate(x, scale):
-    return x * (1 + scale.unsqueeze(1))
+    return scale_modulation(x, scale)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
@@ -106,10 +108,25 @@ class JointAttention(nn.Module):
             xq, xk = ck.apply_rope(xq, xk, freqs_cis)
 
         n_rep = self.n_local_heads // self.n_local_kv_heads
-        if n_rep > 1:
+        native_gqa = False
+        if (n_rep > 1 and getattr(args, "native_lumina_gqa", False)
+                and xq.is_cuda and x_mask is None and attention_function is attention_pytorch
+                and "optimized_attention_override" not in transformer_options
+                and not any(getattr(args, key, None) is not None
+                            for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+            try:
+                params = torch.backends.cuda.SDPAParams(xq.movedim(1, 2), xk.movedim(1, 2),
+                                                        xv.movedim(1, 2), None, 0.0, False, True)
+                native_gqa = (torch.backends.cuda.flash_sdp_enabled()
+                              and torch.backends.cuda.can_use_flash_attention(params))
+            except (AttributeError, TypeError):
+                native_gqa = False
+        if n_rep > 1 and not native_gqa:
             xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
             xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-        output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
+        extra = {"enable_gqa": True} if native_gqa else {}
+        output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask,
+                                    skip_reshape=True, transformer_options=transformer_options, **extra)
 
         return self.out(output)
 
@@ -126,7 +143,7 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def _forward_silu_gating(self, x1, x3):
-        return clamp_fp16(F.silu(x1) * x3)
+        return silu_gate(x1, x3, fix_fp16=True)
 
     def forward(self, x):
         with shared_activation_scope(x):

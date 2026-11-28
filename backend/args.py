@@ -12,6 +12,8 @@ parser.add_argument("--activation-space-lora", action="store_true", help="Run co
 parser.add_argument("--invariant-cache-mib", type=int, default=0, metavar="MIB", help="Experimental single-GPU sampling cache budget in MiB; 0 disables")
 parser.add_argument("--shared-activation-quantization", action="store_true", help="Experimentally reuse unscaled tensorwise INT8 activations between compatible projections")
 parser.add_argument("--weight-prefetch-mib", type=int, default=0, metavar="MIB", help="Experimental bounded pinned CPU weight look-ahead for Anima, FLUX and Z-Image; 0 disables")
+parser.add_argument("--fused-denoiser-pointwise", action="store_true", help="Experimentally compile pure denoiser modulation and gated-MLP expressions; may slightly change rounding")
+parser.add_argument("--native-lumina-gqa", action="store_true", help="Use native PyTorch flash grouped-query attention in compatible unmasked Lumina/Z-Image layers")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')
