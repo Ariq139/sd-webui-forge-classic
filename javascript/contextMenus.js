@@ -157,11 +157,10 @@ let regen_img2img = null;
             }
 
             const current = localGet(key);
-            if (current) {
+            if (current && current !== task) {
                 task = current;
                 awaitingTask = false;
                 uncertainSince = 0;
-                return;
             }
 
             if (task || awaitingTask) {
@@ -181,7 +180,7 @@ let regen_img2img = null;
                 request("./internal/progress", { id_task: previous, live_preview: false }, function (res) {
                     checking = false;
                     if (task !== previous) return;
-                    if (res.completed && !res.active && !res.queued) {
+                    if (res.completed && !res.active && !res.queued && !localGet(key)) {
                         task = null;
                         uncertainSince = 0;
                     } else if (res.active || res.queued) {
