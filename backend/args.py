@@ -21,6 +21,8 @@ parser.add_argument("--native-token-assembly", action="store_true", help="Experi
 parser.add_argument("--static-sigma-control", action="store_true", help="Experimental versioned CPU sigma control flow; GPU arithmetic is unchanged")
 parser.add_argument("--qwen-intermediate-only", action="store_true", help="Skip unused final Qwen text encoder layers for native Z-Image and Klein conditioning")
 parser.add_argument("--qwen-batched-prompts", action="store_true", help="Experimentally batch pairs of equal-length native Qwen prompts when the encoder is resident")
+parser.add_argument("--flux-fused-qk-rope", action="store_true", help="Experimental native FLUX/Klein fused Q/K normalization and rotary")
+parser.add_argument("--native-int8-mlp-activation", action="store_true", help="Experimental ConvRot INT8 activation-quantizer fusion; can change rounding")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')

@@ -18,6 +18,9 @@ from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import silu_gate, norm_affine, can_fuse_silu
 from backend.utils import fp16_fix, pad_to_patch_size
+from backend.single_gpu_fastpaths import single_gpu_flag
+from backend.sampling.invariant_cache import cache_dependencies_safe
+from backend.operations_mixed_precision import try_native_int8_input_act
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor, mask=None, transformer_options={}) -> torch.Tensor:
@@ -105,6 +108,23 @@ class YakMLP(nn.Module):
         return down_proj
 
 
+def run_native_mlp(module, x):
+    if (not single_gpu_flag("native_int8_mlp_activation")
+            or type(module) is not nn.Sequential or len(module) != 3
+            or not cache_dependencies_safe(module)):
+        return module(x)
+    act = module[1]
+    if type(act) is SiLUActivation and type(act.gate_fn) is nn.SiLU and not act.gate_fn.inplace:
+        kind = "swiglu"
+    elif type(act) is nn.GELU and act.approximate == "tanh":
+        kind = "gelu_tanh"
+    else:
+        return module(x)
+    hidden = module[0](x)
+    fused = try_native_int8_input_act(module[2], hidden, kind)
+    return module[2](act(hidden)) if fused is None else fused
+
+
 def build_mlp(hidden_size: int, mlp_hidden_dim: int, mlp_silu_act: bool = False, yak_mlp: bool = False) -> nn.Module:
     if yak_mlp:
         return YakMLP(hidden_size, mlp_hidden_dim)
@@ -132,6 +152,46 @@ class QKNorm(nn.Module):
         q = self.query_norm(q)
         k = self.key_norm(k)
         return q.to(v), k.to(v)
+
+    def try_fused_rope(self, q, k, v, pe, options):
+        if (not single_gpu_flag("flux_fused_qk_rope") or pe is None
+                or not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16)
+                or q.dtype != k.dtype or q.dtype != v.dtype
+                or q.device != k.device or q.device != v.device or q.device != pe.device
+                or q.shape != k.shape or q.shape != v.shape
+                or torch.is_grad_enabled() or torch.is_autocast_enabled(q.device.type)
+                or not isinstance(options, dict)
+                or options.keys() - {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                     "uncond_indices", "sampling_sigmas", "total_blocks", "block_type", "block_index"}
+                or not cache_dependencies_safe(self)):
+            return None
+        if (pe.ndim != 6 or pe.shape[0] not in (1, q.shape[0])
+                or pe.shape[1] != 1 or pe.shape[2] != q.shape[2]
+                or pe.shape[3:] != (q.shape[-1] // 2, 2, 2)):
+            return None
+        from backend.operations import ForgeOperations
+        from comfy_kitchen import registry
+        from comfy_kitchen.exceptions import NoCapableBackendError
+        scales = []
+        eps = []
+        for norm in (self.query_norm, self.key_norm):
+            if (type(norm) not in (nn.RMSNorm, ForgeOperations.RMSNorm)
+                    or getattr(norm, "add", False)
+                    or getattr(norm, "weight_function", None) or getattr(norm, "bias_function", None)
+                    or type(norm.weight) is not torch.nn.Parameter
+                    or norm.weight.device != q.device or norm.weight.dtype != q.dtype):
+                return None
+            scales.append(norm.weight)
+            eps.append(norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps)
+        if eps[0] != eps[1]:
+            return None
+        kwargs = dict(q=q, k=k, freqs_cis=pe, q_scale=scales[0], k_scale=scales[1], epsilon=eps[0])
+        try:
+            if registry.get_capable_backend("rms_rope", kwargs) not in ("cuda", "triton"):
+                return None
+        except NoCapableBackendError:
+            return None
+        return ck.rms_rope(q, k, pe, scales[0], scales[1], eps[0])
 
 
 class SelfAttention(nn.Module):
@@ -252,7 +312,8 @@ class DoubleStreamBlock(nn.Module):
         del img_modulated
         img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del img_qkv
-        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+        img_pair = self.img_attn.norm.try_fused_rope(img_q, img_k, img_v, None if pe is None else pe[:, :, txt.shape[1]:], transformer_options)
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v) if img_pair is None else img_pair
 
         # prepare txt for attention
         txt_modulated = apply_norm_scale_shift(self.txt_norm1, txt, txt_mod1.scale, txt_mod1.shift, modulation_dims_txt)
@@ -260,7 +321,17 @@ class DoubleStreamBlock(nn.Module):
         del txt_modulated
         txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del txt_qkv
-        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+        txt_pair = self.txt_attn.norm.try_fused_rope(txt_q, txt_k, txt_v, None if pe is None else pe[:, :, :txt.shape[1]], transformer_options)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v) if txt_pair is None else txt_pair
+
+        if img_pair is not None or txt_pair is not None:
+            # Exactly one rotation per stream, even if only one fused kernel is eligible.
+            if img_pair is None:
+                img_q, img_k = ck.apply_rope(img_q, img_k, pe[:, :, txt.shape[1]:])
+            if txt_pair is None:
+                txt_q, txt_k = ck.apply_rope(txt_q, txt_k, pe[:, :, :txt.shape[1]])
+            pe = None
+        del img_pair, txt_pair
 
         q = torch.cat((txt_q, img_q), dim=2)
         del txt_q, img_q
@@ -277,12 +348,12 @@ class DoubleStreamBlock(nn.Module):
         # calculate the img blocks
         img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
         del img_attn
-        img += apply_mod(self.img_mlp(apply_norm_scale_shift(self.img_norm2, img, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+        img += apply_mod(run_native_mlp(self.img_mlp, apply_norm_scale_shift(self.img_norm2, img, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
         # calculate the txt blocks
         txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
         del txt_attn
-        txt += apply_mod(self.txt_mlp(apply_norm_scale_shift(self.txt_norm2, txt, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+        txt += apply_mod(run_native_mlp(self.txt_mlp, apply_norm_scale_shift(self.txt_norm2, txt, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
 
         txt = fp16_fix(txt)
 
@@ -336,7 +407,13 @@ class SingleStreamBlock(nn.Module):
 
         q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del qkv
-        q, k = self.norm(q, k, v)
+        pair = self.norm.try_fused_rope(q, k, v, pe, transformer_options)
+        if pair is None:
+            q, k = self.norm(q, k, v)
+        else:
+            q, k = pair
+            pe = None
+        del pair
 
         # compute attention
         attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
