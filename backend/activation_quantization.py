@@ -137,7 +137,7 @@ def try_shared_int8_linear(source, weight, weight_scale, bias, *, convrot=False,
                   residual=None, residual_scale=None)
     try:
         selected = registry.get_capable_backend("int8_linear", kwargs)
-        if selected not in ("eager", "cuda"):
+        if selected != "eager" and (selected != "cuda" or native_cache is None):
             return None
         kwargs["x"] = source.reshape(-1, source.shape[-1])
         if registry.get_capable_backend("int8_linear", kwargs) != selected:

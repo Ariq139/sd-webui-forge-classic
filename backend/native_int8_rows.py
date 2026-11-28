@@ -78,7 +78,7 @@ def _native_rows(cuda, flat, convrot, stream):
 def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda):
     if (not source.is_cuda or source.dtype not in (torch.float16, torch.bfloat16)
             or torch.cuda.get_device_capability(source.device) != (8, 6)
-            or not source.is_contiguous() or weight.data_ptr() % 16
+            or not source.is_contiguous() or source.data_ptr() % 16 or weight.data_ptr() % 16
             or cuda._DISABLE_CUTLASS_INT8):
         return None
     n, k = weight.shape
@@ -110,4 +110,7 @@ def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda):
         wrap(out), cuda.DTYPE_TO_CODE[source.dtype], stream)
     # A rejected CUTLASS shape takes the original authoritative dispatch. Device
     # failures are not swallowed or retried.
-    return out.reshape(*source.shape[:-1], n) if used else None
+    if not used:
+        cache.pop(row_key(source, convrot, stream), None)
+        return None
+    return out.reshape(*source.shape[:-1], n)

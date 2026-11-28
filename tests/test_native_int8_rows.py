@@ -51,3 +51,59 @@ def test_pinned_sm86_native_epilogue_matches_original(convrot):
             expected = cuda.int8_linear(x, w, s, b, x.dtype, convrot=convrot)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert len(cache) == 1
+
+
+@pytest.mark.parametrize("convrot", [False, True])
+def test_mocked_native_dispatch_reuses_rows_and_discards_on_decline(monkeypatch, convrot):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    x = torch.zeros(1, 4, 256, dtype=torch.bfloat16)
+
+    class SimulatedDeviceTensor:
+        is_cuda = True
+        def __getattr__(self, name):
+            return getattr(x, name)
+        def get_device(self):
+            return 0
+
+    source = SimulatedDeviceTensor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 6))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=12))
+    producer = Mock(side_effect=lambda flat: (flat.to(torch.int8), torch.ones(flat.shape[0], 1)))
+    def rotated(flat, q, scales, group, stochastic, act, seed, act_weight, eps, stream):
+        assert (group, stochastic, act, seed, eps, stream) == (256, False, 0, 0, 0.0, 12)
+        q.copy_(flat.to(torch.int8))
+        scales.fill_(1)
+    rotated_producer = Mock(side_effect=rotated)
+    decline = [False]
+    def epilogue(q, w, rs, ws, b, out, dtype_code, stream):
+        assert dtype_code == 5 and stream == 12
+        out.copy_((q.float() @ w.float().T).to(out.dtype))
+        return not decline[0]
+    cutlass = Mock(side_effect=epilogue)
+    cuda = SimpleNamespace(
+        quantize_int8_rowwise=producer, _DISABLE_CUTLASS_INT8=False,
+        _CONVROT_FUSED_MAX_K=4096, _convrot_fused_shared_memory_fits=lambda *args: True,
+        _cuda_device_supports_cutlass_int8_dequant=lambda *args: True,
+        _prefer_cublas_int8_fallback=lambda *args: False,
+        _prefer_turing_fused_int8=lambda *args: False,
+        _int8_weight_scale_arg=lambda s, d: s,
+        _gemm_vector_arg=lambda v, d, dtype: v,
+        _empty_cuda_tensor=lambda d, dtype: torch.empty(0, device=d, dtype=dtype),
+        _wrap_for_dlpack=lambda t: t, _input_act_code=lambda act: 0,
+        DTYPE_TO_CODE={torch.bfloat16: 5},
+        _C=SimpleNamespace(cutlass_int8_dequant=cutlass, quantize_int8_rowwise_convrot64=rotated_producer),
+    )
+    cache = {}
+    w = torch.ones(16, 256, dtype=torch.int8)
+    scale = torch.ones(16)
+    for _ in range(2):
+        out = rows.try_native_cutlass(source, w, scale, None, convrot, cache, cuda)
+        assert out.shape == (1, 4, 16)
+    assert producer.call_count == (0 if convrot else 1)
+    assert rotated_producer.call_count == (1 if convrot else 0)
+    assert cutlass.call_count == 2
+    decline[0] = True
+    assert rows.try_native_cutlass(source, w, scale, None, convrot, cache, cuda) is None
+    assert not cache
