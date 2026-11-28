@@ -433,6 +433,9 @@ class NextDiT(nn.Module):
         freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
                                     lambda: self.rope_embedder(position_ids).movedim(1, 2).to(dtype),
                                     geometry=geometry, geometry_only=True)
+        packed_rope_hook = getattr(self, "_forge_packed_rope_hook", None)
+        if packed_rope_hook is not None and single_gpu_flag("nunchaku_rope_cache"):
+            packed_rope_hook.bind_geometry(self, freqs_cis, geometry, transformer_options)
 
         def refine_context():
             features = cap_feats

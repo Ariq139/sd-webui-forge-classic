@@ -782,6 +782,10 @@ class NunchakuQwenImageTransformer2DModel(NunchakuModelMixin, QwenImageTransform
 from functools import wraps
 
 from backend.nn.lumina import JointAttention, NextDiT, clamp_fp16
+from backend.nn.flux import EmbedND
+from backend.rope_packing_cache import PackedRopeViews
+from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
+from backend.single_gpu_fastpaths import single_gpu_flag
 
 
 def fuse_to_svdquant_linear(linear1: nn.Linear, linear2: nn.Linear, **kwargs) -> SVDQW4A4Linear:
@@ -916,21 +920,29 @@ class NunchakuZImageFeedForward(nn.Module):
 class RopeFuseAttentionHook:
 
     def __init__(self):
-        self.packed_freqs_cis_cache = {}
+        self.views = PackedRopeViews()
         self.hook_handles = []
+        self.persistent = None
+
+    def bind(self, source, geometry, embedder, options):
+        self.views.bind(source, geometry)
+
+        def persistent(view, layout, pack):
+            return cached_invariant(embedder, "nunchaku_packed_rope", view, options,
+                                    lambda: pack(view), geometry=layout, geometry_only=True)
+
+        self.persistent = persistent
 
     def pre_forward(self, module: NunchakuZImageAttention, input_args: tuple, input_kwargs: dict):
         new_input_args = list(input_args)
         freqs_cis: torch.Tensor = new_input_args[2]
         if freqs_cis is None:
             return None
-        cache_key = (freqs_cis.data_ptr(), freqs_cis.shape)
-        packed_freqs_cis = self.packed_freqs_cis_cache.get(cache_key, None)
-        if packed_freqs_cis is None:
-            freqs_cis = freqs_cis[..., [1], :].squeeze(2).float()
-            packed_freqs_cis = pack_rotemb(pad_tensor(freqs_cis, 256, 1))
-            self.packed_freqs_cis_cache[cache_key] = packed_freqs_cis
-        new_input_args[2] = packed_freqs_cis
+
+        def pack(view):
+            return pack_rotemb(pad_tensor(view[..., [1], :].squeeze(2).float(), 256, 1))
+
+        new_input_args[2] = self.views.get(freqs_cis, pack, self.persistent)
         return tuple(new_input_args), input_kwargs
 
     def hook(self, module: NunchakuZImageAttention):
@@ -941,7 +953,8 @@ class RopeFuseAttentionHook:
         for h in self.hook_handles:
             h.remove()
         self.hook_handles.clear()
-        self.packed_freqs_cis_cache.clear()
+        self.views.clear()
+        self.persistent = None
 
 
 class RopeFuseTransformerHook:
@@ -964,10 +977,39 @@ class RopeFuseTransformerHook:
         self.attn_hook.unhook()
         return None
 
+    def safe(self, model, *, during_forward=False):
+        if (type(model) is not NunchakuZImage2DModel or model.training
+                or not single_gpu_flag("nunchaku_rope_cache")
+                or torch.nn.modules.module._global_forward_hooks
+                or torch.nn.modules.module._global_forward_pre_hooks
+                or type(model.rope_embedder) is not EmbedND
+                or set(model._forward_pre_hooks) != {self.pre_handle.id}
+                or set(model._forward_hooks) != {self.post_handle.id}):
+            return False
+        allowed = {h.id for h in self.attn_hook.hook_handles} if during_forward else set()
+        return all(not child.training and not child._forward_hooks
+                   and set(child._forward_pre_hooks) <= allowed
+                   for child in model.modules() if child is not model)
+
+    def bind_geometry(self, model, source, geometry, options):
+        if (self.safe(model, during_forward=True)
+                and invariants_enabled(model.rope_embedder, source, options)):
+            self.attn_hook.bind(source, geometry, model.rope_embedder, options)
+
     def hook(self, model: NextDiT):
         assert isinstance(model, NextDiT)
         self.pre_handle = model.register_forward_pre_hook(self.pre_forward)
         self.post_handle = model.register_forward_hook(self.post_forward, always_call=True)
+        model._forge_packed_rope_hook = self
+
+
+class NunchakuZImage2DModel(NunchakuModelMixin, NextDiT):
+    pass
+
+
+def nunchaku_rope_cache_safe(model):
+    hook = getattr(model, "_forge_packed_rope_hook", None)
+    return type(hook) is RopeFuseTransformerHook and hook.safe(model)
 
 
 def patch_z_image_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -1044,9 +1086,6 @@ def patch_nunchaku_zimage(model: NextDiT, precision: str, rank: int):
         sd = patch_z_image_state_dict(sd)
         patch_scale_key(model, sd)
         return _load_state_dict(sd, *args, **kwargs)
-
-    class NunchakuZImage2DModel(NunchakuModelMixin, NextDiT):
-        pass
 
     model.load_state_dict = load_state_dict
     model.__class__ = NunchakuZImage2DModel

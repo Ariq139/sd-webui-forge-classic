@@ -791,8 +791,14 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
             from backend.nn.flux import IntegratedFluxTransformer2DModel
             from backend.nn.krea import SingleStreamDiT
             from backend.nn.lumina import NextDiT
-            if (type(getattr(model, "diffusion_model", None)) in
-                    (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
+            diffusion = getattr(model, "diffusion_model", None)
+            native = type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
+            packed_rope_only = False
+            if (not native and single_gpu_flag("nunchaku_rope_cache")
+                    and type(diffusion).__module__ == "backend.nn.svdq"):
+                from backend.nn.svdq import nunchaku_rope_cache_safe
+                packed_rope_only = nunchaku_rope_cache_safe(diffusion)
+            if ((native or packed_rope_only)
                     and not any(script_callbacks.callback_map.get(key) for key in
                                 ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))):
                 invariant_revision_key = (revision, ref_signature) if ref_signature is not None else revision
