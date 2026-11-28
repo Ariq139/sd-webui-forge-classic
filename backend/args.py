@@ -11,6 +11,7 @@ parser.add_argument("--disable-gpu-warning", action="store_true", help="Disable 
 parser.add_argument("--activation-space-lora", action="store_true", help="Run compatible standard online linear LoRAs in activation space; results may differ slightly from dense merging")
 parser.add_argument("--invariant-cache-mib", type=int, default=0, metavar="MIB", help="Experimental single-GPU sampling cache budget in MiB; 0 disables")
 parser.add_argument("--shared-activation-quantization", action="store_true", help="Experimentally reuse INT8 row quantization between compatible projections on the pinned eager backend")
+parser.add_argument("--native-shared-int8-rows", action="store_true", help="Extend shared activation quantization to eligible SM86 CUDA CUTLASS projections (requires --shared-activation-quantization)")
 parser.add_argument("--weight-prefetch-mib", type=int, default=0, metavar="MIB", help="Experimental bounded pinned CPU weight look-ahead for Anima, FLUX, Z-Image and Krea; 0 disables")
 parser.add_argument("--fused-denoiser-pointwise", action="store_true", help="Experimentally compile pure denoiser modulation and gated-MLP expressions; may slightly change rounding")
 parser.add_argument("--native-lumina-gqa", action="store_true", help="Use native PyTorch flash grouped-query attention in compatible unmasked Lumina/Z-Image layers")
