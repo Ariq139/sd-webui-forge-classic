@@ -13,6 +13,7 @@ from backend import memory_management
 from backend.args import dynamic_args
 from backend.attention import attention_function
 from backend.quant_ops import ck
+from backend.sampling.invariant_cache import cached_invariant
 from backend.utils import fp16_fix, pad_to_patch_size
 
 
@@ -467,6 +468,7 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         control=None,
         transformer_options: dict[str, list] = {},
         attn_mask: torch.Tensor = None,
+        position_geometry=None,
     ) -> torch.Tensor:
 
         patches = transformer_options.get("patches", {})
@@ -487,9 +489,14 @@ class IntegratedFluxTransformer2DModel(nn.Module):
                 y = torch.zeros((img.shape[0], self.vec_in_dim), device=img.device, dtype=img.dtype)
             vec = vec + self.vector_in(y[:, : self.vec_in_dim])
 
-        if self.txt_norm is not None:
-            txt = self.txt_norm(txt)
-        txt = self.txt_in(txt)
+        def project_text():
+            features = self.txt_norm(txt) if self.txt_norm is not None else txt
+            return self.txt_in(features)
+
+        # DoubleStreamBlock updates its text stream in-place. The cached
+        # projection must never be exposed to those writes.
+        txt = cached_invariant(self, "flux_text_projection", txt, transformer_options,
+                               project_text, clone=True, geometry=(img.dtype, img.device))
 
         vec_orig = vec
         if self.global_modulation:
@@ -505,7 +512,12 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         if img_ids is not None:
             ids = torch.cat((txt_ids, img_ids), dim=1)
-            pe = self.pe_embedder(ids)
+            if position_geometry is not None and not patches and not patches_replace:
+                pe = cached_invariant(self.pe_embedder, "flux_rope", ids, transformer_options,
+                                      lambda: self.pe_embedder(ids),
+                                      geometry=(position_geometry, tuple(self.pe_embedder.axes_dim), self.pe_embedder.theta))
+            else:
+                pe = self.pe_embedder(ids)
         else:
             pe = None
 
@@ -651,7 +663,9 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             for i in self.txt_ids_dims:
                 txt_ids[:, :, i] = torch.linspace(0, context.shape[1] - 1, steps=context.shape[1], device=x.device, dtype=torch.float32)
 
-        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options, attn_mask=kwargs.get("attention_mask", None))
+        geometry = None if ref_latents else (h_len, w_len, context.shape[1], tuple(self.txt_ids_dims), patch_size)
+        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options,
+                                attn_mask=kwargs.get("attention_mask", None), position_geometry=geometry)
         out = out[:, :img_tokens]
 
         return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=self.patch_size, pw=self.patch_size)[:, :, :h_orig, :w_orig]

@@ -33,6 +33,14 @@ class InvariantCache:
         # are visited in the same order on each denoising evaluation.
         if key in self.entries or not size or self.bytes_used + size > self.max_bytes:
             return False
+        # Avoid retaining additional GPU storage under pressure. The reserved
+        # allocator pool may be reusable, but the driver-only check is deliberately
+        # conservative for an experimental cache on an 8 GB GPU.
+        sample = value[0] if isinstance(value, tuple) and value else value
+        if isinstance(sample, torch.Tensor) and sample.is_cuda:
+            free, _ = torch.cuda.mem_get_info(sample.device)
+            if free < 256 * 1024 * 1024 + size:
+                return False
         self.entries[key] = value
         self.bytes_used += size
         return True
@@ -83,6 +91,7 @@ def invariants_enabled(module, tensor, options):
     return (_CACHE.get() is not None and _REVISION.get() is not None
             and _CONDITION.get() is not None and not torch.is_grad_enabled()
             and isinstance(tensor, torch.Tensor) and not module.training
+            and not torch.is_autocast_enabled(tensor.device.type)
             and isinstance(options, dict) and options.keys() <= _SAFE_OPTIONS)
 
 

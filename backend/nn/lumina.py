@@ -13,6 +13,7 @@ from backend.attention import attention_function
 from backend.nn.flux import EmbedND
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
+from backend.sampling.invariant_cache import cached_invariant
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -383,11 +384,25 @@ class NextDiT(nn.Module):
             x = torch.cat((x, self.x_pad_token.to(device=x.device, dtype=dtype, copy=True).unsqueeze(0).repeat(x.shape[0], pad_extra, 1)), dim=1)
             x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
 
-        freqs_cis = self.rope_embedder(torch.cat((cap_pos_ids, x_pos_ids), dim=1)).movedim(1, 2).to(dtype)
+        position_ids = torch.cat((cap_pos_ids, x_pos_ids), dim=1)
+        geometry = (H_tokens, W_tokens, cap_pos_ids.shape[1], self.pad_tokens_multiple,
+                    tuple(self.rope_embedder.axes_dim), self.rope_embedder.theta, dtype)
+        freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
+                                    lambda: self.rope_embedder(position_ids).movedim(1, 2).to(dtype),
+                                    geometry=geometry)
 
-        # refine context
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_mask, freqs_cis[:, : cap_pos_ids.shape[1]], transformer_options=transformer_options)
+        def refine_context():
+            features = cap_feats
+            for layer in self.context_refiner:
+                features = layer(features, cap_mask, freqs_cis[:, : cap_pos_ids.shape[1]], transformer_options=transformer_options)
+            return features
+
+        # A dynamic mask can alter the context-refiner output; do not cache it.
+        if cap_mask is None:
+            cap_feats = cached_invariant(self, "lumina_context_refiner", cap_feats, transformer_options,
+                                         refine_context, geometry=geometry)
+        else:
+            cap_feats = refine_context()
 
         padded_img_mask = None
         for layer in self.noise_refiner:
@@ -409,7 +424,8 @@ class NextDiT(nn.Module):
         t = self.t_embedder(t * self.time_scale, dtype=x.dtype)  # (N, D)
         adaln_input = t
 
-        cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+        cap_feats = cached_invariant(self, "lumina_text_projection", cap_feats, transformer_options,
+                                     lambda: self.cap_embedder(cap_feats), geometry=(x.dtype, x.device))
 
         if self.clip_text_pooled_proj is not None:
             pooled = kwargs.get("clip_text_pooled", None)
