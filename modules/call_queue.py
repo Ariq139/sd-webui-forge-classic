@@ -32,20 +32,31 @@ def wrap_gradio_gpu_call(func, extra_outputs=None):
             id_task = None
 
         with queue_lock:
-            shared.state.begin(job=id_task)
-            progress.start_task(id_task)
-
             try:
+                shared.state.begin(job=id_task)
+                progress.start_task(id_task)
                 res = func(*args, **kwargs)
                 progress.record_results(id_task, res)
             finally:
-                progress.finish_task(id_task)
-
-            shared.state.end()
+                try:
+                    shared.state.end()
+                finally:
+                    _reset_job_state()
+                    progress.finish_task(id_task)
 
         return res
 
-    return wrap_gradio_call(f, extra_outputs=extra_outputs, add_stats=True)
+    return wrap_gradio_call_no_job(f, extra_outputs=extra_outputs, add_stats=True)
+
+
+def _reset_job_state():
+    shared.state.skipped = False
+    shared.state.interrupted = False
+    shared.state.stopping_generation = False
+    shared.state.infinite_generation = False
+    shared.state.infinite_batch = 0
+    shared.state.job_count = 0
+    shared.state.job = ""
 
 
 def wrap_gradio_call(func, extra_outputs=None, add_stats=False):
@@ -54,11 +65,12 @@ def wrap_gradio_call(func, extra_outputs=None, add_stats=False):
         try:
             res = func(*args, **kwargs)
         finally:
-            shared.state.skipped = False
-            shared.state.interrupted = False
-            shared.state.stopping_generation = False
-            shared.state.job_count = 0
-            shared.state.job = ""
+            # Legacy non-GPU callbacks must not clear a generation that owns the queue.
+            if queue_lock.acquire(blocking=False):
+                try:
+                    _reset_job_state()
+                finally:
+                    queue_lock.release()
         return res
 
     return wrap_gradio_call_no_job(f, extra_outputs, add_stats)

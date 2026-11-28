@@ -18,6 +18,8 @@ class State:
     skipped = False
     interrupted = False
     stopping_generation = False
+    infinite_generation = False
+    infinite_batch = 0
     job = ""
     job_no = 0
     job_count = 0
@@ -108,6 +110,8 @@ class State:
             "skipped": self.skipped,
             "interrupted": self.interrupted,
             "stopping_generation": self.stopping_generation,
+            "infinite_generation": self.infinite_generation,
+            "infinite_batch": self.infinite_batch,
             "job": self.job,
             "job_count": self.job_count,
             "job_timestamp": self.job_timestamp,
@@ -133,6 +137,8 @@ class State:
         self.skipped = False
         self.interrupted = False
         self.stopping_generation = False
+        self.infinite_generation = False
+        self.infinite_batch = 0
         self.textinfo = None
         self.job = job
         devices.torch_gc()
@@ -143,6 +149,8 @@ class State:
         log.info("Ending job %s (%.2f seconds)", self.job, duration)
         self.job = ""
         self.job_count = 0
+        self.infinite_generation = False
+        self.infinite_batch = 0
 
         devices.torch_gc()
 

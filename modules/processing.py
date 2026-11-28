@@ -30,7 +30,8 @@ from backend.performance import record_region
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
 from modules.latent_retention import retain_latents, scripts_require_latents
-from modules import batch_planning, devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
+from modules import infinite_generation as inf
+from modules import batch_planning, grouped_inputs, devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
 from modules.sd_models import apply_token_merging, forge_model_reload
 from modules.sd_samplers_common import approximation_indexes, decode_first_stage, images_tensor_to_samples
 from modules.shared import cmd_opts, opts, state
@@ -813,6 +814,8 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     p._current_output_index = None
     p._extra_network_original_batch_size = p.batch_size
     p._extra_network_original_n_iter = p.n_iter
+    if p.infinite_generation:
+        p._infinite_source_indices = None
     if len(p.all_prompts or ()) <= 1:
         return
     if not p.infinite_generation and (p.disable_extra_networks or p.batch_size <= 1):
@@ -837,7 +840,7 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
         fields = ("all_prompts", "all_negative_prompts", "all_seeds", "all_subseeds", "all_hr_prompts", "all_hr_negative_prompts")
         p._infinite_pending_groups = []
         for group in groups:
-            values = {}
+            values = {"_infinite_source_indices": list(group)}
             for field in fields:
                 items = getattr(p, field, None)
                 if items is not None and len(items) >= len(signatures):
@@ -853,12 +856,6 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     batch_plan = batch_planning.group_extra_network_batches(signatures, p.batch_size)
     if batch_plan is None:
         logger.info("Different extra-network selections are batch-aligned; keeping the requested batch size.")
-        return
-
-    if getattr(p, "init_images", None) is not None:
-        logger.info("Different extra-network selections detected; img2img will process one image per batch.")
-        p.batch_size = 1
-        p.n_iter = len(p.all_prompts)
         return
 
     p._extra_network_batch_plan = batch_plan
@@ -920,39 +917,13 @@ def _refresh_infinite_batch(p: StableDiffusionProcessing):
         for i in range(batch_size)
     ]
 
+    inf.reset_hr_prompts(p, batch_size)
     if p.scripts is not None:
         p.scripts.process(p)
 
-    p._infinite_next_seed_offset = offset + len(p.all_prompts or ())
+    cycle_count = inf.normalize_cycle(p, batch_size, seed_is_sequence, subseed_is_sequence)
+    p._infinite_next_seed_offset = offset + cycle_count
     _split_batches_for_extra_networks(p)
-
-    prompts = list((p.all_prompts or [base_prompt])[: p.batch_size])
-    negative_prompts = list((p.all_negative_prompts or [base_negative_prompt])[: p.batch_size])
-    if not prompts:
-        prompts = [base_prompt]
-    if not negative_prompts:
-        negative_prompts = [base_negative_prompt]
-    while len(prompts) < p.batch_size:
-        prompts.append(prompts[-1])
-    while len(negative_prompts) < p.batch_size:
-        negative_prompts.append(negative_prompts[-1])
-
-    if getattr(p, "enable_hr", False):
-        hr_prompt = p.hr_prompt[0] if isinstance(p.hr_prompt, list) and p.hr_prompt else p.hr_prompt
-        hr_negative_prompt = p.hr_negative_prompt[0] if isinstance(p.hr_negative_prompt, list) and p.hr_negative_prompt else p.hr_negative_prompt
-        hr_prompts = list((getattr(p, "all_hr_prompts", None) or [hr_prompt or base_prompt])[: p.batch_size])
-        hr_negative_prompts = list((getattr(p, "all_hr_negative_prompts", None) or [hr_negative_prompt or base_negative_prompt])[: p.batch_size])
-        while len(hr_prompts) < p.batch_size:
-            hr_prompts.append(hr_prompts[-1])
-        while len(hr_negative_prompts) < p.batch_size:
-            hr_negative_prompts.append(hr_negative_prompts[-1])
-        p.all_hr_prompts = hr_prompts
-        p.all_hr_negative_prompts = hr_negative_prompts
-
-    p.all_prompts = prompts
-    p.all_negative_prompts = negative_prompts
-    p.all_seeds = list(p.all_seeds[: p.batch_size])
-    p.all_subseeds = list(p.all_subseeds[: p.batch_size])
 
 
 def apply_model_capabilities(p: StableDiffusionProcessing):
@@ -1052,7 +1023,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     p._retain_all_pixels = bool(getattr(p, "retain_all_pixels", False) or retain_all)
     if p.scripts is not None:
         p._retain_all_pixels |= scripts_require_latents(p.scripts, p.script_args, "requires_all_pixels")
-    with retain_latents(p, retain_all), batch_planning.restore_grouped_batch_settings(p):
+    inf.require_bounded_retention(p.infinite_generation, retain_all, p._retain_all_pixels)
+    with inf.generation_state(state, p.infinite_generation), retain_latents(p, retain_all), batch_planning.restore_grouped_batch_settings(p):
         return _process_images_inner(p)
 
 
@@ -1117,6 +1089,9 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
         p._infinite_prompt_template = p.all_prompts[0]
         p._infinite_negative_prompt_template = p.all_negative_prompts[0]
         p._infinite_batch_size = p.batch_size
+        if getattr(p, "enable_hr", False):
+            p._infinite_hr_prompts_template = list(p.all_hr_prompts)
+            p._infinite_hr_negative_prompts_template = list(p.all_hr_negative_prompts)
 
     if isinstance(seed, list):
         p.all_seeds = seed
@@ -1132,26 +1107,39 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
         p.scripts.process(p)
 
     if p.infinite_generation:
+        p._infinite_seed_is_sequence = isinstance(seed, list)
+        p._infinite_subseed_is_sequence = isinstance(subseed, list)
+        p._infinite_next_seed_offset = inf.normalize_cycle(
+            p, p._infinite_batch_size, p._infinite_seed_is_sequence, p._infinite_subseed_is_sequence
+        )
         p._infinite_base_seeds = list(p.all_seeds)
         p._infinite_base_subseeds = list(p.all_subseeds)
         p._infinite_pending_groups = []
         p._infinite_cycle = 0
-        p._infinite_next_seed_offset = len(p.all_prompts)
-        p._infinite_seed_is_sequence = isinstance(seed, list)
-        p._infinite_subseed_is_sequence = isinstance(subseed, list)
     _split_batches_for_extra_networks(p)
     batch_plan = getattr(p, "_extra_network_batch_plan", None)
     original_batch_size = getattr(p, "_extra_network_original_batch_size", p.batch_size)
     original_n_iter = getattr(p, "_extra_network_original_n_iter", p.n_iter)
+    grouped_img2img = isinstance(p, StableDiffusionProcessingImg2Img) and (batch_plan is not None or p.infinite_generation)
+    if grouped_img2img:
+        if _is_video or args.dynamic_args.pid or getattr(p, "init_latent", None) is not None:
+            raise ValueError("Regrouped img2img requires standard image inputs, not video, PiD, or precomputed latents.")
+        source_images = list(p.init_images or ())
+        grouped_inputs.source_indices([], original_batch_size, len(source_images))
+        initial_geometry = (p.width, p.height, p.inpaint_full_res)
+        if p.image_mask is not None and len({image.size for image in source_images}) > 1:
+            raise ValueError("Grouped inpainting source images must have identical sizes.")
     infotexts = []
     output_images = []
+    last_completed = None
     output_order_records = []
     infotext_order_records = []
     latent_order_records = []
     pixel_order_records = []
     with torch.inference_mode():
         with devices.autocast():
-            p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
+            if not grouped_img2img:
+                p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
 
             # for OSX, loading the model during sampling changes the generated picture, so it is loaded here
             if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
@@ -1170,13 +1158,15 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if n and not p._retain_all_pixels:
                 p.pixels_after_sampling.clear()
 
-            if p.infinite_generation and n:
-                # Infinite runs return the latest batch instead of retaining an unbounded gallery.
-                output_images.clear()
-                infotexts.clear()
-                p.extra_result_images.clear()
-                p.latents_after_sampling.clear()
-                p.pixels_after_sampling.clear()
+            if p.infinite_generation:
+                state.infinite_batch = n + 1
+                if n:
+                    # The previous completed result stays committed until a new batch succeeds.
+                    output_images.clear()
+                    infotexts.clear()
+                    p.extra_result_images.clear()
+                    p.latents_after_sampling.clear()
+                    p.pixels_after_sampling.clear()
 
             if state.skipped:
                 state.skipped = False
@@ -1212,6 +1202,20 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.negative_prompts = p.all_negative_prompts[batch_start:batch_end]
                 p.seeds = p.all_seeds[batch_start:batch_end]
                 p.subseeds = p.all_subseeds[batch_start:batch_end]
+
+            if not p.prompts:
+                break
+            if grouped_img2img:
+                # Encode only the source slots selected for this LoRA group.
+                # A new group must not reuse the preceding group's masks/latents.
+                indices = (getattr(p, "_infinite_source_indices", None) or batch_indices) if p.infinite_generation else batch_indices
+                p.batch_size = len(p.prompts)
+                p.width, p.height, p.inpaint_full_res = initial_geometry
+                p.init_latent = p.image_conditioning = None
+                p.mask = p.nmask = p.mask_for_overlay = None
+                p.overlay_images = p.color_corrections = p.paste_to = None
+                with grouped_inputs.group_sources(p, source_images, original_batch_size, indices), devices.autocast():
+                    p.init(p.prompts, p.seeds, p.subseeds)
 
             if args.dynamic_args.pid:
                 _shape = (3, p.height, p.width)
@@ -1471,10 +1475,24 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             devices.torch_gc(force=False)
 
+            if p.infinite_generation and output_images and not state.interrupted and not state.skipped:
+                last_completed = inf.capture_completed(p, output_images, infotexts, video_path)
+
             if n == 0 and not cmd_opts.no_prompt_history:
                 with open(os.path.join(paths.data_path, "params.txt"), "w", encoding="utf8") as file:
                     processed = Processed(p, [])
                     file.write(processed.infotext(p, 0))
+
+        if p.infinite_generation:
+            if last_completed is not None:
+                output_images, infotexts, video_path = inf.restore_completed(p, last_completed)
+            elif state.interrupted or state.skipped:
+                # An incomplete first batch is not a committed result.
+                output_images.clear()
+                infotexts.clear()
+                p.extra_result_images.clear()
+                p.pixels_after_sampling.clear()
+                video_path = None
 
         if batch_plan is not None:
             output_images, infotexts = batch_planning.restore_grouped_output_order(output_images, output_order_records, infotext_order_records)
@@ -1504,7 +1522,7 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
         index_of_first_image = 0
         unwanted_grid_because_of_img_count = len(output_images) < 2 and opts.grid_only_if_multiple
-        if (opts.return_grid or opts.grid_save) and not p.do_not_save_grid and not unwanted_grid_because_of_img_count:
+        if output_images and (opts.return_grid or opts.grid_save) and not p.do_not_save_grid and not unwanted_grid_because_of_img_count:
             grid = images.image_grid(output_images, original_batch_size)
 
             if opts.return_grid:
@@ -1515,7 +1533,8 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 output_images.insert(0, grid)
                 index_of_first_image = 1
             if opts.grid_save:
-                images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(use_main_prompt=True), short_filename=not opts.grid_extended_filename, p=p, grid=True)
+                grid_info = infotexts[0] if p.infinite_generation else infotext(use_main_prompt=True)
+                images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=grid_info, short_filename=not opts.grid_extended_filename, p=p, grid=True)
 
     if not p.disable_extra_networks and p.extra_network_data:
         extra_networks.deactivate(p, p.extra_network_data)
@@ -1533,6 +1552,14 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
         extra_images_list=p.extra_result_images,
     )
 
+    if batch_plan is not None and output_order_records:
+        # On interruption, group order may have skipped original slots.
+        actual_indices = [record[0] for record in sorted(output_order_records)]
+        res.all_prompts = [p.all_prompts[i] for i in actual_indices]
+        res.all_negative_prompts = [p.all_negative_prompts[i] for i in actual_indices]
+        res.all_seeds = [p.all_seeds[i] for i in actual_indices]
+        res.all_subseeds = [p.all_subseeds[i] for i in actual_indices]
+        res.seed, res.subseed = res.all_seeds[0], res.all_subseeds[0]
     res.video_path = video_path
 
     if p.scripts is not None:
@@ -1827,7 +1854,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             if not isinstance(image, Image.Image):
                 image = sd_samplers.sample_to_image(image, index, approximation=0)
 
-            info = create_infotext(self, self.all_prompts, self.all_seeds, self.all_subseeds, [], iteration=self.iteration, position_in_batch=index)
+            info = create_infotext(self, self.all_prompts, self.all_seeds, self.all_subseeds, [], index=inf.intermediate_index(self, index))
             images.save_image(image, self.outpath_samples, "", seeds[index], prompts[index], opts.samples_format, info=info, p=self, suffix="-before-highres-fix")
 
         img2img_sampler_name = self.hr_sampler_name or self.sampler_name

@@ -75,6 +75,52 @@ class ProcessingBatchGroupTests(unittest.TestCase):
         self.assertEqual(p.all_prompts, ["choice-105"])
         self.assertEqual(p.all_seeds, [105])
 
+    def test_infinite_static_seed_offsets_do_not_overlap(self):
+        p = self.processing.StableDiffusionProcessingTxt2Img(
+            prompt="static", negative_prompt="", batch_size=3, n_iter=1,
+            seed=100, subseed=200, infinite_generation=True,
+        )
+        p._infinite_prompt_template = p.prompt
+        p._infinite_negative_prompt_template = p.negative_prompt
+        p._infinite_batch_size = 3
+        p._infinite_base_seeds = [100, 101, 102]
+        p._infinite_base_subseeds = [200, 201, 202]
+        p._infinite_next_seed_offset = 3
+        with mock.patch.object(self.processing, "_extra_network_signature", return_value=()):
+            for offset in (3, 6, 9):
+                self.processing._refresh_infinite_batch(p)
+                self.assertEqual(p.all_seeds, list(range(100 + offset, 103 + offset)))
+                self.assertEqual(p.all_subseeds, list(range(200 + offset, 203 + offset)))
+                self.assertEqual(len(p.all_prompts), 3)
+                self.assertEqual(p._infinite_next_seed_offset, offset + 3)
+
+    def test_infinite_hr_refresh_rebuilds_arrays_before_grouping(self):
+        p = self.processing.StableDiffusionProcessingTxt2Img(
+            prompt="template", negative_prompt="", batch_size=3, n_iter=1, enable_hr=True,
+            hr_prompt="hr", hr_negative_prompt="hr neg", seed=100, subseed=200, infinite_generation=True,
+        )
+        p._infinite_batch_size = 3
+        p._infinite_base_seeds = [100, 101, 102]
+        p._infinite_base_subseeds = [200, 201, 202]
+        p._infinite_hr_prompts_template = ["hr A", "hr B", "hr C"]
+        p._infinite_hr_negative_prompts_template = ["hr neg"] * 3
+        p.all_hr_prompts = ["previous group"]
+        p.all_hr_negative_prompts = ["previous group"]
+        runner = mock.MagicMock()
+        def expand(processing):
+            processing.all_prompts = ["lora A", "lora B", "lora C"]
+        runner.process.side_effect = expand
+        p.scripts_value = runner
+        with mock.patch.object(self.processing, "_extra_network_signature", side_effect=lambda prompt: prompt):
+            self.processing._refresh_infinite_batch(p)
+            self.assertEqual(p.all_hr_prompts, ["hr A"])
+            self.processing._take_infinite_group(p)
+            self.assertEqual(p.all_hr_prompts, ["hr B"])
+            self.processing._take_infinite_group(p)
+            self.assertEqual(p.all_hr_prompts, ["hr C"])
+            self.processing._refresh_infinite_batch(p)
+            self.assertEqual(p.all_hr_prompts, ["hr A"])
+
     def test_aligned_signatures_keep_requested_batches(self):
         signatures = ["a", "a", "b", "b"]
 

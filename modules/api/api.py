@@ -26,7 +26,8 @@ import modules.textual_inversion.textual_inversion
 from modules import errors, images, infotext_utils, postprocessing, restart, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, ui
 from modules.api import models
 from modules.processing import StableDiffusionProcessingImg2Img, StableDiffusionProcessingTxt2Img, process_extra_images, process_images
-from modules.progress import add_task_to_queue, create_task_id, current_task, finish_task, start_task
+from modules import progress as generation_progress
+from modules.progress import add_task_to_queue, create_task_id, finish_task, start_task
 from modules.shared import cmd_opts, opts
 
 
@@ -611,25 +612,30 @@ class Api:
         if shared.state.job_count == 0:
             return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
 
-        # avoid dividing zero
-        progress = 0.01
+        textinfo = shared.state.textinfo
+        if shared.state.infinite_generation:
+            from modules.infinite_generation import progress_text
 
-        if shared.state.job_count > 0:
-            progress += shared.state.job_no / shared.state.job_count
-        if shared.state.sampling_steps > 0:
-            progress += 1 / shared.state.job_count * shared.state.sampling_step / shared.state.sampling_steps
+            # The public API reports overall progress; an infinite request has no total or ETA.
+            progress = 0
+            eta_relative = 0
+            textinfo = progress_text(shared.state)
+        else:
+            progress = 0.01
+            if shared.state.job_count > 0:
+                progress += shared.state.job_no / shared.state.job_count
+                if shared.state.sampling_steps > 0:
+                    progress += 1 / shared.state.job_count * shared.state.sampling_step / shared.state.sampling_steps
 
-        time_since_start = time.time() - shared.state.time_start
-        eta = time_since_start / progress
-        eta_relative = eta - time_since_start
-
-        progress = min(progress, 1)
+            time_since_start = time.time() - shared.state.time_start
+            eta_relative = max(0, time_since_start / progress - time_since_start)
+            progress = min(progress, 1)
 
         current_image = None
         if shared.state.current_image and not req.skip_current_image:
             current_image = encode_pil_to_base64(shared.state.current_image)
 
-        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=shared.state.textinfo, current_task=current_task)
+        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=textinfo, current_task=generation_progress.current_task
 
     def interruptapi(self):
         shared.state.interrupt()

@@ -60,6 +60,8 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
     batch_results = None
     discard_further_results = False
+    requested_batch_size, requested_n_iter = p.batch_size, p.n_iter
+    requested_full_res = p.inpaint_full_res
     for i, image in enumerate(batch_images):
         state.job = f"{i+1} out of {len(batch_images)}"
         if state.skipped:
@@ -87,7 +89,12 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
         if p.resize_mode < 4 and not (_w % _STEP == 0 and _h % _STEP == 0):
             img = images.resize_image(1, img, sRound(_w), sRound(_h))
 
-        p.init_images = [img] * p.batch_size
+        # Each input owns its latents, masks and crop geometry.
+        p.init_latent = p.image_conditioning = None
+        p.mask = p.nmask = p.mask_for_overlay = None
+        p.overlay_images = p.color_corrections = p.paste_to = None
+        p.inpaint_full_res = requested_full_res
+        p.init_images = [img]
 
         image_path = Path(image)
         if is_inpaint_batch:
@@ -158,10 +165,12 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             filename_pattern = f"{image_path.stem}-[generation_number]" if p.n_iter > 1 or p.batch_size > 1 else f"{image_path.stem}"
             p.override_settings["samples_filename_pattern"] = filename_pattern
 
-        proc = modules.scripts.scripts_img2img.run(p, *args)
-
-        if proc is None:
-            proc = process_images(p)
+        try:
+            proc = modules.scripts.scripts_img2img.run(p, *args)
+            if proc is None:
+                proc = process_images(p)
+        finally:
+            p.batch_size, p.n_iter = requested_batch_size, requested_n_iter
 
         if not discard_further_results and proc:
             if batch_results:

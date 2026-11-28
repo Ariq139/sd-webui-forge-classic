@@ -117,7 +117,9 @@ class Toprow:
             self.submit = gr.Button("Generate", elem_id=f"{self.id_part}_generate", variant="primary", tooltip="Right click generate forever menu")
 
             def interrupt_function():
-                if not shared.state.stopping_generation and shared.state.job_count > 1 and shared.opts.interrupt_after_current:
+                from modules.infinite_generation import stop_after_current
+
+                if stop_after_current(shared.state, shared.opts.interrupt_after_current):
                     shared.state.stop_generating()
                     gr.Info("Generation will stop after finishing this image, click again to stop immediately.")
                 else:
