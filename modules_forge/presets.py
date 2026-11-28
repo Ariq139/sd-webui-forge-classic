@@ -417,6 +417,10 @@ def register(options_templates: dict):
                         "ltx2_seed": OptionInfo(-1, "Seed", Number, {"minimum": -1, "maximum": 2**31 - 1, "step": 1}),
                         "ltx2_include_audio": OptionInfo(True, "Include generated audio", Checkbox),
                         "ltx2_cross_timestep_mode": OptionInfo("Automatic", "Cross timestep mode", Dropdown, {"choices": ["Automatic", "LTX-2.3", "LTX-2.0"]}),
+                        "ltx2_workflow": OptionInfo("Full", "LTX workflow", Dropdown, {"choices": ["Full", "Distilled 8", "Full + refine 2x", "Distilled + refine 2x"]}),
+                        "ltx2_quantization": OptionInfo("Checkpoint", "LTX native quantization (experimental)", Dropdown, {"choices": ["Checkpoint", "NF4 denoisers", "NF4 denoisers + text encoder"]}),
+                        "ltx2_upsampler_path": OptionInfo("", "Local latent upsampler directory", Textbox),
+                        "ltx2_refine_lora": OptionInfo("", "Local distilled refinement LoRA", Textbox),
                     },
                 )
             )
@@ -435,6 +439,10 @@ def register(options_templates: dict):
                         "ideogram_prompt_cache": OptionInfo(True, "Cache prompt embeddings", Checkbox).info("cache the last four encoded prompts"),
                         "ideogram_compile": OptionInfo(False, "Compile denoiser", Checkbox).info("experimental; requires CUDA and CPU offload set to none"),
                         "ideogram_polish_guidance": OptionInfo(True, "Final CFG polishing", Checkbox),
+                        "ideogram_recipe": OptionInfo("Custom", "Sampler recipe", Dropdown, {"choices": ["Custom", "Quality 48", "Default 20", "Turbo 12"]}),
+                        "ideogram_custom_schedule": OptionInfo("", "Custom CFG schedule", Textbox),
+                        "ideogram_quantization": OptionInfo("Checkpoint", "Native quantization", Dropdown, {"choices": ["Checkpoint", "NF4 denoisers", "NF4 denoisers + text encoder"]}),
+                        "ideogram_enhancer_path": OptionInfo("", "Local prompt enhancer head directory", Textbox),
                         "ideogram_mu": OptionInfo(0.0, "Flow schedule mu", Number, {"minimum": -10, "maximum": 10, "step": 0.1}),
                         "ideogram_std": OptionInfo(1.5, "Flow schedule std", Number, {"minimum": 0.01, "maximum": 10, "step": 0.1}),
                         "ideogram_prompt_upsampling": OptionInfo(False, "Prompt upsampling", Checkbox),

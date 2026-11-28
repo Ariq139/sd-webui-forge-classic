@@ -3,6 +3,7 @@ import datetime
 import io
 import ipaddress
 import os
+import re
 import time
 from contextlib import closing, contextmanager
 from io import BytesIO
@@ -17,14 +18,14 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import PngImagePlugin
 
 import modules.shared as shared
 import modules.textual_inversion.textual_inversion
 from modules import errors, images, infotext_utils, postprocessing, restart, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, ui
-from modules.api import models
+from modules.api import models, native_models
 from modules.processing import StableDiffusionProcessingImg2Img, StableDiffusionProcessingTxt2Img, process_extra_images, process_images
 from modules import progress as generation_progress
 from modules.progress import add_task_to_queue, create_task_id, finish_task, start_task
@@ -32,15 +33,15 @@ from modules.shared import cmd_opts, opts
 
 
 @contextmanager
-def api_generation_task(task_id, job):
+def api_generation_task(task_id, job, *, allow_native=False):
     """Finalize pending/active tasks even if construction or inference fails."""
     started = False
     try:
         start_task(task_id)
         shared.state.begin(job=job)
         started = True
-        if opts.forge_preset in ("ltx2", "ideogram"):
-            raise HTTPException(status_code=422, detail="This native preset is not supported by the standard image generation API. Use its WebUI page.")
+        if not allow_native and opts.forge_preset in ("ltx2", "ideogram"):
+            raise HTTPException(status_code=422, detail="This native preset is not supported by the standard image generation API. Use its native API endpoint or WebUI page.")
         yield
     finally:
         try:
@@ -227,6 +228,12 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
+        from modules_forge.native_requests import PageJobOwner
+        self.native_owner = PageJobOwner()
+        self.add_api_route("/sdapi/v1/native/ideogram", self.native_ideogram, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/ltx2", self.native_ltx2, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/{task_id}/interrupt", self.native_interrupt, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/video/{filename}", self.native_video, methods=["GET"])
         # api_middleware(self.app)  # FIXME: (legacy) this will have to be fixed
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
@@ -576,6 +583,59 @@ class Api:
             img2imgreq.mask = None
 
         return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+
+    def native_ideogram(self, req: native_models.IdeogramRequest):
+        from modules import ui_ideogram
+        from modules_forge import main_thread, native_validation
+        from modules_forge.native_outputs import gallery_metadata
+
+        task_id = create_task_id("ideogram")
+        seed = native_validation.actual_seed(req.seed)
+        add_task_to_queue(task_id)
+        with self.queue_lock, api_generation_task(task_id, "native_ideogram", allow_native=True):
+            if opts.forge_preset != "ideogram":
+                raise HTTPException(status_code=409, detail="Select the Ideogram preset first.")
+            with self.native_owner.active(task_id):
+                result = main_thread.run_and_wait_result(ui_ideogram.generate_from_preset, req.prompt, width=req.width, height=req.height, num_images=req.num_images, steps=req.steps, guidance=req.guidance, seed=seed)
+            if not result or not result[0]:
+                raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
+            output, status = result
+            return {"task_id": task_id, "images": [encode_pil_to_base64(image) for image in output], "info": gallery_metadata(output), "status": status}
+
+    def native_ltx2(self, req: native_models.LTXRequest):
+        from modules import ui_ltx2_video
+        from modules_forge import main_thread, native_validation
+        from modules_forge.native_outputs import video_metadata
+
+        condition = None
+        if req.image:
+            if req.image.startswith(("http://", "https://")):
+                raise HTTPException(status_code=422, detail="Supply a base64 image, not a URL.")
+            condition = decode_base64_to_image(req.image).convert("RGB")
+        task_id = create_task_id("ltx2")
+        seed = native_validation.actual_seed(req.seed)
+        add_task_to_queue(task_id)
+        with self.queue_lock, api_generation_task(task_id, "native_ltx2", allow_native=True):
+            if opts.forge_preset != "ltx2":
+                raise HTTPException(status_code=409, detail="Select the LTX2 preset first.")
+            with self.native_owner.active(task_id):
+                result = main_thread.run_and_wait_result(ui_ltx2_video.generate_from_preset, req.prompt, req.negative_prompt, condition, width=req.width, height=req.height, frames=req.frames, steps=req.steps, guidance=req.guidance, seed=seed)
+            if not result or not result[0]:
+                raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
+            path, status = result
+            return {"task_id": task_id, "video": os.path.basename(path), "download": "/sdapi/v1/native/video/" + os.path.basename(path), "info": video_metadata(path), "status": status}
+
+    def native_video(self, filename: str):
+        if not re.fullmatch(r"ltx2-[0-9a-f]{32}\.mp4", filename):
+            raise HTTPException(status_code=404, detail="Native video not found")
+        directory = os.path.realpath(opts.outdir_videos)
+        path = os.path.realpath(os.path.join(directory, filename))
+        if os.path.dirname(path) != directory or not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Native video not found")
+        return FileResponse(path, media_type="video/mp4", filename=filename)
+
+    def native_interrupt(self, task_id: str):
+        return {"interrupted": self.native_owner.interrupt(task_id, shared.state.interrupt)}
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)

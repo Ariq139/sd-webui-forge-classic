@@ -54,11 +54,19 @@ def ltx_cross_timestep(config, mode="Automatic"):
     return bool(get("cross_attn_mod", False) or get("audio_cross_attn_mod", False))
 
 
-def audio_override(audio, video, label):
+class _ExplicitZero(float):
+    """Preserve explicit zero through the pinned pipeline's erroneous `a or b` default."""
+    def __bool__(self):
+        return True
+
+
+def audio_override(audio, video, label, version=None):
     audio = finite_number(audio, label, 0)
-    # Diffusers 0.39.0 uses `audio_value or video_value`, not an explicit None test.
     if audio == 0 and video != 0:
-        raise ValueError(f"{label}=0 cannot be independent of nonzero video guidance in Diffusers 0.39.0.")
+        if version != "0.39.0":
+            raise ValueError(f"{label}=0 requires the pinned audio-guidance compatibility adapter.")
+        # The pinned pipelines subsequently use numeric comparisons/arithmetic only.
+        return _ExplicitZero(0.0)
     return audio
 
 

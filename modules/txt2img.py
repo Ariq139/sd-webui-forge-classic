@@ -200,7 +200,10 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
             )
             if not video_path:
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
-            generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+            native_info = {"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt}
+            from modules_forge.native_outputs import video_metadata
+            native_info.update(video_metadata(video_path))
+            generation_info_js = json.dumps(native_info)
             return gr.update(value=None, visible=False), gr.update(value=video_path, visible=True), generation_info_js, plaintext_to_html(status), ""
 
         from modules.ui_ideogram import generate_from_preset
@@ -211,15 +214,9 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
         )
         if not images:
             return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
-        # One RNG is used for the entire request. Do not invent per-image seeds.
-        generation_info_js = json.dumps({
-            "infotexts": [None] * len(images), "prompt": prompt,
-            "negative_prompt": "", "width": width, "height": height,
-            "batch_size": len(images), "steps": steps, "cfg_scale": guidance,
-            "sampler_name": "Ideogram 4", "index_of_first_image": 0,
-            "sd_model_name": getattr(opts, "forge_checkpoint_ideogram", ""),
-            "request_seed": seed, "all_seeds": [], "styles": native["prompt_styles"] or [],
-        })
+        from modules_forge.native_outputs import gallery_metadata
+
+        generation_info_js = json.dumps(gallery_metadata(images))
         return gr.update(value=images, visible=True), gr.update(value=None, visible=False), generation_info_js, plaintext_to_html(status), ""
 
     p = txt2img_create_processing(id_task, request, *args)

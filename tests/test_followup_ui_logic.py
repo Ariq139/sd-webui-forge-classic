@@ -92,7 +92,11 @@ class NativeValidationTests(unittest.TestCase):
     def test_audio_zero_is_not_silently_ignored(self):
         self.assertEqual(native.audio_override(0, 0, 'Audio STG'), 0)
         self.assertEqual(native.audio_override(1, 3, 'Audio CFG'), 1)
-        with self.assertRaisesRegex(ValueError, 'Diffusers 0.39.0'):
+        value = native.audio_override(0, 1, 'Audio STG', '0.39.0')
+        self.assertEqual(value or 1, 0)
+        self.assertFalse(value > 0)
+        self.assertEqual(value * 123, 0)
+        with self.assertRaises(ValueError):
             native.audio_override(0, 1, 'Audio STG')
 
     def test_ideogram_schedule_matches_pinned_recipe(self):

@@ -30,7 +30,7 @@ from backend.performance import record_region
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
 from modules.latent_retention import retain_latents, scripts_require_latents
-from modules import batch_planning, devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
+from modules import batch_planning, grouped_inputs, devices, errors, extra_networks, images, infotext_utils, masking, profiling, prompt_parser, rng, scripts, sd_samplers, sd_samplers_common, sd_unet, sd_vae_approx
 from modules.sd_models import apply_token_merging, forge_model_reload
 from modules.sd_samplers_common import approximation_indexes, decode_first_stage, images_tensor_to_samples
 from modules.shared import cmd_opts, opts, state
@@ -815,6 +815,8 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     p._current_output_index = None
     p._extra_network_original_batch_size = p.batch_size
     p._extra_network_original_n_iter = p.n_iter
+    if p.infinite_generation:
+        p._infinite_source_indices = None
     if len(p.all_prompts or ()) <= 1:
         return
     if not p.infinite_generation and (p.disable_extra_networks or p.batch_size <= 1):
@@ -839,7 +841,7 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
         fields = ("all_prompts", "all_negative_prompts", "all_seeds", "all_subseeds", "all_hr_prompts", "all_hr_negative_prompts")
         p._infinite_pending_groups = []
         for group in groups:
-            values = {}
+            values = {"_infinite_source_indices": list(group)}
             for field in fields:
                 items = getattr(p, field, None)
                 if items is not None and len(items) >= len(signatures):
@@ -855,12 +857,6 @@ def _split_batches_for_extra_networks(p: StableDiffusionProcessing):
     batch_plan = batch_planning.group_extra_network_batches(signatures, p.batch_size)
     if batch_plan is None:
         logger.info("Different extra-network selections are batch-aligned; keeping the requested batch size.")
-        return
-
-    if getattr(p, "init_images", None) is not None:
-        logger.info("Different extra-network selections detected; img2img will process one image per batch.")
-        p.batch_size = 1
-        p.n_iter = len(p.all_prompts)
         return
 
     p._extra_network_batch_plan = batch_plan
@@ -1145,6 +1141,15 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
     batch_plan = getattr(p, "_extra_network_batch_plan", None)
     original_batch_size = getattr(p, "_extra_network_original_batch_size", p.batch_size)
     original_n_iter = getattr(p, "_extra_network_original_n_iter", p.n_iter)
+    grouped_img2img = isinstance(p, StableDiffusionProcessingImg2Img) and (batch_plan is not None or p.infinite_generation)
+    if grouped_img2img:
+        if _is_video or args.dynamic_args.pid or getattr(p, "init_latent", None) is not None:
+            raise ValueError("Regrouped img2img requires standard image inputs, not video, PiD, or precomputed latents.")
+        source_images = list(p.init_images or ())
+        grouped_inputs.source_indices([], original_batch_size, len(source_images))
+        initial_geometry = (p.width, p.height, p.inpaint_full_res)
+        if p.image_mask is not None and len({image.size for image in source_images}) > 1:
+            raise ValueError("Grouped inpainting source images must have identical sizes.")
     infotexts = []
     output_images = []
     output_order_records = []
@@ -1153,7 +1158,8 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
     pixel_order_records = []
     with torch.inference_mode():
         with devices.autocast():
-            p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
+            if not grouped_img2img:
+                p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
 
             # for OSX, loading the model during sampling changes the generated picture, so it is loaded here
             if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
@@ -1214,6 +1220,20 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.negative_prompts = p.all_negative_prompts[batch_start:batch_end]
                 p.seeds = p.all_seeds[batch_start:batch_end]
                 p.subseeds = p.all_subseeds[batch_start:batch_end]
+
+            if not p.prompts:
+                break
+            if grouped_img2img:
+                # Encode only the source slots selected for this LoRA group.
+                # A new group must not reuse the preceding group's masks/latents.
+                indices = (getattr(p, "_infinite_source_indices", None) or batch_indices) if p.infinite_generation else batch_indices
+                p.batch_size = len(p.prompts)
+                p.width, p.height, p.inpaint_full_res = initial_geometry
+                p.init_latent = p.image_conditioning = None
+                p.mask = p.nmask = p.mask_for_overlay = None
+                p.overlay_images = p.color_corrections = p.paste_to = None
+                with grouped_inputs.group_sources(p, source_images, original_batch_size, indices), devices.autocast():
+                    p.init(p.prompts, p.seeds, p.subseeds)
 
             if args.dynamic_args.pid:
                 _shape = (3, p.height, p.width)
@@ -1537,6 +1557,14 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
         extra_images_list=p.extra_result_images,
     )
 
+    if batch_plan is not None and output_order_records:
+        # On interruption, group order may have skipped original slots.
+        actual_indices = [record[0] for record in sorted(output_order_records)]
+        res.all_prompts = [p.all_prompts[i] for i in actual_indices]
+        res.all_negative_prompts = [p.all_negative_prompts[i] for i in actual_indices]
+        res.all_seeds = [p.all_seeds[i] for i in actual_indices]
+        res.all_subseeds = [p.all_subseeds[i] for i in actual_indices]
+        res.seed, res.subseed = res.all_seeds[0], res.all_subseeds[0]
     res.video_path = video_path
 
     if p.scripts is not None:

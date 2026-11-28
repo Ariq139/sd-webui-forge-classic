@@ -7,7 +7,7 @@ import torch
 
 from backend import memory_management
 from modules import shared
-from modules_forge import main_thread, native_requests, native_validation
+from modules_forge import main_thread, native_requests, native_validation, native_recipes, native_outputs
 from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
@@ -16,6 +16,8 @@ from modules_forge.native_pipeline_speed import (
     configure_prompt_cache,
     configure_vae_tiling,
     load_native_pipeline,
+    native_quantization_kwargs,
+    require_dependency,
     resolve_vae_tiling_mode,
 )
 
@@ -79,6 +81,10 @@ def _sync_preset_controls(preset: str):
         _option("ideogram_prompt_temperature", 1.0),
         _option("ideogram_seed", -1),
         _option("ideogram_polish_guidance", True),
+        _option("ideogram_recipe", "Custom"),
+        _option("ideogram_custom_schedule", ""),
+        _option("ideogram_quantization", "Checkpoint"),
+        _option("ideogram_enhancer_path", ""),
     ]
 
 
@@ -131,7 +137,7 @@ def _device() -> torch.device:
     return device
 
 
-def _get_pipeline(model_path: str, precision: str, offload: str, attention_backend: str, compile_enabled: bool, prompt_cache: bool):
+def _get_pipeline(model_path: str, precision: str, offload: str, attention_backend: str, compile_enabled: bool, prompt_cache: bool, quantization="Checkpoint", enhancer_path=""):
     global _pipeline, _pipeline_key
 
     from diffusers import Ideogram4Pipeline
@@ -139,7 +145,7 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
     model_path = resolve_model_path(model_path)
     device = _device()
     dtype = _default_dtype(precision)
-    key = (model_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache))
+    key = (model_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), quantization, enhancer_path)
 
     with _pipeline_lock:
         if _pipeline is not None and _pipeline_key == key:
@@ -148,6 +154,15 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
         unload()
         unload_forge_model()
         pipeline_kwargs = {"torch_dtype": dtype}
+        pipeline_kwargs.update(native_quantization_kwargs(model_path, quantization, dtype, device, offload, ("transformer", "unconditional_transformer")))
+        if enhancer_path:
+            import os
+            from diffusers import Ideogram4PromptEnhancerHead
+
+            enhancer_path = resolve_model_path(enhancer_path)
+            if not os.path.isdir(enhancer_path):
+                raise ValueError("Select a local Ideogram prompt enhancer head directory.")
+            pipeline_kwargs["prompt_enhancer_head"] = Ideogram4PromptEnhancerHead.from_pretrained(enhancer_path, torch_dtype=dtype, local_files_only=True)
         _pipeline = load_native_pipeline(Ideogram4Pipeline, model_path, pipeline_kwargs, dtype, logger, "Ideogram 4")
         configure_pipeline(_pipeline, device, offload, attention_backend, compile_enabled, logger)
         configure_prompt_cache(_pipeline, prompt_cache, logger)
@@ -208,6 +223,10 @@ def generate(
     prompt_temperature: float,
     seed: int,
     polish_guidance: bool = True,
+    recipe: str = "Custom",
+    custom_schedule: str = "",
+    quantization: str = "Checkpoint",
+    enhancer_path: str = "",
     progress=gr.Progress(track_tqdm=True),
 ):
     if not model_path or not model_path.strip():
@@ -228,16 +247,21 @@ def generate(
         if not 1 <= steps <= 150:
             return [], "Ideogram 4 steps must be between 1 and 150."
 
-        guidance_kwargs = native_validation.ideogram_guidance(steps, guidance, polish_guidance)
+        guidance = native_validation.finite_number(guidance, "CFG scale", 0, 24)
         mu = native_validation.finite_number(mu, "Schedule mu", -10, 10)
         std = native_validation.finite_number(std, "Schedule std", 0.01, 10)
+        recipe_kwargs = native_recipes.ideogram_recipe(recipe, steps, guidance, mu, std, polish_guidance, custom_schedule)
+        steps = recipe_kwargs["num_inference_steps"]
+        if prompt_upsampling:
+            require_dependency("outlines", "Structured Ideogram prompt upsampling")
         prompt_temperature = native_validation.finite_number(prompt_temperature, "Upsampling temperature", 0.1, 2)
         seed = native_validation.actual_seed(seed)
         if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             raise _IdeogramInterrupted()
 
         pipeline_attempted = True
-        pipe = _get_pipeline(model_path, precision, offload, attention_backend, compile_enabled, prompt_cache)
+        shared.state.textinfo = "Ideogram 4: loading model"
+        pipe = _get_pipeline(model_path, precision, offload, attention_backend, compile_enabled, prompt_cache, quantization, enhancer_path)
         divisor = pipe.vae_scale_factor * pipe.patch_size
         if width % divisor or height % divisor:
             return [], f"Ideogram 4 width and height must be divisible by {divisor} for this model."
@@ -261,7 +285,18 @@ def generate(
         shared.state.id_live_preview += 1
         shared.state.textinfo = "Ideogram 4: loading and preparing"
 
-        generator = torch.Generator(device=_device()).manual_seed(seed)
+        seeds = native_recipes.seed_sequence(seed, num_images)
+        generator = [torch.Generator(device=_device()).manual_seed(s) for s in seeds]
+        effective_prompt = prompt
+        if prompt_upsampling:
+            shared.state.textinfo = "Ideogram 4: enhancing prompt"
+            with torch.inference_mode():
+                enhanced = pipe.upsample_prompt(prompt, height=height, width=width, temperature=prompt_temperature,
+                                                generator=torch.Generator(device=_device()).manual_seed(seed), device=pipe._execution_device)
+            effective_prompt = enhanced[0] if isinstance(enhanced, list) else enhanced
+            import json
+            if not isinstance(json.loads(effective_prompt), dict):
+                raise ValueError("Prompt enhancer did not produce a structured caption.")
 
         def on_step_end(_pipe, step, _timestep, callback_kwargs):
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
@@ -276,15 +311,11 @@ def generate(
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
                 raise _IdeogramInterrupted()
             result = pipe(
-                prompt=prompt,
+                prompt=effective_prompt,
                 height=height,
                 width=width,
-                num_inference_steps=steps,
-                **guidance_kwargs,
-                mu=float(mu),
-                std=float(std),
-                prompt_upsampling=bool(prompt_upsampling),
-                prompt_upsampling_temperature=float(prompt_temperature),
+                **recipe_kwargs,
+                prompt_upsampling=False,
                 num_images_per_prompt=num_images,
                 generator=generator,
                 output_type="pil",
@@ -295,11 +326,26 @@ def generate(
         if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             raise _IdeogramInterrupted()
         images = list(result.images if hasattr(result, "images") else result[0])
-        shared.state.current_image = images[0] if images else None
+        if len(images) != len(seeds):
+            raise RuntimeError("Ideogram returned an unexpected image count.")
+        shared.state.textinfo = "Ideogram 4: saving results"
+        schedule = recipe_kwargs["guidance_schedule"]
+        metadata = dict(native_model="ideogram", prompt=prompt, effective_prompt=effective_prompt, negative_prompt="",
+                        request_seed=seed, width=width, height=height, steps=steps,
+                        cfg_scale=schedule[0] if schedule else recipe_kwargs["guidance_scale"],
+                        sampler_name="Ideogram 4", sd_model_name=model_path, recipe=recipe,
+                        quantization=quantization, precision=precision, enhancer_path=enhancer_path,
+                        prompt_upsampling=bool(prompt_upsampling), prompt_temperature=prompt_temperature,
+                        sampling=recipe_kwargs, runtime=getattr(pipe, "_forge_runtime", {}))
+        saved, warnings = native_outputs.finalize_images(images, metadata, seeds)
+        shared.state.current_image = images[0]
         shared.state.sampling_step = steps
         shared.state.textinfo = "Ideogram 4: finished"
 
-        return images, f"Ideogram 4 generated {len(images)} image(s). Request seed: {seed}."
+        message = f"Ideogram 4 generated {len(images)} image(s). Request seed: {seed}. Saved: {len(saved)}."
+        if warnings:
+            message += " " + "; ".join(warnings)
+        return images, message
     except Exception as error:
         # Callback exceptions bypass Diffusers' normal final offload hooks.
         # Invalidate the failed pipeline rather than reusing partial hook state.
@@ -344,6 +390,10 @@ def generate_from_preset(prompt: str, *, width=None, height=None, num_images=Non
         _option("ideogram_prompt_temperature", 1.0),
         seed if seed is not None else _option("ideogram_seed", -1),
         _option("ideogram_polish_guidance", True),
+        _option("ideogram_recipe", "Custom"),
+        _option("ideogram_custom_schedule", ""),
+        _option("ideogram_quantization", "Checkpoint"),
+        _option("ideogram_enhancer_path", ""),
     )
 
 
@@ -402,6 +452,10 @@ def create_ui():
                         prompt_upsampling = gr.Checkbox(value=_option("ideogram_prompt_upsampling", False), label="Prompt upsampling")
                         prompt_temperature = gr.Number(value=_option("ideogram_prompt_temperature", 1.0), minimum=0.1, maximum=2, step=0.1, label="Upsampling temperature")
                     polish_guidance = gr.Checkbox(value=_option("ideogram_polish_guidance", True), label="Final CFG polishing", info="Use up to three final steps capped at CFG 3; disable for constant CFG.")
+                    recipe = gr.Dropdown(choices=list(native_recipes.IDEOGRAM_MODES), value=_option("ideogram_recipe", "Custom"), label="Sampler recipe", info="Named recipes override steps, CFG, mu and std.")
+                    custom_schedule = gr.Textbox(value=_option("ideogram_custom_schedule", ""), label="Custom per-step CFG", info="Comma-separated in sampling order; leave empty for scalar/polishing.")
+                    quantization = gr.Dropdown(choices=list(native_recipes.QUANTIZATION_MODES), value=_option("ideogram_quantization", "Checkpoint"), label="Native quantization", info="NF4 on-load is experimental; prefer a compatible prequantized checkpoint on low VRAM.")
+                    enhancer_path = gr.Textbox(value=_option("ideogram_enhancer_path", ""), label="Local prompt enhancer head directory", info="Optional; requires outlines for structured captions.")
             with gr.Column(scale=2):
                 output = gr.Gallery(label="Output", columns=2, height=512, object_fit="contain", type="pil")
 
@@ -425,6 +479,10 @@ def create_ui():
             prompt_temperature,
             seed,
             polish_guidance,
+            recipe,
+            custom_schedule,
+            quantization,
+            enhancer_path,
         ]
 
         settings_to_save = {
@@ -447,6 +505,10 @@ def create_ui():
             prompt_temperature: "ideogram_prompt_temperature",
             seed: "ideogram_seed",
             polish_guidance: "ideogram_polish_guidance",
+            recipe: "ideogram_recipe",
+            custom_schedule: "ideogram_custom_schedule",
+            quantization: "ideogram_quantization",
+            enhancer_path: "ideogram_enhancer_path",
         }
         for component, key in settings_to_save.items():
             if component is model_path:
@@ -474,6 +536,10 @@ def create_ui():
             prompt_temperature,
             seed,
             polish_guidance,
+            recipe,
+            custom_schedule,
+            quantization,
+            enhancer_path,
         ]
         from modules_forge.native_requests import PageJobOwner
         from uuid import uuid4
@@ -482,8 +548,12 @@ def create_ui():
         session = gr.State(value=lambda: uuid4().hex)
 
         def run_page(session_id, *args):
+            # Resolve random seeds once, before the worker's optional OOM retry.
+            import inspect
+            bound = inspect.signature(generate).bind(*args)
+            bound.arguments["seed"] = native_validation.actual_seed(bound.arguments["seed"])
             with owner.active(session_id):
-                result = main_thread.run_and_wait_result(generate, *args)
+                result = main_thread.run_and_wait_result(generate, *bound.args, **bound.kwargs)
                 if result is None:
                     raise RuntimeError("Native generation failed")
                 output_value, message = result

@@ -267,7 +267,10 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
         )
         if not video_path:
             return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
-        generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+        native_info = {"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt}
+        from modules_forge.native_outputs import video_metadata
+        native_info.update(video_metadata(video_path))
+        generation_info_js = json.dumps(native_info)
         return (
             gr.update(value=None, visible=False),
             gr.update(value=video_path, visible=bool(video_path)),
