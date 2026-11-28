@@ -90,6 +90,16 @@ def invariant_scope_active():
     return _CACHE.get() is not None and _REVISION.get() is not None
 
 
+def retain_reference_sources(refs):
+    cache = _CACHE.get()
+    if cache is None or _REVISION.get() is None:
+        return False
+    # Keep source identities alive until the revision changes or sampling ends.
+    for ref in refs:
+        cache.sources[("reference", id(ref))] = ref
+    return True
+
+
 def clear_invariants():
     cache = _CACHE.get()
     if cache is not None:

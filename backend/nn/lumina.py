@@ -18,7 +18,8 @@ from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
-from backend.single_gpu_fastpaths import single_gpu_flag, uniform_unpatchify
+from backend.single_gpu_fastpaths import dense_tokenwise_head, single_gpu_flag, uniform_unpatchify
+from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
@@ -156,7 +157,9 @@ class FeedForward(nn.Module):
         # BF16 has no FP16 clamp in the original gating function.
         # Only the native ConvRot quantizer is eligible; do not concatenate
         # separate projections for a backend that would apply SiLU eagerly.
-        fused = try_native_int8_input_act(self.w2, (w1, w3), "swiglu") if w1.dtype == torch.bfloat16 else None
+        fused = (try_native_int8_input_act(self.w2, (w1, w3), "swiglu")
+                 if type(self) is FeedForward and w1.dtype == torch.bfloat16
+                 and single_gpu_flag("native_int8_mlp_activation") and cache_dependencies_safe(self) else None)
         return self.w2(self._forward_silu_gating(w1, w3)) if fused is None else fused
 
 
@@ -504,6 +507,20 @@ class NextDiT(nn.Module):
 
         if shard:
             x, adaln_input = x.to(shard[0]), adaln_input.to(shard[0])
+        if (type(self) is NextDiT and type(self.final_layer) is FinalLayer
+                and single_gpu_flag("target_only_output_head") and not self.training
+                and not torch.is_grad_enabled() and not shard
+                and adaln_input.ndim == 2 and img_size and cap_size
+                and all(size == img_size[0] for size in img_size)
+                and all(size == cap_size[0] for size in cap_size)
+                and transformer_options.keys() <= {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                                   "uncond_indices", "sampling_sigmas"}
+                and dense_tokenwise_head(self.final_layer)):
+            ih, iw = img_size[0]
+            start = cap_size[0]
+            end = start + (ih // self.patch_size) * (iw // self.patch_size)
+            x = x[:, start:end]
+            cap_size = [0] * len(cap_size)
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]
 

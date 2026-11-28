@@ -255,6 +255,29 @@ def cond_cat(c_list):
     return out
 
 
+def _assembled_native_conditions(groups, model, x, model_options, condition_cache, key):
+    if (key is None or not single_gpu_flag("assembled_condition_cache")
+            or not invariant_scope_active()
+            or not _native_full_area_cfg(model, x, model_options, condition_cache)
+            or not groups or not all(_standard_condition_fields(group) for group in groups)
+            or not cache_dependencies_safe(model.diffusion_model)):
+        return cond_cat(groups)
+    names = tuple(groups[0])
+    if any(tuple(group) != names for group in groups):
+        return cond_cat(groups)
+    from backend.sampling.invariant_cache import cached_invariant
+    source = groups[0][names[0]].cond
+    geometry = tuple(tuple((name, tuple(group[name].cond.shape), group[name].cond.dtype,
+                            group[name].cond.device) for name in names) for group in groups)
+    def assemble():
+        merged = cond_cat(groups)
+        return tuple(merged[name] for name in names)
+    with invariant_condition(key):
+        values = cached_invariant(model.diffusion_model, "assembled_conditioning", source,
+                                  model_options.get("transformer_options", {}), assemble, geometry=geometry)
+    return dict(zip(names, values))
+
+
 def compute_cond_mark(cond_or_uncond, sigmas):
     cond_or_uncond_size = int(sigmas.shape[0])
     return sigmas.new_tensor(cond_or_uncond).repeat_interleave(cond_or_uncond_size)
@@ -284,7 +307,7 @@ def _cached_cond_indices(cond_or_uncond, sigma_batch_size):
     return tuple(cond_indices), tuple(uncond_indices)
 
 
-from backend.single_gpu_fastpaths import schedule_options_safe
+from backend.single_gpu_fastpaths import reference_signature, schedule_options_safe, single_gpu_flag
 
 
 def _native_full_area_cfg(model, x, model_options, condition_cache):
@@ -422,7 +445,6 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 
         batch_chunks = len(cond_or_uncond)
         input_x = torch.cat(input_x)
-        c = cond_cat(c)
         batch_indices = first[0].batch_indices
         batch_timestep = timestep if batch_indices is None else repeat_to_batch_size(timestep, x_in.shape[0])[batch_indices]
         timestep_ = torch.cat([batch_timestep] * batch_chunks)
@@ -448,8 +470,6 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
         transformer_options["cond_mark"] = compute_cond_mark(cond_or_uncond=cond_or_uncond, sigmas=batch_timestep)
         transformer_options["cond_indices"], transformer_options["uncond_indices"] = compute_cond_indices(cond_or_uncond=cond_or_uncond, sigmas=batch_timestep)
 
-        c["transformer_options"] = transformer_options
-
         krea_condition_key = None
         if condition_parts_valid and condition_parts:
             candidate = (id(model), getattr(model, "patches_uuid", None), tuple(condition_parts))
@@ -459,6 +479,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             except TypeError:
                 pass
 
+        c = _assembled_native_conditions(c, model, x_in, model_options, condition_cache, krea_condition_key)
+        c["transformer_options"] = transformer_options
         batch_context = contextlib.nullcontext() if batch_indices is None else conditioning_batch(control, batch_indices, x_in.shape[0])
         with batch_context:
             if control is not None:
@@ -735,6 +757,11 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     try:
         revision = (id(unet_patcher), unet_patcher.patches_uuid)
         invariant_revision_key = None
+        ref_signature = None
+        if dynamic_args.ref_latents and single_gpu_flag("flux_reference_cache"):
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            if type(getattr(model, "diffusion_model", None)) is IntegratedFluxTransformer2DModel:
+                ref_signature = reference_signature(dynamic_args.ref_latents)
         if (getattr(args, "invariant_cache_mib", 0) > 0 and condition_cache is not None
                 and cond_cache_key is not None and (uncond is None or math.isclose(cond_scale, 1.0) or uncond_cache_key is not None)
                 and parallel_cfg is None and control is None and extra_concat_condition is None
@@ -742,7 +769,7 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
                 and not getattr(unet_patcher, "weight_wrapper_patches", None)
                 and set(model_options) <= {"transformer_options"}
                 and not getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None)
-                and not dynamic_args.ref_latents and dynamic_args.context_handler is None):
+                and (not dynamic_args.ref_latents or ref_signature is not None) and dynamic_args.context_handler is None):
             from modules import script_callbacks
             from backend.nn.anima import Anima
             from backend.nn.flux import IntegratedFluxTransformer2DModel
@@ -752,7 +779,7 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
                     (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
                     and not any(script_callbacks.callback_map.get(key) for key in
                                 ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))):
-                invariant_revision_key = revision
+                invariant_revision_key = (revision, ref_signature) if ref_signature is not None else revision
         with krea_text_fusion_revision(revision), invariant_revision(invariant_revision_key):
             return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
     except BaseException as error:

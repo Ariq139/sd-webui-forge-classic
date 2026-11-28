@@ -18,7 +18,8 @@ from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import silu_gate, norm_affine, can_fuse_silu
 from backend.utils import fp16_fix, pad_to_patch_size
-from backend.single_gpu_fastpaths import single_gpu_flag
+from backend.single_gpu_fastpaths import dense_tokenwise_head, reference_signature, single_gpu_flag
+from backend.sampling.invariant_cache import invariant_scope_active, retain_reference_sources, invariants_enabled
 from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
 
@@ -312,7 +313,8 @@ class DoubleStreamBlock(nn.Module):
         del img_modulated
         img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del img_qkv
-        img_pair = self.img_attn.norm.try_fused_rope(img_q, img_k, img_v, None if pe is None else pe[:, :, txt.shape[1]:], transformer_options)
+        img_pair = (self.img_attn.norm.try_fused_rope(img_q, img_k, img_v, pe[:, :, txt.shape[1]:], transformer_options)
+                    if single_gpu_flag("flux_fused_qk_rope") and pe is not None and type(self.img_attn.norm) is QKNorm else None)
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v) if img_pair is None else img_pair
 
         # prepare txt for attention
@@ -321,7 +323,8 @@ class DoubleStreamBlock(nn.Module):
         del txt_modulated
         txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del txt_qkv
-        txt_pair = self.txt_attn.norm.try_fused_rope(txt_q, txt_k, txt_v, None if pe is None else pe[:, :, :txt.shape[1]], transformer_options)
+        txt_pair = (self.txt_attn.norm.try_fused_rope(txt_q, txt_k, txt_v, pe[:, :, :txt.shape[1]], transformer_options)
+                    if single_gpu_flag("flux_fused_qk_rope") and pe is not None and type(self.txt_attn.norm) is QKNorm else None)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v) if txt_pair is None else txt_pair
 
         if img_pair is not None or txt_pair is not None:
@@ -407,7 +410,7 @@ class SingleStreamBlock(nn.Module):
 
         q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del qkv
-        pair = self.norm.try_fused_rope(q, k, v, pe, transformer_options)
+        pair = self.norm.try_fused_rope(q, k, v, pe, transformer_options) if type(self.norm) is QKNorm else None
         if pair is None:
             q, k = self.norm(q, k, v)
         else:
@@ -560,6 +563,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         transformer_options: dict[str, list] = {},
         attn_mask: torch.Tensor = None,
         position_geometry=None,
+        projected_img=False,
+        target_tokens=None,
     ) -> torch.Tensor:
 
         patches = transformer_options.get("patches", {})
@@ -569,7 +574,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
         # running on sequences img
-        img = self.img_in(img)
+        if not projected_img:
+            img = self.img_in(img)
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.guidance_embed:
             if guidance is not None:
@@ -691,6 +697,14 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         if shard:
             img = img.to(shard[0])
 
+        if (target_tokens is not None and target_tokens < img.shape[1]
+                and single_gpu_flag("target_only_output_head")
+                and type(self) is IntegratedFluxTransformer2DModel
+                and type(self.final_layer) is LastLayer and not self.training
+                and not torch.is_grad_enabled() and not patches and not patches_replace and control is None
+                and (vec_orig.ndim == 2 or (vec_orig.ndim == 3 and vec_orig.shape[1] == 1))
+                and dense_tokenwise_head(self.final_layer)):
+            img = img[:, :target_tokens]
         return self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
 
     def process_img(self, x, index=0, h_offset=0, w_offset=0):
@@ -725,12 +739,26 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         ref_latents: list[torch.Tensor] = dynamic_args.ref_latents
 
+        reference_key = None
+        project_refs = False
+        if (ref_latents and type(self) is IntegratedFluxTransformer2DModel
+                and single_gpu_flag("flux_reference_cache") and invariant_scope_active()
+                and invariants_enabled(self, x, transformer_options) and control is None):
+            reference_key = reference_signature(ref_latents)
+            if reference_key is not None and retain_reference_sources(ref_latents):
+                from backend.operations import ForgeOperations
+                project_refs = (type(self.img_in) in (nn.Linear, ForgeOperations.Linear)
+                                and dense_tokenwise_head(self.img_in))
+            else:
+                reference_key = None
         if bool(ref_latents):
+            img_parts = [self.img_in(img) if project_refs else img]
+            id_parts = [img_ids]
             h = 0
             w = 0
             index = 0
             ref_latents_method = kwargs.get("ref_latents_method", self.default_ref_method)
-            for ref in ref_latents:
+            for ref_number, ref in enumerate(ref_latents):
                 if ref_latents_method == "index":
                     index += self.ref_index_scale
                     h_offset = 0
@@ -752,13 +780,26 @@ class IntegratedFluxTransformer2DModel(nn.Module):
                     h = max(h, ref.shape[-2] + h_offset)
                     w = max(w, ref.shape[-1] + w_offset)
 
-                kontext, kontext_ids = self.process_img(ref.to(x), index=index, h_offset=h_offset, w_offset=w_offset)
+                def prepare_ref():
+                    tokens, ids = self.process_img(ref.to(x), index=index, h_offset=h_offset, w_offset=w_offset)
+                    return (self.img_in(tokens) if project_refs else tokens), ids
+
+                if reference_key is None:
+                    kontext, kontext_ids = prepare_ref()
+                else:
+                    kontext, kontext_ids = cached_invariant(
+                        self, "flux_reference_tokens", ref, transformer_options, prepare_ref,
+                        geometry=(reference_key[ref_number], x.device, x.dtype, index, h_offset, w_offset,
+                                  tuple(self.axes_dim), patch_size, project_refs),
+                        dependencies=(self.img_in,) if project_refs else ())
                 if img.size(0) > 1:
                     kontext = kontext.expand(img.shape[0], *kontext.shape[1:])
-                img = torch.cat([img, kontext], dim=1)
+                img_parts.append(kontext)
                 if img_ids.size(0) > 1:
                     kontext_ids = kontext_ids.expand(img_ids.shape[0], *kontext_ids.shape[1:])
-                img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+                id_parts.append(kontext_ids)
+            img = torch.cat(img_parts, dim=1)
+            img_ids = torch.cat(id_parts, dim=1)
 
         txt_ids = torch.zeros((bs, context.shape[1], len(self.axes_dim)), device=x.device, dtype=torch.float32)
 
@@ -766,9 +807,17 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             for i in self.txt_ids_dims:
                 txt_ids[:, :, i] = torch.linspace(0, context.shape[1] - 1, steps=context.shape[1], device=x.device, dtype=torch.float32)
 
-        geometry = None if ref_latents else (h_len, w_len, context.shape[1], tuple(self.txt_ids_dims), patch_size)
+        geometry = (h_len, w_len, context.shape[1], tuple(self.txt_ids_dims), patch_size)
+        if ref_latents:
+            geometry = None if reference_key is None else (*geometry, reference_key, ref_latents_method, self.ref_index_scale)
+        # Preserve custom subclass/extension signatures when neither new path is active.
+        extra = {}
+        if project_refs:
+            extra["projected_img"] = True
+        if ref_latents and single_gpu_flag("target_only_output_head") and type(self) is IntegratedFluxTransformer2DModel:
+            extra["target_tokens"] = img_tokens
         out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options,
-                                attn_mask=kwargs.get("attention_mask", None), position_geometry=geometry)
+                                attn_mask=kwargs.get("attention_mask", None), position_geometry=geometry, **extra)
         out = out[:, :img_tokens]
 
         return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=self.patch_size, pw=self.patch_size)[:, :, :h_orig, :w_orig]

@@ -71,3 +71,39 @@ class SigmaControl:
             self.values = self.sigmas.detach().cpu().tolist()
             self.version = version
         return self.values[index]
+
+
+def reference_signature(refs):
+    """Unversioned or subclassed references retain the original path."""
+    result = []
+    for ref in refs:
+        if type(ref) is not torch.Tensor:
+            return None
+        try:
+            version = ref._version
+        except RuntimeError:
+            return None
+        result.append((id(ref), version, ref.device, ref.dtype, tuple(ref.shape), tuple(ref.stride())))
+    return tuple(result)
+
+
+def dense_tokenwise_head(module):
+    """Only ordinary dense weights and native tokenwise modules may be sliced."""
+    from backend.operations import ForgeOperations
+    from backend.sampling.invariant_cache import cache_dependencies_safe
+    if not cache_dependencies_safe(module):
+        return False
+    allowed = (torch.nn.Linear, ForgeOperations.Linear, torch.nn.LayerNorm,
+               ForgeOperations.LayerNorm, torch.nn.RMSNorm, ForgeOperations.RMSNorm,
+               torch.nn.SiLU, torch.nn.Sequential)
+    for child in module.modules():
+        if child is not module and type(child) not in allowed:
+            return False
+        if (getattr(child, "weight_function", None) or getattr(child, "bias_function", None)
+                or getattr(child, "weight_scale", None) is not None
+                or getattr(child, "forge_force_cast_weights", False)):
+            return False
+        if any(type(p) is not torch.nn.Parameter or not p.is_floating_point()
+               for p in child.parameters(recurse=False)):
+            return False
+    return True
