@@ -3,8 +3,9 @@ import datetime
 import io
 import ipaddress
 import os
+import re
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from io import BytesIO
 from secrets import compare_digest
 from threading import Lock
@@ -17,18 +18,38 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import PngImagePlugin
 
 import modules.shared as shared
 import modules.textual_inversion.textual_inversion
 from modules import errors, images, infotext_utils, postprocessing, restart, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, ui
-from modules.api import models
+from modules.api import models, native_models
 from modules.processing import StableDiffusionProcessingImg2Img, StableDiffusionProcessingTxt2Img, process_extra_images, process_images
 from modules import progress as generation_progress
 from modules.progress import add_task_to_queue, create_task_id, finish_task, start_task
 from modules.shared import cmd_opts, opts
+
+
+@contextmanager
+def api_generation_task(task_id, job, *, allow_native=False):
+    """Finalize pending/active tasks even if construction or inference fails."""
+    started = False
+    try:
+        start_task(task_id)
+        shared.state.begin(job=job)
+        started = True
+        if not allow_native and opts.forge_preset in ("ltx2", "ideogram"):
+            raise HTTPException(status_code=422, detail="This native preset is not supported by the standard image generation API. Use its native API endpoint or WebUI page.")
+        yield
+    finally:
+        try:
+            if started:
+                shared.state.end()
+                shared.total_tqdm.clear()
+        finally:
+            finish_task(task_id)
 
 
 def script_name_to_index(name, scripts):
@@ -207,6 +228,12 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
+        from modules_forge.native_requests import NativeTaskOwner
+        self.native_owner = NativeTaskOwner()
+        self.add_api_route("/sdapi/v1/native/ideogram", self.native_ideogram, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/ltx2", self.native_ltx2, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/{task_id}/interrupt", self.native_interrupt, methods=["POST"])
+        self.add_api_route("/sdapi/v1/native/video/{filename}", self.native_video, methods=["GET"])
         # api_middleware(self.app)  # FIXME: (legacy) this will have to be fixed
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
@@ -467,27 +494,20 @@ class Api:
 
         add_task_to_queue(task_id)
 
-        with self.queue_lock:
+        with self.queue_lock, api_generation_task(task_id, "scripts_txt2img"):
             with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
                 p.is_api = True
                 p.scripts = script_runner
                 p.outpath_grids = opts.outdir_txt2img_grids
                 p.outpath_samples = opts.outdir_txt2img_samples
 
-                try:
-                    shared.state.begin(job="scripts_txt2img")
-                    start_task(task_id)
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_txt2img.run(p, *p.script_args)  # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args)  # Need to pass args as tuple here
-                        processed = process_images(p)
-                    process_extra_images(processed)
-                    finish_task(task_id)
-                finally:
-                    shared.state.end()
-                    shared.total_tqdm.clear()
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_txt2img.run(p, *p.script_args)  # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args)  # Need to pass args as tuple here
+                    processed = process_images(p)
+                process_extra_images(processed)
 
         b64images = list(map(encode_pil_to_base64, processed.images + processed.extra_images)) if send_images else []
 
@@ -540,7 +560,7 @@ class Api:
 
         add_task_to_queue(task_id)
 
-        with self.queue_lock:
+        with self.queue_lock, api_generation_task(task_id, "scripts_img2img"):
             with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
                 p.init_images = [decode_base64_to_image(x) for x in init_images]
                 p.is_api = True
@@ -548,20 +568,13 @@ class Api:
                 p.outpath_grids = opts.outdir_img2img_grids
                 p.outpath_samples = opts.outdir_img2img_samples
 
-                try:
-                    shared.state.begin(job="scripts_img2img")
-                    start_task(task_id)
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_img2img.run(p, *p.script_args)  # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args)  # Need to pass args as tuple here
-                        processed = process_images(p)
-                    process_extra_images(processed)
-                    finish_task(task_id)
-                finally:
-                    shared.state.end()
-                    shared.total_tqdm.clear()
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_img2img.run(p, *p.script_args)  # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args)  # Need to pass args as tuple here
+                    processed = process_images(p)
+                process_extra_images(processed)
 
         b64images = list(map(encode_pil_to_base64, processed.images + processed.extra_images)) if send_images else []
 
@@ -570,6 +583,76 @@ class Api:
             img2imgreq.mask = None
 
         return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+
+    @contextmanager
+    def native_api_task(self, value, preset):
+        from modules_forge.native_requests import native_task_id, DuplicateNativeTask, CancelledNativeTask
+
+        try:
+            task_id = native_task_id(value)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            with self.native_owner.reserve(task_id):
+                add_task_to_queue(task_id)
+                with self.queue_lock, api_generation_task(task_id, "native_" + preset, allow_native=True):
+                    if opts.forge_preset != preset:
+                        raise HTTPException(status_code=409, detail=f"Select the {preset} preset first.")
+                    with self.native_owner.active(task_id):
+                        yield task_id
+        except DuplicateNativeTask as error:
+            raise HTTPException(status_code=409, detail="Native task ID is already in use.") from error
+        except CancelledNativeTask as error:
+            raise HTTPException(status_code=409, detail="Native task cancelled before generation.") from error
+
+    def native_ideogram(self, req: native_models.IdeogramRequest):
+        from modules import ui_ideogram
+        from modules_forge import main_thread, native_validation
+        from modules_forge.native_outputs import gallery_metadata
+
+        seed = native_validation.actual_seed(req.seed)
+        with self.native_api_task(req.task_id, "ideogram") as task_id:
+            result = main_thread.run_and_wait_result(ui_ideogram.generate_from_preset, req.prompt, width=req.width, height=req.height, num_images=req.num_images, steps=req.steps, guidance=req.guidance, seed=seed)
+            if not result or not result[0]:
+                raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
+            output, status = result
+            return {"task_id": task_id, "images": [encode_pil_to_base64(image) for image in output], "info": gallery_metadata(output), "status": status}
+
+    def native_ltx2(self, req: native_models.LTXRequest):
+        from modules import ui_ltx2_video
+        from modules_forge import main_thread, native_validation
+        from modules_forge.native_outputs import video_metadata
+
+        condition = None
+        if req.image:
+            if req.image.startswith(("http://", "https://")):
+                raise HTTPException(status_code=422, detail="Supply a base64 image, not a URL.")
+            condition = decode_base64_to_image(req.image).convert("RGB")
+        seed = native_validation.actual_seed(req.seed)
+        with self.native_api_task(req.task_id, "ltx2") as task_id:
+            result = main_thread.run_and_wait_result(ui_ltx2_video.generate_from_preset, req.prompt, req.negative_prompt, condition, width=req.width, height=req.height, frames=req.frames, steps=req.steps, guidance=req.guidance, seed=seed)
+            if not result or not result[0]:
+                raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
+            path, status = result
+            return {"task_id": task_id, "video": os.path.basename(path), "download": "/sdapi/v1/native/video/" + os.path.basename(path), "info": video_metadata(path), "status": status}
+
+    def native_video(self, filename: str):
+        if not re.fullmatch(r"ltx2-[0-9a-f]{32}\.mp4", filename):
+            raise HTTPException(status_code=404, detail="Native video not found")
+        directory = os.path.realpath(opts.outdir_videos)
+        path = os.path.realpath(os.path.join(directory, filename))
+        if os.path.dirname(path) != directory or not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Native video not found")
+        return FileResponse(path, media_type="video/mp4", filename=filename)
+
+    def native_interrupt(self, task_id: str):
+        from modules_forge.native_requests import native_task_id
+
+        try:
+            task_id = native_task_id(task_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"interrupted": self.native_owner.interrupt(task_id, shared.state.interrupt)}
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
@@ -643,7 +726,8 @@ class Api:
         return {}
 
     def unloadapi(self):
-        sd_models.unload_model_weights()
+        with self.queue_lock:
+            sd_models.unload_model_weights()
 
         return {}
 

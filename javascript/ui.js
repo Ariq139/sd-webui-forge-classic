@@ -60,15 +60,22 @@ function extract_image_from_gallery(gallery) {
 
 window.args_to_array = Array.from; // Compatibility with e.g. extensions that may expect this to be around
 
+function switch_main_tab(tabId) {
+    const button = gradioApp().querySelector(`#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab'][data-tab-id="${tabId}"]`);
+    button?.click();
+    return Boolean(button);
+}
+
 function switch_to_txt2img() {
-    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[0]?.click();
+    switch_main_tab("txt2img");
 
     return Array.from(arguments);
 }
 
 function switch_to_img2img_tab(no) {
-    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[1]?.click();
-    gradioApp().getElementById("mode_img2img").querySelectorAll(".tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[no]?.click();
+    if (switch_main_tab("img2img")) {
+        gradioApp().getElementById("mode_img2img")?.querySelectorAll(".tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[no]?.click();
+    }
 }
 
 function switch_to_img2img() {
@@ -92,7 +99,7 @@ function switch_to_inpaint_sketch() {
 }
 
 function switch_to_extras() {
-    gradioApp().querySelectorAll("#tabs > .tab-wrapper > .tab-container[role='tablist'] > button[role='tab']")[2]?.click();
+    switch_main_tab("extras");
 
     return Array.from(arguments);
 }

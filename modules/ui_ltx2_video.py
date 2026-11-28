@@ -1,4 +1,6 @@
 import gc
+import sys
+import json
 import logging
 import os
 import threading
@@ -9,8 +11,8 @@ import torch
 
 from backend import memory_management
 from modules import paths, shared
-from modules_forge import main_thread
-from modules_forge.native_models import is_compatible_model, resolve_model_path
+from modules_forge import main_thread, native_validation, native_recipes, pruna_decoder, native_runtime
+from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
@@ -18,6 +20,7 @@ from modules_forge.native_pipeline_speed import (
     configure_prompt_cache,
     configure_vae_tiling,
     load_native_pipeline,
+    native_quantization_kwargs,
     resolve_vae_tiling_mode,
 )
 
@@ -51,10 +54,7 @@ def _auto_vae_tiling_value() -> bool:
 
 
 def _model_path():
-    for value in (_option("forge_checkpoint_ltx2", ""), _option("ltx2_model_path", "")):
-        if is_compatible_model(value, "LTX2"):
-            return value
-    return ""
+    return select_model_path("LTX2", _option("forge_checkpoint_ltx2", ""), _option("ltx2_model_path", ""))
 
 
 def _resolve_prunavaed_path(value: str) -> str:
@@ -82,35 +82,23 @@ def _prunavaed_choices() -> list[str]:
                 for config_name in ("config.json", "model_index.json")
             )
             if entry.is_dir() and has_config:
-                values.append(entry.name)
+                values.append(os.path.abspath(entry.path))
             elif entry.is_file() and os.path.splitext(entry.name)[1].lower() in _DECODER_EXTENSIONS:
-                values.append(entry.name)
+                values.append(os.path.abspath(entry.path))
 
     configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
-    if configured and os.path.exists(configured):
-        configured_path = os.path.abspath(configured)
-        for root in _DECODER_ROOTS:
-            if os.path.dirname(configured_path).lower() == os.path.abspath(root).lower():
-                configured = os.path.basename(configured_path)
-                break
-        if configured not in values:
-            values.append(configured)
+    if configured:
+        # Preserve invalid persisted paths so a missing decoder does not
+        # silently switch the generation to the bundled VAE.
+        resolved = _resolve_prunavaed_path(configured)
+        if resolved not in values:
+            values.append(resolved)
     return sorted(set(values), key=shared.natural_sort_key)
 
 
 def _prunavaed_value() -> str | None:
     configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
-    choices = _prunavaed_choices()
-    if configured in choices:
-        return configured
-    configured_path = _resolve_prunavaed_path(configured)
-    if os.path.exists(configured_path):
-        configured_path = os.path.abspath(configured_path)
-        for choice in choices:
-            if os.path.abspath(_resolve_prunavaed_path(choice)) == configured_path:
-                return choice
-    return None
-
+    return _resolve_prunavaed_path(configured) if configured else None
 
 def _save_option(name: str, value):
     if value is None:
@@ -151,6 +139,11 @@ def _sync_preset_controls(preset: str):
         _option("ltx2_guidance_blocks", "28"),
         _option("ltx2_seed", -1),
         _option("ltx2_include_audio", True),
+        _option("ltx2_cross_timestep_mode", "Automatic"),
+        _option("ltx2_workflow", "Full"),
+        _option("ltx2_quantization", "Checkpoint"),
+        _option("ltx2_upsampler_path", ""),
+        _option("ltx2_refine_lora", ""),
     ]
 
 
@@ -187,13 +180,6 @@ def bind_preset(preset_component, checkpoint_component=None, decoder_component=N
             queue=False,
             show_progress=False,
         )
-        _ltx_components[0].change(
-            fn=_sync_model_to_quicksettings,
-            inputs=[preset_component, _ltx_components[0]],
-            outputs=[checkpoint_component],
-            queue=False,
-            show_progress=False,
-        )
     if decoder_component is not None:
         decoder_component.change(
             fn=_sync_decoder_to_page,
@@ -206,6 +192,8 @@ def bind_preset(preset_component, checkpoint_component=None, decoder_component=N
 
 
 def _default_dtype(precision: str) -> torch.dtype:
+    if precision == "automatic" and _device().type == "cpu":
+        return torch.float32
     if precision == "float16":
         return torch.float16
     if precision == "bfloat16":
@@ -223,41 +211,54 @@ def _device() -> torch.device:
 
 
 def _load_prunavaed(path: str, dtype: torch.dtype):
+    import diffusers
     from diffusers import AutoencoderKLLTX2Video
+    from diffusers.models.autoencoders import autoencoder_kl_ltx2 as ltx_vae
 
     path = _resolve_prunavaed_path(path)
-    if os.path.isfile(path) and hasattr(AutoencoderKLLTX2Video, "from_single_file"):
-        return AutoencoderKLLTX2Video.from_single_file(path, torch_dtype=dtype)
+    if os.path.isfile(path):
+        if "pruna" in os.path.basename(path).lower():
+            raise ValueError("Pruned decoders require a local Diffusers directory with config.json and weights.")
+        if hasattr(AutoencoderKLLTX2Video, "from_single_file"):
+            return AutoencoderKLLTX2Video.from_single_file(path, torch_dtype=dtype, local_files_only=True)
+        raise ValueError("This VAE class does not support single-file loading.")
+    for folder in (os.path.join(path, "vae"), path):
+        config_path = os.path.join(folder, "config.json")
+        if not os.path.isfile(config_path):
+            continue
+        with open(config_path, encoding="utf-8") as file:
+            config = json.load(file)
+        with pruna_decoder.pruna_construction(ltx_vae, diffusers.__version__, config):
+            vae, loading = AutoencoderKLLTX2Video.from_pretrained(
+                folder, torch_dtype=dtype, local_files_only=True, output_loading_info=True)
+        problems = {key: loading.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs") if loading.get(key)}
+        if problems:
+            raise RuntimeError(f"VAE checkpoint does not match its architecture: {problems}")
+        return vae
+    raise ValueError("Select a local Diffusers VAE directory containing config.json and weights.")
 
-    last_error = None
-    for subfolder in ("vae", None):
-        try:
-            kwargs = {"torch_dtype": dtype}
-            if subfolder is not None:
-                kwargs["subfolder"] = subfolder
-            return AutoencoderKLLTX2Video.from_pretrained(path, **kwargs)
-        except (OSError, ValueError, RuntimeError) as error:
-            last_error = error
 
-    raise RuntimeError(f"Could not load PrunaVAED from {path}: {last_error}")
-
-
-def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload: str, attention_backend: str, compile_enabled: bool, prompt_cache: bool, image_mode: bool):
+def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload: str, attention_backend: str, compile_enabled: bool, prompt_cache: bool, image_mode: bool, quantization: str = "Checkpoint"):
     global _pipeline, _pipeline_key
 
     from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
 
-    model_path = resolve_model_path(model_path)
+    model_path = native_runtime.require_pipeline_directory(resolve_model_path(model_path), "LTX2")
     prunavaed_path = _resolve_prunavaed_path(prunavaed_path)
     device = _device()
     dtype = _default_dtype(precision)
-    key = (model_path, prunavaed_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), bool(image_mode))
+    key = (model_path, prunavaed_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), bool(image_mode), quantization)
 
     with _pipeline_lock:
         if _pipeline is not None and _pipeline_key == key:
             return _pipeline
 
         unload()
+        # The caller owns the generation queue. Release the other native
+        # pipeline before loading this one, including dedicated-page calls.
+        peer = sys.modules.get("modules.ui_ideogram")
+        if peer is not None:
+            peer.unload()
         unload_forge_model()
 
         vae = None
@@ -266,6 +267,7 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
             vae = _load_prunavaed(prunavaed_path, dtype)
 
         pipeline_kwargs = {"torch_dtype": dtype}
+        pipeline_kwargs.update(native_quantization_kwargs(model_path, quantization, dtype, device, offload, ("transformer",)))
         if vae is not None:
             pipeline_kwargs["vae"] = vae
 
@@ -285,22 +287,21 @@ def unload():
             _pipeline_key = None
             return
 
-        if _pipeline is not None:
-            try:
-                _pipeline.to("cpu")
-            except Exception:
-                pass
-        _pipeline = None
+        pipe, _pipeline = _pipeline, None
         _pipeline_key = None
-        gc.collect()
-        memory_management.soft_empty_cache(force=True)
+        try:
+            native_runtime.release_runtime(pipe)
+        finally:
+            del pipe
+            gc.collect()
+            memory_management.soft_empty_cache(force=True)
 
 
 def unload_forge_model():
     try:
         from modules import sd_models
 
-        sd_models.unload_model_weights()
+        sd_models.unload_model_weights(include_native=False)
     except Exception:
         logger.debug("No Forge image model needed unloading before LTX-2.3", exc_info=True)
 
@@ -349,6 +350,11 @@ def generate(
     guidance_blocks: str,
     seed: int,
     include_audio: bool,
+    cross_timestep_mode: str = "Automatic",
+    workflow: str = "Full",
+    quantization: str = "Checkpoint",
+    upsampler_path: str = "",
+    refine_lora: str = "",
     progress=gr.Progress(track_tqdm=True),
 ):
     if not model_path or not model_path.strip():
@@ -356,14 +362,70 @@ def generate(
     if not prompt or not prompt.strip():
         return None, "Enter a prompt."
 
+    pipeline_attempted = False
     try:
-        width, height, frames, steps = int(width), int(height), int(frames), int(steps)
-        if width < 64 or height < 64 or width % 32 or height % 32:
-            return None, "LTX-2.3 width and height must be at least 64 and divisible by 32."
-        if frames < 9:
-            return None, "LTX-2.3 requires at least 9 frames."
+        import diffusers
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 
-        pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None)
+        if workflow not in native_recipes.LTX_MODES:
+            raise ValueError("Unknown LTX workflow.")
+        distilled = workflow.startswith("Distilled")
+        two_stage = workflow.endswith("2x")
+        if two_stage:
+            if offload != "model" or compile_enabled:
+                raise ValueError("Two-stage LTX currently requires model CPU offload and compile disabled.")
+            upsampler_path = os.path.abspath(resolve_model_path(upsampler_path) if upsampler_path else os.path.join(resolve_model_path(model_path), "latent_upsampler"))
+            if not os.path.isfile(os.path.join(upsampler_path, "config.json")):
+                raise ValueError("Choose a compatible local latent upsampler directory.")
+            if not distilled:
+                if quantization != "Checkpoint":
+                    raise ValueError("Full + refine requires an unquantized checkpoint and a compatible distilled refinement LoRA.")
+                refine_lora = os.path.abspath(refine_lora)
+                if not os.path.isfile(refine_lora) or not refine_lora.lower().endswith(".safetensors"):
+                    raise ValueError("Full + refine requires a local distilled refinement LoRA (.safetensors).")
+        if distilled:
+            guidance, stg, modality = 1.0, 0.0, 1.0
+            audio_guidance, audio_stg, audio_modality = 1.0, 0.0, 1.0
+            guidance_rescale, guidance_blocks = 0.0, ""
+            steps = len(DISTILLED_SIGMA_VALUES)
+        width, height, frames, fps, steps = native_validation.ltx_dimensions(width, height, frames, fps, steps)
+        guidance = native_validation.finite_number(guidance, "Video CFG", 0, 24)
+        stg = native_validation.finite_number(stg, "Video STG", 0)
+        modality = native_validation.finite_number(modality, "Video modality", 0)
+        audio_guidance = native_validation.audio_override(audio_guidance, guidance, "Audio CFG", version=diffusers.__version__)
+        audio_stg = native_validation.audio_override(audio_stg, stg, "Audio STG", version=diffusers.__version__)
+        audio_modality = native_validation.audio_override(audio_modality, modality, "Audio modality", version=diffusers.__version__)
+        guidance_rescale = native_validation.finite_number(guidance_rescale, "Guidance rescale", 0, 1)
+        blocks = _parse_blocks(guidance_blocks)
+        if (stg > 0 or audio_stg > 0) and not blocks:
+            raise ValueError("Supply STG block indices when using STG.")
+        if blocks and (min(blocks) < 0 or len(set(blocks)) != len(blocks)):
+            raise ValueError("STG block indices must be unique and nonnegative.")
+        seed = native_validation.actual_seed(seed)
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _LTXInterrupted()
+
+        shared.state.job_count = 1
+        shared.state.job_no = 0
+        shared.state.sampling_step = 0
+        shared.state.sampling_steps = steps + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
+        shared.state.textinfo = "LTX-2.3: loading model"
+        pipeline_attempted = True
+        pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None, quantization)
+        temporal_ratio = getattr(pipe, "vae_temporal_compression_ratio", 8)
+        spatial_ratio = getattr(pipe, "vae_spatial_compression_ratio", 32)
+        native_validation.ltx_dimensions(width, height, frames, fps, steps, temporal_ratio)
+        if width % spatial_ratio or height % spatial_ratio:
+            raise ValueError(f"LTX dimensions must be divisible by the model VAE spatial ratio ({spatial_ratio}).")
+        if two_stage and not distilled and (getattr(pipe.transformer, "is_quantized", False) or getattr(pipe.transformer, "hf_quantizer", None) is not None):
+            raise ValueError("Refinement LoRA is not supported on a quantized transformer in this workflow.")
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _LTXInterrupted()
+        cross_timestep = native_validation.ltx_cross_timestep(pipe.transformer.config, cross_timestep_mode)
+        num_layers = getattr(pipe.transformer.config, "num_layers", None)
+        if blocks and num_layers is not None and max(blocks) >= num_layers:
+            raise ValueError(f"STG block indices must be below {num_layers}.")
         configure_vae_tiling(
             pipe.vae,
             resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),
@@ -373,7 +435,9 @@ def generate(
             frames,
         )
 
-        shared.state.sampling_steps = steps
+        total_steps = steps + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
+        stage_offset = 0
+        shared.state.sampling_steps = total_steps
         shared.state.sampling_step = 0
         shared.state.job_count = 1
         shared.state.job_no = 0
@@ -381,17 +445,16 @@ def generate(
         shared.state.id_live_preview += 1
         shared.state.textinfo = "LTX-2.3: loading and preparing"
 
-        generator = None
-        if int(seed) >= 0:
-            generator = torch.Generator(device=_device()).manual_seed(int(seed))
+        generator = torch.Generator(device=_device()).manual_seed(seed)
 
         def on_step_end(_pipe, step, timestep, callback_kwargs):
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
                 raise _LTXInterrupted()
 
-            shared.state.sampling_step = step + 1
-            shared.state.textinfo = f"LTX-2.3: step {step + 1}/{int(steps)}"
-            progress(step + 1, total=steps, desc=f"LTX-2.3 step {step + 1}/{steps}")
+            completed = stage_offset + step + 1
+            shared.state.sampling_step = completed
+            shared.state.textinfo = f"LTX-2.3: step {completed}/{total_steps}"
+            progress(completed, total=total_steps, desc=f"LTX-2.3 step {completed}/{total_steps}")
             return callback_kwargs
 
         kwargs = dict(
@@ -405,11 +468,12 @@ def generate(
             guidance_scale=float(guidance),
             stg_scale=float(stg),
             modality_scale=float(modality),
-            audio_guidance_scale=float(audio_guidance),
-            audio_stg_scale=float(audio_stg),
-            audio_modality_scale=float(audio_modality),
+            audio_guidance_scale=audio_guidance,
+            audio_stg_scale=audio_stg,
+            audio_modality_scale=audio_modality,
             guidance_rescale=float(guidance_rescale),
-            spatio_temporal_guidance_blocks=_parse_blocks(guidance_blocks),
+            spatio_temporal_guidance_blocks=blocks,
+            use_cross_timestep=cross_timestep,
             generator=generator,
             output_type="np",
             return_dict=False,
@@ -419,8 +483,53 @@ def generate(
         if image is not None:
             kwargs["image"] = image
 
+        first, refine = native_recipes.ltx_recipe(workflow, kwargs, DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES)
+        original_scheduler = pipe.scheduler
+        loaded_adapter = False
         with _pipeline_lock:
-            video, audio = pipe(**kwargs)
+            try:
+                if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                    raise _LTXInterrupted()
+                if distilled:
+                    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(original_scheduler.config, use_dynamic_shifting=False, shift_terminal=None)
+                video, audio = pipe(**first)
+                if refine is not None:
+                    if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                        raise _LTXInterrupted()
+                    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+                    shared.state.textinfo = "LTX-2.3: latent upsampling"
+                    upsampler = LTX2LatentUpsamplerModel.from_pretrained(
+                        upsampler_path, torch_dtype=_default_dtype(precision), local_files_only=True)
+                    try:
+                        from types import SimpleNamespace
+                        before = SimpleNamespace(shape=tuple(video.shape))
+                        upsampler.to(_device())
+                        with torch.inference_mode():
+                            video = upsampler(video.to(device=_device(), dtype=_default_dtype(precision)))
+                        native_runtime.refinement_geometry(before, video, audio, width=width, height=height, frames=frames,
+                                                           spatial_ratio=spatial_ratio, temporal_ratio=temporal_ratio)
+                    finally:
+                        del upsampler
+                        memory_management.soft_empty_cache(force=True)
+                    if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                        raise _LTXInterrupted()
+                    if not distilled:
+                        pipe.load_lora_weights(os.path.dirname(refine_lora), weight_name=os.path.basename(refine_lora), adapter_name="forge_stage2")
+                        loaded_adapter = True
+                        pipe.set_adapters("forge_stage2", adapter_weights=1.0)
+                    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(original_scheduler.config, use_dynamic_shifting=False, shift_terminal=None)
+                    stage_offset = steps
+                    refine.update(latents=video, audio_latents=audio)
+                    configure_vae_tiling(pipe.vae, resolve_vae_tiling_mode(auto_vae_tiling, tile_vae), _device(), width * 2, height * 2, frames)
+                    if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                        raise _LTXInterrupted()
+                    video, audio = pipe(**refine)
+            finally:
+                pipe.scheduler = original_scheduler
+                if loaded_adapter:
+                    pipe.unload_lora_weights()
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _LTXInterrupted()
         output_path = _output_path()
 
         from diffusers.utils import encode_video
@@ -431,17 +540,49 @@ def generate(
             audio_tensor = audio[0].float().cpu()
             audio_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
 
-        encode_video(video[0], fps=int(fps), audio=audio_tensor, audio_sample_rate=audio_rate, output_path=output_path)
-        shared.state.sampling_step = steps
+        temporary = os.path.splitext(output_path)[0] + ".partial.mp4"
+        try:
+            encode_video(video[0], fps=fps, audio=audio_tensor, audio_sample_rate=audio_rate, output_path=temporary)
+            if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                raise _LTXInterrupted()
+            os.replace(temporary, output_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        sampling = {key: value for key, value in first.items() if key not in ("generator", "callback_on_step_end", "image")}
+        metadata = dict(native_model="ltx2", prompt=prompt, negative_prompt=negative_prompt, seed=seed, request_seed=seed,
+                        sd_model_name=model_path, sampler_name="LTX-2.3", workflow=workflow,
+                        width=width * (2 if two_stage else 1), height=height * (2 if two_stage else 1),
+                        base_width=width, base_height=height, frames=len(video[0]), fps=fps, steps=total_steps,
+                        cfg_scale=first["guidance_scale"], sampling=sampling, include_audio=audio_tensor is not None,
+                        quantization=quantization, precision=precision, decoder=prunavaed_path,
+                        upsampler=upsampler_path if two_stage else "", refinement_lora=refine_lora if two_stage and not distilled else "",
+                        cross_timestep=cross_timestep, image_conditioned=image is not None,
+                        runtime=getattr(pipe, "_forge_runtime", {}))
+        if refine is not None:
+            metadata["refinement_sampling"] = {key: value for key, value in refine.items() if key not in ("generator", "callback_on_step_end", "image", "latents", "audio_latents")}
+        warning = ""
+        try:
+            native_recipes.atomic_json(os.path.splitext(output_path)[0] + ".native.json", metadata)
+        except Exception:
+            logger.exception("Failed to save native video metadata")
+            warning = " | Warning: metadata sidecar could not be saved."
+        shared.state.sampling_step = total_steps
         shared.state.textinfo = "LTX-2.3: finished"
-        return output_path, f"Saved: {output_path}"
+        return output_path, f"Saved: {output_path} | Seed: {seed} | Frames: {len(video[0])} | Cross timestep: {cross_timestep}{warning}"
     except Exception as error:
+        # Callback exceptions bypass Diffusers' normal final offload hooks.
+        # Invalidate the failed pipeline rather than reusing partial hook state.
+        if pipeline_attempted:
+            try:
+                unload()
+            except Exception:
+                logger.exception("Native pipeline cleanup failed")
         if isinstance(error, _LTXInterrupted):
             shared.state.textinfo = "LTX-2.3: interrupted"
             return None, "LTX-2.3 generation interrupted."
         if memory_management.is_oom(error):
             logger.exception("LTX-2.3 generation ran out of memory")
-            unload()
             if getattr(shared.opts, "forge_oom_retry_enabled", True):
                 raise
             shared.state.textinfo = "LTX-2.3: out of memory"
@@ -451,7 +592,7 @@ def generate(
         return None, f"LTX-2.3 error: {error}"
 
 
-def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width=None, height=None, frames=None, steps=None, guidance=None):
+def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width=None, height=None, frames=None, steps=None, guidance=None, seed=None):
     """Run LTX with the values stored by the shared ``ltx2`` preset."""
     return generate(
         _model_path(),
@@ -479,15 +620,21 @@ def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width
         _option("ltx2_audio_modality", 3.0),
         _option("ltx2_guidance_rescale", 0.7),
         _option("ltx2_guidance_blocks", "28"),
-        _option("ltx2_seed", -1),
+        seed if seed is not None else _option("ltx2_seed", -1),
         _option("ltx2_include_audio", True),
+        _option("ltx2_cross_timestep_mode", "Automatic"),
+        _option("ltx2_workflow", "Full"),
+        _option("ltx2_quantization", "Checkpoint"),
+        _option("ltx2_upsampler_path", ""),
+        _option("ltx2_refine_lora", ""),
     )
 
 
 def create_ui():
-    global _ltx_components
+    global _ltx_components, _preset_bound
+    _preset_bound = False
 
-    from modules.call_queue import wrap_gradio_gpu_call
+    from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call
 
     with gr.Blocks(analytics_enabled=False) as interface:
         gr.Markdown(
@@ -545,7 +692,12 @@ def create_ui():
                         audio_modality = gr.Number(value=_option("ltx2_audio_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Audio modality")
                     with gr.Row():
                         guidance_blocks = gr.Textbox(value=_option("ltx2_guidance_blocks", "28"), label="Spatio-temporal guidance blocks")
-                        include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio")
+                        include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio", info="Controls exported audio, not joint denoising.")
+                    cross_timestep_mode = gr.Dropdown(choices=["Automatic", "LTX-2.3", "LTX-2.0"], value=_option("ltx2_cross_timestep_mode", "Automatic"), label="Cross timestep mode", info="Automatic detects prompt modulation in the transformer config.")
+                    workflow = gr.Dropdown(native_recipes.LTX_MODES, value=_option("ltx2_workflow", "Full"), label="Workflow", info="Distilled modes require a matching distilled checkpoint; two-stage output doubles the base resolution.")
+                    quantization = gr.Dropdown(native_recipes.QUANTIZATION_MODES, value=_option("ltx2_quantization", "Checkpoint"), label="Native quantization (experimental)")
+                    upsampler_path = gr.Textbox(value=_option("ltx2_upsampler_path", ""), label="Local latent upsampler", info="Leave blank to use the checkpoint's latent_upsampler directory.")
+                    refine_lora = gr.Textbox(value=_option("ltx2_refine_lora", ""), label="Local distilled refinement LoRA", info="Required for Full + refine 2x.")
             with gr.Column(scale=2):
                 video_output = gr.Video(label="Output", autoplay=True, include_audio=True)
 
@@ -574,6 +726,11 @@ def create_ui():
             guidance_blocks,
             seed,
             include_audio,
+            cross_timestep_mode,
+            workflow,
+            quantization,
+            upsampler_path,
+            refine_lora,
         ]
 
         settings_to_save = {
@@ -600,9 +757,16 @@ def create_ui():
             guidance_blocks: "ltx2_guidance_blocks",
             seed: "ltx2_seed",
             include_audio: "ltx2_include_audio",
+            cross_timestep_mode: "ltx2_cross_timestep_mode",
+            workflow: "ltx2_workflow",
+            quantization: "ltx2_quantization",
+            upsampler_path: "ltx2_upsampler_path",
+            refine_lora: "ltx2_refine_lora",
         }
         for component, key in settings_to_save.items():
-            component.change(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
+            if component is model_path:
+                continue  # The global checkpoint selector owns model persistence.
+            component.input(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
 
         inputs = [
             model_path,
@@ -632,13 +796,38 @@ def create_ui():
             guidance_blocks,
             seed,
             include_audio,
+            cross_timestep_mode,
+            workflow,
+            quantization,
+            upsampler_path,
+            refine_lora,
         ]
-        generate_ltx = wrap_gradio_gpu_call(
-            lambda *args, **kwargs: main_thread.run_and_wait_result(generate, *args, **kwargs),
-            extra_outputs=[None],
-        )
-        generate_button.click(generate_ltx, inputs=inputs, outputs=[video_output, status])
-        prompt.submit(generate_ltx, inputs=inputs, outputs=[video_output, status])
+        from modules_forge.native_requests import PageJobOwner
+        from uuid import uuid4
+
+        owner = PageJobOwner()
+        session = gr.State(value=lambda: uuid4().hex)
+
+        def run_page(session_id, *args):
+            # Resolve random seeds once, before the worker's optional OOM retry.
+            import inspect
+            bound = inspect.signature(generate).bind(*args)
+            if shared.opts.forge_preset != "ltx2":
+                return gr.skip(), "The active preset changed; select ltx2 before generating."
+            # Do not trust an asynchronously updated hidden checkpoint mirror.
+            bound.arguments["model_path"] = _model_path()
+            bound.arguments["prunavaed_path"] = _prunavaed_value() or ""
+            bound.arguments["seed"] = native_validation.actual_seed(bound.arguments["seed"])
+            with owner.active(session_id):
+                result = main_thread.run_and_wait_result(generate, *bound.args, **bound.kwargs)
+                if result is None:
+                    raise RuntimeError("Native generation failed")
+                output_value, message = result
+                return (output_value if output_value else gr.skip()), message
+
+        generate_ltx = wrap_gradio_gpu_call(run_page, extra_outputs=[gr.skip()])
+        generate_button.click(generate_ltx, inputs=[session, *inputs], outputs=[video_output, status])
+        prompt.submit(generate_ltx, inputs=[session, *inputs], outputs=[video_output, status])
         auto_vae_tiling.change(
             fn=lambda enabled: gr.update(interactive=not enabled),
             inputs=[auto_vae_tiling],
@@ -646,7 +835,7 @@ def create_ui():
             queue=False,
             show_progress=False,
         )
-        interrupt_button.click(interrupt_generation, outputs=[])
-        unload_button.click(unload, outputs=[])
+        interrupt_button.click(lambda session_id: owner.interrupt(session_id, interrupt_generation), inputs=[session], outputs=[], queue=False, show_progress=False)
+        unload_button.click(wrap_queued_call(unload), outputs=[])
 
     return interface

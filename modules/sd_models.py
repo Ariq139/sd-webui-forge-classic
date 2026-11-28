@@ -273,7 +273,10 @@ class SdModelData:
 model_data = SdModelData()
 
 
-def unload_model_weights(*args, **kwargs):
+def unload_model_weights(*args, include_native=True, **kwargs):
+    from modules_forge.native_runtime import unload_native_pipelines
+
+    failures = unload_native_pipelines(sys.modules) if include_native else []
     memory_management.unload_all_models()
 
     del model_data.sd_model
@@ -283,6 +286,8 @@ def unload_model_weights(*args, **kwargs):
 
     memory_management.soft_empty_cache(force=True)
     gc.collect()
+    if failures:
+        raise RuntimeError("Native pipeline cleanup failed: " + "; ".join(failures))
 
 
 def list_loaded_weights():

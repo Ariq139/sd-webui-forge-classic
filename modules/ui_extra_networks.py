@@ -843,10 +843,9 @@ def create_ui(interface: gr.Blocks, unrelated_tabs, tabname):
 
 
 def path_is_parent(parent_path, child_path):
-    parent_path = os.path.abspath(parent_path)
-    child_path = os.path.abspath(child_path)
+    from modules.ui_result_utils import path_is_child
 
-    return child_path.startswith(parent_path)
+    return path_is_child(parent_path, child_path)
 
 
 def setup_ui(ui, gallery):

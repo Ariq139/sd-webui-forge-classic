@@ -1,17 +1,76 @@
+import importlib.util
+import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from functools import wraps
 
 import torch
 
+from modules_forge import native_runtime
+
 
 ATTENTION_BACKEND_CHOICES = ("automatic", "native", "sage", "flash")
 OFFLOAD_CHOICES = ("none", "model", "group", "sequential")
 
 
+def require_dependency(name, feature):
+    if importlib.util.find_spec(name) is None:
+        raise RuntimeError(f"{feature} requires optional dependency '{name}' in the WebUI environment.")
+
+
+def native_quantization_kwargs(model_path, mode, dtype, device, offload, denoisers):
+    """Apply only explicit quantization; do not silently dequantize or download weights."""
+    from modules_forge.native_recipes import QUANTIZATION_MODES
+
+    if mode not in QUANTIZATION_MODES:
+        raise ValueError("Unknown native quantization mode.")
+    prequantized = []
+    for name in (*denoisers, "text_encoder"):
+        path = os.path.join(model_path, name, "config.json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as file:
+                quant = json.load(file).get("quantization_config") or {}
+            if quant:
+                prequantized.append(name)
+                method = str(quant.get("quant_method", "")).lower()
+                if "bitsandbytes" in method or quant.get("load_in_4bit") or quant.get("load_in_8bit"):
+                    require_dependency("bitsandbytes", "Prequantized native checkpoint")
+    if mode == "Checkpoint":
+        return {"device_map": "cpu"} if prequantized and (device.type != "cuda" or offload != "none") else {}
+    if prequantized:
+        raise ValueError("Checkpoint already contains quantized components; select Checkpoint mode.")
+    if device.type != "cuda" or offload not in ("model", "none"):
+        raise ValueError("Experimental on-load NF4 requires CUDA and model or none offload. Prefer a prequantized checkpoint on low VRAM.")
+    require_dependency("bitsandbytes", "NF4 quantization")
+    require_dependency("accelerate", "NF4 quantization")
+    from diffusers import BitsAndBytesConfig, PipelineQuantizationConfig
+
+    options = dict(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
+    mapping = {name: BitsAndBytesConfig(**options) for name in denoisers}
+    if mode.endswith("text encoder"):
+        from transformers import BitsAndBytesConfig as TextBitsAndBytesConfig
+        mapping["text_encoder"] = TextBitsAndBytesConfig(**options)
+    kwargs = {"quantization_config": PipelineQuantizationConfig(quant_mapping=mapping)}
+    if offload != "none":
+        kwargs["device_map"] = "cpu"
+    return kwargs
+
+
 def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
-    return pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs))
+    # The model selector accepts complete local pipeline directories only.
+    # Missing weights must never trigger an implicit Hub download.
+    pipe = pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs, local_files_only=True))
+    if pipeline_kwargs.get("device_map") == "cpu":
+        native_runtime.verify_cpu_loading(pipe)
+        # 0.39.0 uses a device-type string for explicit CPU placement.
+        # Remove that marker only after verifying no weights are on CUDA/meta.
+        if pipe.hf_device_map == "cpu":
+            pipe.hf_device_map = None
+        elif pipe.hf_device_map is not None:
+            raise RuntimeError("Unexpected native CPU device map; refusing to stack offload hooks.")
+    return pipe
 
 
 def resolve_vae_tiling_mode(auto: bool, force: bool) -> str:
@@ -59,7 +118,7 @@ def _attention_components(pipe):
 
 def configure_attention(pipe, requested: str, device: torch.device, logger: logging.Logger) -> str:
     requested = str(requested or "automatic").strip().lower()
-    candidates = ("sage", "flash", "native") if requested == "automatic" and device.type == "cuda" else (requested,)
+    candidates = ("sage", "flash", "native") if requested == "automatic" and device.type == "cuda" else ("native",) if requested == "automatic" else (requested,)
     if requested not in ATTENTION_BACKEND_CHOICES:
         candidates = ("native",)
 
@@ -96,13 +155,15 @@ def configure_offload(pipe, device: torch.device, offload: str, logger: logging.
         pipe.to(device)
         return "none"
 
-    if offload == "group" and hasattr(pipe, "enable_group_offload"):
-        try:
+    if offload == "group":
+        if not hasattr(pipe, "enable_group_offload"):
+            logger.warning("Group offload is unavailable; falling back to sequential offload")
+            offload = "sequential"
+        else:
+            # Failed setup can leave partially installed hooks. Do not stack
+            # another offload policy or silently load the pipeline to CUDA.
             _enable_group_offload(pipe, device)
             return "group"
-        except Exception:
-            logger.warning("Group offload is unavailable; falling back to model offload", exc_info=True)
-            offload = "model"
 
     if offload == "sequential":
         pipe.enable_sequential_cpu_offload(device=device)
@@ -111,8 +172,7 @@ def configure_offload(pipe, device: torch.device, offload: str, logger: logging.
         pipe.enable_model_cpu_offload(device=device)
         return "model"
 
-    pipe.to(device)
-    return "none"
+    raise ValueError(f"Unsupported native offload mode: {offload}")
 
 
 def compile_denoisers(pipe, enabled: bool, device: torch.device, offload: str, logger: logging.Logger) -> bool:
@@ -136,7 +196,19 @@ def compile_denoisers(pipe, enabled: bool, device: torch.device, offload: str, l
 def configure_pipeline(pipe, device: torch.device, offload: str, attention: str, compile_enabled: bool, logger: logging.Logger):
     backend = configure_attention(pipe, attention, device, logger)
     actual_offload = configure_offload(pipe, device, offload, logger)
+    if getattr(pipe, "unconditional_transformer", None) is not None:
+        # Ideogram alternates denoisers and accesses encoder submodules
+        # directly; the generic linear/sequential hooks are insufficient.
+        import diffusers
+        if actual_offload in ("model", "sequential") and diffusers.__version__ != "0.39.0":
+            raise RuntimeError("Ideogram offload adapters require Diffusers 0.39.0.")
+        if actual_offload == "model":
+            native_runtime.install_alternating_offload(pipe)
+        elif actual_offload == "sequential":
+            from accelerate.hooks import remove_hook_from_module
+            native_runtime.keep_sequential_prompt_on_cpu(pipe, remove_hook_from_module, device)
     compiled = compile_denoisers(pipe, compile_enabled, device, actual_offload, logger)
+    pipe._forge_runtime = dict(attention_backend=backend, offload=actual_offload, compiled=compiled)
     return backend, actual_offload, compiled
 
 
@@ -178,7 +250,7 @@ def _to_cpu(value):
 
 def _to_device(value, device):
     if isinstance(value, torch.Tensor):
-        return value.to(device)
+        return value.to(device, copy=True)
     if isinstance(value, tuple):
         return tuple(_to_device(item, device) for item in value)
     if isinstance(value, list):
@@ -188,15 +260,28 @@ def _to_device(value, device):
     return value
 
 
+def _tensor_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(item) for item in value)
+    return 0
+
+
 class PromptEmbeddingCache:
-    def __init__(self, max_entries: int = 4):
+    def __init__(self, max_entries: int = 4, max_bytes: int = 128 * 1024**2):
         self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(0, int(max_bytes))
+        self.bytes_used = 0
         self._values = OrderedDict()
         self._lock = threading.RLock()
 
     def clear(self):
         with self._lock:
             self._values.clear()
+            self.bytes_used = 0
 
     def get_or_compute(self, key, device, factory):
         with self._lock:
@@ -206,13 +291,22 @@ class PromptEmbeddingCache:
                 return _to_device(value, device)
 
         with torch.no_grad():
-            value = _to_cpu(factory())
+            computed = factory()
+        size = _tensor_bytes(computed)
+        if size > self.max_bytes or not size:
+            return computed
+        value = _to_cpu(computed)
 
         with self._lock:
+            previous = self._values.pop(key, None)
+            if previous is not None:
+                self.bytes_used -= _tensor_bytes(previous)
+            while self._values and (len(self._values) >= self.max_entries or self.bytes_used + size > self.max_bytes):
+                _, evicted = self._values.popitem(last=False)
+                self.bytes_used -= _tensor_bytes(evicted)
             self._values[key] = value
-            while len(self._values) > self.max_entries:
-                self._values.popitem(last=False)
-        return _to_device(value, device)
+            self.bytes_used += size
+        return computed
 
 
 def configure_prompt_cache(pipe, enabled: bool, logger: logging.Logger) -> bool:
@@ -243,5 +337,5 @@ def configure_prompt_cache(pipe, enabled: bool, logger: logging.Logger) -> bool:
 
     pipe.encode_prompt = cached_encode_prompt
     pipe._forge_prompt_cache_state = {"original": original, "cache": cache}
-    logger.info("Native pipeline prompt embedding cache enabled (maximum 4 entries)")
+    logger.info("Native pipeline prompt embedding cache enabled (maximum 4 entries / 128 MiB of tensor payload)")
     return True

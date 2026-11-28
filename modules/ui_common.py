@@ -9,7 +9,7 @@ import gradio as gr
 
 import modules.images
 import modules.infotext_utils as parameters_copypaste
-from modules import call_queue, shared, ui_tempdir, util
+from modules import call_queue, shared, ui_result_utils, ui_tempdir, util
 from modules.ui_components import ToolButton
 
 folder_symbol = "\U0001f4c2"  # 📂
@@ -20,9 +20,8 @@ def update_generation_info(generation_info, html_info, img_index):
     try:
         generation_info = json.loads(generation_info)
         img_index = int(img_index)
-        if img_index < 0 or img_index >= len(generation_info["infotexts"]):
-            return html_info
-        return plaintext_to_html(generation_info["infotexts"][img_index])
+        infotext = ui_result_utils.image_infotext(generation_info, img_index)
+        return plaintext_to_html(infotext) if infotext else html_info
     except Exception:
         pass
     # if the json parse or anything else fails, just return the old html_info
@@ -30,7 +29,7 @@ def update_generation_info(generation_info, html_info, img_index):
 
 
 def plaintext_to_html(text, classname=None):
-    content = "<br>\n".join(html.escape(x) for x in text.split("\n"))
+    content = "<br>\n".join(html.escape(x) for x in (text or "").split("\n"))
 
     return f"<p class='{classname}'>{content}</p>" if classname else f"<p>{content}</p>"
 
@@ -64,98 +63,119 @@ def update_logfile(logfile_path, fields):
 def save_files(js_data, images, do_make_zip, index):
     filenames = []
     fullfns = []
-    parsed_infotexts = []
+    records = []
 
-    # quick dictionary to class object conversion. Its necessary due apply_filename_pattern requiring it
     class MyObject:
-        def __init__(self, d=None):
-            if d is not None:
-                for key, value in d.items():
-                    setattr(self, key, value)
+        def __init__(self, data):
+            self.__dict__.update(data)
 
-    data = json.loads(js_data)
-    p = MyObject(data)
+    data = ui_result_utils.decode_metadata(js_data)
+    first = ui_result_utils.first_image_index(data)
+    if not images:
+        return gr.update(value=[], visible=False), plaintext_to_html("No images to save.")
 
+    kinds = ui_result_utils.gallery_kinds(data, len(images))
+    try:
+        selected_index = int(index)
+    except (TypeError, ValueError, OverflowError):
+        selected_index = -1
+    if 0 <= selected_index < len(kinds) and kinds[selected_index] == "grid":
+        selected_index = -1  # A grid is a batch overview, not a selected sample.
+    selected = ui_result_utils.selected_range(len(images), selected_index, first, shared.opts.save_selected_only)
+    ordinals = []
+    generated = 0
+    for kind in kinds:
+        ordinals.append(generated)
+        generated += kind == "image"
     path = shared.opts.outdir_save
     save_to_dirs = shared.opts.use_save_to_dirs_for_ui
-    extension: str = shared.opts.samples_format
-    start_index = 0
-
-    if index > -1 and shared.opts.save_selected_only and (index >= data["index_of_first_image"]):  # ensures we are looking at a specific non-grid picture, and we have save_selected_only
-        images = [images[index]]
-        start_index = index
-
-    os.makedirs(shared.opts.outdir_save, exist_ok=True)
+    extension = shared.opts.samples_format
+    os.makedirs(path, exist_ok=True)
 
     fields = [
-        "prompt",
-        "seed",
-        "width",
-        "height",
-        "sampler",
-        "cfgs",
-        "steps",
-        "filename",
-        "negative_prompt",
-        "sd_model_name",
-        "sd_model_hash",
+        "prompt", "seed", "width", "height", "sampler", "cfgs", "steps",
+        "filename", "negative_prompt", "sd_model_name", "sd_model_hash",
     ]
-    logfile_path = os.path.join(shared.opts.outdir_save, "log.csv")
-
-    # NOTE: ensure csv integrity when fields are added by
-    # updating headers and padding with delimiters where needed
+    logfile_path = os.path.join(path, "log.csv")
     if shared.opts.save_write_log_csv and os.path.exists(logfile_path):
         update_logfile(logfile_path, fields)
 
     with open(logfile_path, "a", encoding="utf8", newline="") if shared.opts.save_write_log_csv else nullcontext() as file:
-        if file:
-            at_start = file.tell() == 0
-            writer = csv.writer(file)
-            if at_start:
-                writer.writerow(fields)
+        writer = csv.writer(file) if file else None
+        if file and file.tell() == 0:
+            writer.writerow(fields)
 
-        for image_index, filedata in enumerate(images, start_index):
-            image = filedata[0]
-            is_grid = image_index < p.index_of_first_image
-            p.batch_index = image_index - 1
-
-            try:
-                parameters = parameters_copypaste.parse_generation_parameters(data["infotexts"][image_index], [])
-            except IndexError:
-                fullfn, _ = modules.images.save_image(image, path, "", seed=None, prompt=None, extension=extension, info=None, grid=is_grid, p=p, save_to_dirs=save_to_dirs)
-                filename = os.path.relpath(fullfn, path)
-                return gr.update(value=[fullfn], visible=True), plaintext_to_html(f"Saved: {filename}")
-
-            parsed_infotexts.append(parameters)
-            fullfn, txt_fullfn = modules.images.save_image(image, path, "", seed=parameters["Seed"], prompt=parameters["Prompt"], extension=extension, info=p.infotexts[image_index], grid=is_grid, p=p, save_to_dirs=save_to_dirs)
-
+        for image_index in selected:
+            image = images[image_index][0]
+            is_grid = kinds[image_index] == "grid"
+            raw = ui_result_utils.image_infotext(data, image_index)
+            parameters = {}
+            if raw:
+                try:
+                    parameters = parameters_copypaste.parse_generation_parameters(raw, [], style_mode="Ignore")
+                except Exception:
+                    # Missing or invalid metadata must not prevent saving.
+                    raw = None
+            native = "request_seed" in data
+            prompt = parameters.get("Prompt", data.get("prompt", "") if native else "")
+            seed = parameters.get("Seed")
+            p = MyObject(data)
+            p.batch_size = ui_result_utils.safe_batch_size(data)
+            ordinal = ordinals[image_index]
+            p.iteration, p.batch_index = divmod(ordinal, p.batch_size)
+            p.n_iter = max(1, (generated + p.batch_size - 1) // p.batch_size)
+            p.prompt = prompt
+            p.negative_prompt = parameters.get("Negative prompt", data.get("negative_prompt", "") if native else "")
+            p.sd_model_name = parameters.get("Model", data.get("sd_model_name", ""))
+            p.sd_model_hash = parameters.get("Model hash", data.get("sd_model_hash", ""))
+            p.steps = parameters.get("Steps", data.get("steps") if native else None)
+            p.sampler_name = parameters.get("Sampler", data.get("sampler_name", "") if native else "")
+            p.cfg_scale = parameters.get("CFG scale", data.get("cfg_scale") if native else None)
+            p.styles = data.get("styles") or []
+            p.all_seeds = data.get("all_seeds") or ([seed] if seed is not None else [])
+            fullfn, txt_fullfn = modules.images.save_image(
+                image, path, "", seed=seed, prompt=prompt, extension=extension,
+                info=raw, grid=is_grid, p=p, save_to_dirs=save_to_dirs,
+            )
+            if not fullfn:
+                continue
             filename = os.path.relpath(fullfn, path)
             filenames.append(filename)
             fullfns.append(fullfn)
+            records.append((p, seed, prompt, image))
             if txt_fullfn:
-                filenames.append(os.path.basename(txt_fullfn))
+                filenames.append(os.path.relpath(txt_fullfn, path))
                 fullfns.append(txt_fullfn)
+            if writer:
+                writer.writerow([prompt, seed, image.width, image.height, p.sampler_name, p.cfg_scale,
+                                 p.steps, filename, p.negative_prompt, p.sd_model_name, p.sd_model_hash])
 
-        if file:
-            writer.writerow([parsed_infotexts[0]["Prompt"], parsed_infotexts[0]["Seed"], data["width"], data["height"], data["sampler_name"], data["cfg_scale"], data["steps"], filenames[0], parsed_infotexts[0]["Negative prompt"], data["sd_model_name"], data["sd_model_hash"]])
+    if not fullfns:
+        return gr.update(value=[], visible=False), plaintext_to_html("No images were saved.")
 
-    # Make Zip
     if do_make_zip:
-        p.all_seeds = [parameters["Seed"] for parameters in parsed_infotexts]
-        namegen = modules.images.FilenameGenerator(p, parsed_infotexts[0]["Seed"], parsed_infotexts[0]["Prompt"], image, True)
-        zip_filename = namegen.apply(shared.opts.grid_zip_filename_pattern or "[datetime]_[[model_name]]_[seed]-[seed_last]")
-        zip_filepath = os.path.join(path, f"{zip_filename}.zip")
-
+        p, seed, prompt, image = records[0]
+        p.all_seeds = [record[1] for record in records if record[1] is not None]
+        namegen = modules.images.FilenameGenerator(p, seed, prompt, image, True)
+        pattern = shared.opts.grid_zip_filename_pattern or ("[datetime]_[[model_name]]_[seed]-[seed_last]" if p.all_seeds else "[datetime]")
+        zip_filename = namegen.apply(pattern)
         from zipfile import ZipFile
 
-        with ZipFile(zip_filepath, "w") as zip_file:
-            for i in range(len(fullfns)):
-                with open(fullfns[i], mode="rb") as f:
-                    zip_file.writestr(filenames[i], f.read())
+        # Never overwrite an archive made by another save in the same second.
+        suffix = 0
+        while True:
+            name = zip_filename if suffix == 0 else f"{zip_filename}-{suffix}"
+            zip_filepath = os.path.join(path, f"{name}.zip")
+            try:
+                with ZipFile(zip_filepath, "x") as zip_file:
+                    for fullfn, filename in zip(fullfns, filenames):
+                        zip_file.write(fullfn, filename)
+                break
+            except FileExistsError:
+                suffix += 1
         fullfns.insert(0, zip_filepath)
 
     return gr.update(value=fullfns, visible=True), plaintext_to_html(f"Saved: {filenames[0]}")
-
 
 @dataclasses.dataclass
 class OutputPanel:

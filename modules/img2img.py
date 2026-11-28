@@ -10,6 +10,7 @@ import modules.processing as processing
 import modules.scripts
 import modules.shared as shared
 from modules import images
+from modules.batch_gallery import BatchGallery
 from modules.infotext_utils import (
     create_override_settings_dict,
     parse_generation_parameters,
@@ -22,7 +23,7 @@ from modules.processing import (
 from modules.sd_models import get_closet_checkpoint_match, model_data
 from modules.shared import opts, state
 from modules.ui import _STEP, plaintext_to_html, sRound
-from modules_forge import main_thread
+from modules_forge import main_thread, native_requests, native_validation
 from modules_forge.presets import get_capabilities
 
 
@@ -58,10 +59,10 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     height = p.height
     override_settings = p.override_settings
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
-    batch_results = None
-    discard_further_results = False
+    gallery = BatchGallery(shared.opts.img2img_batch_show_results_limit)
     requested_batch_size, requested_n_iter = p.batch_size, p.n_iter
     requested_full_res = p.inpaint_full_res
+    png_info_props = png_info_props or []
     for i, image in enumerate(batch_images):
         state.job = f"{i+1} out of {len(batch_images)}"
         if state.skipped:
@@ -89,7 +90,8 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
         if p.resize_mode < 4 and not (_w % _STEP == 0 and _h % _STEP == 0):
             img = images.resize_image(1, img, sRound(_w), sRound(_h))
 
-        # Each input owns its latents, masks and crop geometry.
+        # Each input owns its latents, masks and crop geometry. In particular,
+        # a previous grouped img2img run must not look like a supplied latent.
         p.init_latent = p.image_conditioning = None
         p.mask = p.nmask = p.mask_for_overlay = None
         p.overlay_images = p.color_corrections = p.paste_to = None
@@ -124,10 +126,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
                     info_img_path = os.path.join(png_info_dir, os.path.basename(image))
                     info_img = images.read(info_img_path)
                 geninfo, _ = images.read_info_from_image(info_img)
-                _orig: str = shared.opts.infotext_styles
-                shared.opts.infotext_styles = "Ignore"
-                parsed_parameters = parse_generation_parameters(geninfo)
-                shared.opts.infotext_styles = _orig
+                parsed_parameters = parse_generation_parameters(geninfo or "", style_mode="Ignore")
                 parsed_parameters = {k: v for k, v in parsed_parameters.items() if k in (png_info_props or [])}
             except Exception:
                 parsed_parameters = {}
@@ -153,7 +152,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             if model_info is not None:
                 p.override_settings["sd_model_checkpoint"] = model_info.name
             elif sd_model_checkpoint_override:
-                p.override_settings["sd_model_checkpoint"] = sd_model_checkpoint_override
+                p.override_settings["sd_model_checkpoint"] = sd_model_checkpoint_override.name
             else:
                 p.override_settings.pop("sd_model_checkpoint", None)
 
@@ -170,30 +169,22 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             if proc is None:
                 proc = process_images(p)
         finally:
+            # A grouped single-image fallback must not shrink later inputs.
             p.batch_size, p.n_iter = requested_batch_size, requested_n_iter
 
-        if not discard_further_results and proc:
-            if batch_results:
-                batch_results.images.extend(proc.images)
-                batch_results.infotexts.extend(proc.infotexts)
-            else:
-                batch_results = proc
+        gallery.add(proc)
 
-            if 0 <= shared.opts.img2img_batch_show_results_limit < len(batch_results.images):
-                discard_further_results = True
-                batch_results.images = batch_results.images[: int(shared.opts.img2img_batch_show_results_limit)]
-                batch_results.infotexts = batch_results.infotexts[: int(shared.opts.img2img_batch_show_results_limit)]
-
-    return batch_results
+    return gallery.finish()
 
 
-def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
+def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args, _native_seed=None):
 
     override_settings = create_override_settings_dict(override_settings_texts)
     try:
         n_iter = int(n_iter)
     except (TypeError, ValueError):
         n_iter = 1
+    requested_n_iter = n_iter
     infinite_generation = n_iter == 0
     n_iter = max(1, n_iter)
     capabilities = get_capabilities(
@@ -255,8 +246,16 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     mask = images.fix_image(mask)
 
     if opts.forge_preset == "ltx2":
-        if is_batch or infinite_generation or int(n_iter or 1) > 1:
+        if is_batch or requested_n_iter != 1:
             raise RuntimeError("LTX-2.3 image-to-video supports one video per request through the shared img2img flow; set Batch Count to 1.")
+        if mode not in (0, 1) or image is None:
+            raise ValueError("LTX image-to-video requires an input image in img2img or Sketch; masks are not supported.")
+        if selected_scale_tab == 1:
+            width, height = native_requests.scaled_video_dimensions(image.width, image.height, scale_by)
+        runner = modules.scripts.scripts_img2img
+        steps = native_requests.script_control(runner, args, "ScriptSampler", "steps")
+        seed = _native_seed if _native_seed is not None else native_validation.actual_seed(
+            native_requests.script_control(runner, args, "ScriptSeed", "seed", getattr(opts, "ltx2_seed", -1)))
 
         from modules.ui_ltx2_video import generate_from_preset
 
@@ -269,10 +268,16 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
             width=width,
             height=height,
             frames=batch_size,
-            steps=args[0] if args and isinstance(args[0], (int, float)) else None,
+            steps=steps,
             guidance=cfg_scale,
+            seed=seed,
         )
-        generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+        if not video_path:
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
+        native_info = {"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt}
+        from modules_forge.native_outputs import video_metadata
+        native_info.update(video_metadata(video_path))
+        generation_info_js = json.dumps(native_info)
         return (
             gr.update(value=None, visible=False),
             gr.update(value=video_path, visible=bool(video_path)),
@@ -368,4 +373,8 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
 
 
 def img2img(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
-    return main_thread.run_and_wait_result(img2img_function, id_task, request, mode, prompt, negative_prompt, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur, mask_alpha, inpainting_fill, n_iter, batch_size, cfg_scale, distilled_cfg_scale, image_cfg_scale, denoising_strength, selected_scale_tab, height, width, scale_by, resize_mode, inpaint_full_res, inpaint_full_res_padding, inpainting_mask_invert, img2img_batch_input_dir, img2img_batch_output_dir, img2img_batch_inpaint_mask_dir, override_settings_texts, img2img_batch_use_png_info, img2img_batch_png_info_props, img2img_batch_png_info_dir, img2img_batch_source_type, img2img_batch_upload, *args)
+    seed = None
+    if opts.forge_preset == "ltx2":
+        seed = native_validation.actual_seed(native_requests.script_control(
+            modules.scripts.scripts_img2img, args, "ScriptSeed", "seed", getattr(opts, "ltx2_seed", -1)))
+    return main_thread.run_and_wait_result(img2img_function, id_task, request, mode, prompt, negative_prompt, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur, mask_alpha, inpainting_fill, n_iter, batch_size, cfg_scale, distilled_cfg_scale, image_cfg_scale, denoising_strength, selected_scale_tab, height, width, scale_by, resize_mode, inpaint_full_res, inpaint_full_res_padding, inpainting_mask_invert, img2img_batch_input_dir, img2img_batch_output_dir, img2img_batch_inpaint_mask_dir, override_settings_texts, img2img_batch_use_png_info, img2img_batch_png_info_props, img2img_batch_png_info_dir, img2img_batch_source_type, img2img_batch_upload, *args, _native_seed=seed)

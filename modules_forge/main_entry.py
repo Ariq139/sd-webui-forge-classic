@@ -22,7 +22,7 @@ from modules import (
     ui_common,
 )
 from modules_forge.presets import PresetArch, get_capabilities, is_video, use_distill, use_shift
-from modules_forge.native_models import compatible_model_directories, is_compatible_model
+from modules_forge.native_models import compatible_model_directories, is_compatible_model, select_model_path
 
 logger = logging.getLogger("ui_models")
 setup_logger(logger)
@@ -234,10 +234,18 @@ def make_checkpoint_manager_ui():
     if memory_management.commandline_vram_mode() is None:
         memory_management.set_vram_mode(initial_vram_mode)
 
-    ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
-    ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
-    ui_forge_unet_dtype.input(dtype_change, inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
-    ui_forge_vram_mode.change(vram_mode_change, inputs=[ui_forge_vram_mode], queue=False, show_progress=False)
+    from modules.call_queue import wrap_queued_call
+
+    def current_preset_only(callback):
+        def apply(value, preset):
+            if preset == shared.opts.forge_preset:
+                callback(value, preset)
+        return wrap_queued_call(apply)
+
+    ui_checkpoint.input(current_preset_only(checkpoint_change), inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
+    ui_vae.input(current_preset_only(modules_change), inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
+    ui_forge_unet_dtype.input(current_preset_only(dtype_change), inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
+    ui_forge_vram_mode.input(wrap_queued_call(vram_mode_change), inputs=[ui_forge_vram_mode], queue=False, show_progress=False)
 
 
 def checkpoint_label(preset: str) -> str:
@@ -280,12 +288,11 @@ def ideogram_model_value() -> str:
 
 
 def native_model_value(preset: str) -> str:
-    default = LTX2_MODEL_DEFAULT if preset == PresetArch.ltx2.name else IDEOGRAM_MODEL_DEFAULT
-    for key in (f"forge_checkpoint_{preset}", f"{preset}_model_path"):
-        value = str(getattr(shared.opts, key, "") or "").strip()
-        if value and value != default and native_model_is_compatible(value, preset):
-            return value
-    return ""
+    return select_model_path(
+        native_model_marker(preset),
+        getattr(shared.opts, f"forge_checkpoint_{preset}", ""),
+        getattr(shared.opts, f"{preset}_model_path", ""),
+    )
 
 
 def checkpoint_choices(preset: str, choices: list[str]) -> list[str]:
@@ -304,7 +311,7 @@ def checkpoint_value_for_preset(preset: str, choices: list[str]) -> str | None:
     choices = [str(choice) for choice in choices if choice not in (None, "")]
     if preset in NATIVE_PIPELINE_PRESETS:
         value = ltx2_model_value() if preset == PresetArch.ltx2.name else ideogram_model_value()
-        return value if value in choices else (choices[0] if choices else None)
+        return value if value in choices else None
     value = getattr(shared.opts, f"forge_checkpoint_{preset}", None) or shared.opts.sd_model_checkpoint
     value = str(value or "").strip()
     if value.lower() in {"none", "null"}:
@@ -404,10 +411,11 @@ def refresh_model_loading_parameters(*, refresh: bool = True, disable_log: bool 
 def checkpoint_change(ckpt_name: str, preset: str, save=True, refresh=True) -> bool:
     """Save a checkpoint selection and return whether it changed."""
     if preset in NATIVE_PIPELINE_PRESETS:
-        value_getter = ltx2_model_value if preset == PresetArch.ltx2.name else ideogram_model_value
         ckpt_name = str(ckpt_name or "").strip()
-        current = value_getter()
-        if ckpt_name == current:
+        if not native_model_is_compatible(ckpt_name, preset):
+            return False
+        if (ckpt_name == getattr(shared.opts, f"forge_checkpoint_{preset}", "")
+                and ckpt_name == getattr(shared.opts, f"{preset}_model_path", "")):
             return False
 
         shared.opts.set(f"forge_checkpoint_{preset}", ckpt_name)
@@ -603,16 +611,24 @@ def forge_main_entry():
         ui_img2img_batch_count,
     ]
 
-    ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).success(
-        fn=_load_presets,
-        inputs=[ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_forge_preset],
-        queue=False,
-        show_progress=False,
-    ).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
-    # A checkpoint can change capabilities without changing the preset, for
-    # example Flux dev versus Flux Schnell.
-    ui_checkpoint.change(on_preset_change, inputs=[ui_forge_preset, ui_checkpoint], outputs=output_targets, queue=False, show_progress=False)
-    Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
+    from modules.call_queue import wrap_queued_call
+
+    # Commit preset and model state together, under the generation queue lock.
+    def apply_preset(preset):
+        if preset != shared.opts.forge_preset:
+            shared.opts.set("forge_preset", preset)
+            shared.opts.save(shared.config_filename)
+            _load_presets(None, None, None, preset)
+        return on_preset_change(preset)
+
+    def checkpoint_update(preset, checkpoint):
+        if preset != shared.opts.forge_preset:
+            return [gr.skip() for _ in output_targets]
+        return on_preset_change(preset, checkpoint)
+
+    ui_forge_preset.change(wrap_queued_call(apply_preset), inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
+    ui_checkpoint.change(wrap_queued_call(checkpoint_update), inputs=[ui_forge_preset, ui_checkpoint], outputs=output_targets, queue=False, show_progress=False)
+    Context.root_block.load(wrap_queued_call(apply_preset), inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
     for tab_id in PRESET_TAB_IDS:
         tab = native_tabs.get(tab_id)
@@ -652,10 +668,6 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
         native_checkpoint = native_model_value(ui_forge_preset)
         if native_checkpoint:
             checkpoint_change(native_checkpoint, ui_forge_preset, save=True, refresh=False)
-        else:
-            shared.opts.set(f"forge_checkpoint_{ui_forge_preset}", "")
-            shared.opts.set(f"{ui_forge_preset}_model_path", "")
-            shared.opts.save(shared.config_filename)
         return
 
     restore_standard_preset(ui_forge_preset)
@@ -682,12 +694,17 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
     if (fps := is_video(preset)) > 1:
         max_frames = fps * (30 if preset == PresetArch.ltx2.name else 15) + 1
         min_frames = 9 if preset == PresetArch.ltx2.name else 1
-        batch_args_t2i = {"minimum": min_frames, "maximum": max_frames, "step": fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+        batch_args_t2i = {"minimum": min_frames, "maximum": max_frames, "step": 8 if preset == PresetArch.ltx2.name else fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
     else:
         batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
 
     batch_args_i2i = batch_args_t2i.copy()
     batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
+    if preset == PresetArch.ltx2.name:
+        for frame_args in (batch_args_t2i, batch_args_i2i):
+            # Bring legacy persisted frame values onto the supported UI lattice.
+            value = int(frame_args["value"] or 121)
+            frame_args["value"] = min(frame_args["maximum"], max(9, 1 + 8 * ((value - 1) // 8)))
 
     native_pipeline = preset in NATIVE_PIPELINE_PRESETS
     ideogram = preset == PresetArch.ideogram.name

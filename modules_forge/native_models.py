@@ -1,5 +1,6 @@
-import json
 import os
+
+from modules_forge.native_runtime import require_pipeline_directory
 
 from modules import paths
 
@@ -23,15 +24,10 @@ def resolve_model_path(value: str) -> str:
 
 
 def is_compatible_model(value: str, marker: str) -> bool:
-    model_path = resolve_model_path(value)
-    model_index = os.path.join(model_path, "model_index.json")
-    if not os.path.isdir(model_path) or not os.path.isfile(model_index):
-        return False
-
     try:
-        with open(model_index, encoding="utf-8") as file:
-            return marker in str(json.load(file).get("_class_name", ""))
-    except (OSError, ValueError):
+        require_pipeline_directory(resolve_model_path(value), marker)
+        return True
+    except ValueError:
         return False
 
 
@@ -42,5 +38,22 @@ def compatible_model_directories(marker: str) -> list[str]:
             continue
         for entry in os.scandir(root):
             if entry.is_dir() and is_compatible_model(entry.path, marker):
-                values.append(os.path.relpath(entry.path, root))
+                # Keep the root identity; equal names may contain different models.
+                values.append(os.path.abspath(entry.path))
     return sorted(set(values), key=str.casefold)
+
+
+DEFAULT_MODEL_IDS = {"LTX2": "diffusers/LTX-2.3-Diffusers", "Ideogram4": "ideogram-ai/ideogram-v4"}
+
+
+def select_model_path(marker, *values):
+    default = DEFAULT_MODEL_IDS[marker]
+    for value in values:
+        value = str(value or "").strip()
+        if value and value != default:
+            # Preserve a missing/incompatible explicit selection for a clear
+            # loader error and for the user to correct in the checkpoint menu.
+            return resolve_model_path(value)
+    if any(str(value or "").strip() == default for value in values) and is_compatible_model(default, marker):
+        return resolve_model_path(default)
+    return ""

@@ -21,7 +21,7 @@ import pytz
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 from pillow_heif import register_heif_opener
 
-from modules import batch_planning, errors, script_callbacks, sd_samplers, shared
+from modules import batch_planning, errors, script_callbacks, sd_samplers, shared, video_stream
 from modules.paths_internal import roboto_ttf_file
 from modules.shared import opts
 
@@ -415,8 +415,8 @@ class FilenameGenerator:
         "sampler": lambda self: self.p and sanitize_filename_part(self.p.sampler_name, replace_spaces=False),
         "sampler_scheduler": lambda self: self.p and get_sampler_scheduler(self.p, True),
         "scheduler": lambda self: self.p and get_sampler_scheduler(self.p, False),
-        "model_hash": lambda self: getattr(self.p, "sd_model_hash", shared.sd_model.sd_model_hash),
-        "model_name": lambda self: sanitize_filename_part(shared.sd_model.sd_checkpoint_info.name_for_extra, replace_spaces=False),
+        "model_hash": lambda self: getattr(self.p, "sd_model_hash", None) or getattr(shared.sd_model, "sd_model_hash", ""),
+        "model_name": lambda self: sanitize_filename_part(getattr(self.p, "sd_model_name", None) or getattr(getattr(shared.sd_model, "sd_checkpoint_info", None), "name_for_extra", ""), replace_spaces=False),
         "date": lambda self: datetime.datetime.now().strftime("%Y-%m-%d"),
         "datetime": lambda self, *args: self.datetime(*args),  # accepts formats: [datetime], [datetime<Format>], [datetime<Format><Time Zone>]
         "job_timestamp": lambda self: getattr(self.p, "job_timestamp", shared.state.job_timestamp),
@@ -952,9 +952,9 @@ def fix_png_transparency(image: Image.Image):
     return image
 
 
-def save_video(p, frames: list[np.ndarray], fps: int = 16, *, basename: str = "", info: str = None, audio_copy: os.PathLike = None) -> str:
-    height, width, channels = frames[0].shape
-    assert channels == 3, "Frames must be in (H, W, 3) RGB format"
+def save_video(p, frames, fps=16, *, basename: str = "", info: str = None, audio_copy: os.PathLike = None) -> str:
+    shape, frames = video_stream.first_frame(frames)
+    height, width, _ = shape
 
     folder = opts.outdir_samples or opts.outdir_videos
     extension = opts.video_container
@@ -1034,17 +1034,12 @@ def save_video(p, frames: list[np.ndarray], fps: int = 16, *, basename: str = ""
         profile,
         "-metadata",
         f"description={str(info)}",
-        fullfn,
     ]
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    for frame in frames:
-        proc.stdin.write(frame.tobytes())
-    proc.stdin.close()
-    proc.wait()
+    video_stream.encode_frames(cmd, fullfn, shape, frames)
 
     if opts.save_txt and info is not None:
-        txt_fullfn = os.path.join(folder, f"{file_decoration}.txt")
+        txt_fullfn = os.path.splitext(fullfn)[0] + ".txt"
         with open(txt_fullfn, "w", encoding="utf8") as file:
             file.write(f"{info}\n")
 
