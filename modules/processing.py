@@ -1257,6 +1257,8 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
             from backend.sampling.krea_cache import sampling_krea_cache_scope
+            from backend.sampling.invariant_cache import sampling_invariant_scope
+            from backend.args import args as backend_args
 
             unet_patcher = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
             model = getattr(unet_patcher, "model", None)
@@ -1266,7 +1268,10 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 getattr(unet_patcher, "patches_uuid", None),
             )
             position_embedder = getattr(getattr(model, "diffusion_model", None), "pe_embedder", None)
-            with sampling_krea_cache_scope(cache_namespace, position_embedder=position_embedder):
+            invariant_mib = getattr(backend_args, "invariant_cache_mib", 0)
+            if any(getattr(backend_args, key, None) is not None for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch")):
+                invariant_mib = 0
+            with sampling_krea_cache_scope(cache_namespace, position_embedder=position_embedder), sampling_invariant_scope(invariant_mib * 1024 * 1024):
                 samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
             for sample_index, x_sample in enumerate(samples_ddim):

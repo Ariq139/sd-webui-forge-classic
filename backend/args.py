@@ -9,6 +9,7 @@ parser.add_argument("--loglevel", type=str, default=None, choices=["DEBUG", "INF
 parser.add_argument("--gpu-device-id", type=int, default=None, metavar="DEVICE_ID", help="Set the id of device to use (all other devices will not be visible)")
 parser.add_argument("--disable-gpu-warning", action="store_true", help="Disable the low VRAM warnings")
 parser.add_argument("--activation-space-lora", action="store_true", help="Run compatible standard online linear LoRAs in activation space; results may differ slightly from dense merging")
+parser.add_argument("--invariant-cache-mib", type=int, default=0, metavar="MIB", help="Experimental single-GPU sampling cache budget in MiB; 0 disables")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')

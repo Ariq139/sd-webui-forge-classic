@@ -29,6 +29,7 @@ from backend.sampling.krea_cache import (
     krea_text_fusion_revision,
 )
 from backend.performance import record_region
+from backend.sampling.invariant_cache import clear_invariants, invariant_condition, invariant_revision
 from modules import shared
 
 
@@ -425,7 +426,7 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             if "model_function_wrapper" in model_options:
                 output = model_options["model_function_wrapper"](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
             else:
-                with krea_text_fusion_condition(krea_condition_key):
+                with krea_text_fusion_condition(krea_condition_key), invariant_condition(krea_condition_key):
                     output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
         del input_x
 
@@ -484,7 +485,9 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
     transformer_options["cond_indices"] = list(range(timestep.shape[0]))
     transformer_options["uncond_indices"] = []
     c["transformer_options"] = transformer_options
-    with record_region("forge::single_condition_cfg1"):
+    keys = tuple((name, getattr(value, "cache_key", None)) for name, value in item["model_conds"].items())
+    invariant_key = (id(model), ((keys, area, None, 0),)) if keys and all(key is not None for _, key in keys) else None
+    with record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key):
         return model.apply_model(x, timestep, **c)
 
 
@@ -649,10 +652,24 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     if parallel_cfg is None and (batch_mode or (args.parallel_cfg is not None and not math.isclose(cond_scale, 1.0))):
         parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x, batch_mode=batch_mode)
     try:
-        with krea_text_fusion_revision((id(unet_patcher), unet_patcher.patches_uuid)):
+        revision = (id(unet_patcher), unet_patcher.patches_uuid)
+        invariant_revision_key = None
+        if (getattr(args, "invariant_cache_mib", 0) > 0 and condition_cache is not None
+                and cond_cache_key is not None and (uncond is None or math.isclose(cond_scale, 1.0) or uncond_cache_key is not None)
+                and parallel_cfg is None and control is None and extra_concat_condition is None
+                and not unet_patcher.object_patches and not unet_patcher.extra_model_patchers_during_sampling
+                and not getattr(unet_patcher, "weight_wrapper_patches", None)
+                and set(model_options) <= {"transformer_options"}
+                and not getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None)
+                and not dynamic_args.ref_latents and dynamic_args.context_handler is None):
+            from modules import script_callbacks
+            if not any(script_callbacks.callback_map.get(key) for key in ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")):
+                invariant_revision_key = revision
+        with krea_text_fusion_revision(revision), invariant_revision(invariant_revision_key):
             return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
     except BaseException as error:
         clear_current_krea_cache()
+        clear_invariants()
         _release_parallel_cfg(unet_patcher)
         if parallel_cfg is not None and isinstance(error, Exception) and memory_management.is_oom(error):
             try:
