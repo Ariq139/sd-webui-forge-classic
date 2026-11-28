@@ -26,6 +26,7 @@ parser.add_argument("--native-int8-mlp-activation", action="store_true", help="E
 parser.add_argument("--flux-reference-cache", action="store_true", help="Cache immutable native FLUX/Klein reference tokens and compatible dense projections with the invariant cache budget")
 parser.add_argument("--target-only-output-head", action="store_true", help="Experimentally skip output projection for discarded reference and caption tokens; can change rounding")
 parser.add_argument("--assembled-condition-cache", action="store_true", help="Cache native assembled conditioning tensors within the invariant cache budget")
+parser.add_argument("--pin-quantized-weights", action="store_true", help="Permit original packed GGUF storage to use existing shared-memory pinning limits")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')

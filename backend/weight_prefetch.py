@@ -43,7 +43,9 @@ class WeightPrefetch:
         if block is None:
             return
         self._reap()
-        allowance = min(self.budget // 2, self.budget - self.bytes)
+        # Permit a single large packed matrix to occupy the remaining budget;
+        # in-flight and retired buffers are still charged until completion.
+        allowance = self.budget - self.bytes
         if allowance <= 0:
             return
         from backend.operations_gguf import ParameterGGUF
@@ -71,6 +73,8 @@ class WeightPrefetch:
             else:
                 continue
             if not raw.is_contiguous() or not raw.is_pinned():
+                # Externally registered storage must be recognized as pinned by
+                # this PyTorch build; never assume async DMA from registration alone.
                 continue
             try:
                 version = source._version

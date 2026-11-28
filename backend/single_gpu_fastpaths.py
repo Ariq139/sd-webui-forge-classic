@@ -107,3 +107,16 @@ def dense_tokenwise_head(module):
                for p in child.parameters(recurse=False)):
             return False
     return True
+
+
+def version_reference_latents(refs):
+    """Create versioned immutable job inputs once, not once per denoiser call."""
+    if not single_gpu_flag("flux_reference_cache"):
+        return list(refs)
+    result = []
+    for ref in refs:
+        if type(ref) is torch.Tensor and ref.is_inference():
+            with torch.inference_mode(False), torch.no_grad():
+                ref = ref.clone()
+        result.append(ref)
+    return result

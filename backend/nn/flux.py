@@ -748,7 +748,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             if reference_key is not None and retain_reference_sources(ref_latents):
                 from backend.operations import ForgeOperations
                 project_refs = (type(self.img_in) in (nn.Linear, ForgeOperations.Linear)
-                                and dense_tokenwise_head(self.img_in))
+                                and dense_tokenwise_head(self.img_in)
+                                and self.img_in.weight.device == x.device)
             else:
                 reference_key = None
         if bool(ref_latents):
