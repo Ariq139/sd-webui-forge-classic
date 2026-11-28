@@ -200,7 +200,7 @@ def unload_forge_model():
     try:
         from modules import sd_models
 
-        sd_models.unload_model_weights()
+        sd_models.unload_model_weights(include_native=False)
     except Exception:
         logger.debug("No Forge image model needed unloading before Ideogram 4", exc_info=True)
 

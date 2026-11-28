@@ -118,58 +118,114 @@ let regen_txt2img = null;
 let regen_img2img = null;
 
 (function () {
-    //Start example Context Menu Items
-    let generateOnRepeat_txt2img = function () {
-        if (regen_txt2img == null && regen_img2img == null) {
-            let generate = gradioApp().querySelector("#txt2img_generate");
-            let interrupt = gradioApp().querySelector("#txt2img_interrupt");
-            if (!interrupt.offsetParent) {
-                generate.click();
+    function nativeInfinite(tab) {
+        const count = gradioApp().querySelector("#" + tab + "_batch_count input[type=number], #" + tab + "_batch_count input[type=range]");
+        return count && count.value !== "" && Number(count.value) === 0;
+    }
+
+    function idleGenerateButton(tab) {
+        const generate = gradioApp().querySelector("#" + tab + "_generate");
+        const interrupt = gradioApp().querySelector("#" + tab + "_interrupt");
+        const interrupting = gradioApp().querySelector("#" + tab + "_interrupting");
+        if (!generate || !generate.offsetParent || generate.disabled || interrupt?.offsetParent || interrupting?.offsetParent) return null;
+        return generate;
+    }
+
+    function startRepeat(tab, cancel) {
+        const key = tab + "_task_id";
+        let task = localGet(key);
+        let awaitingTask = false;
+        let checking = false;
+        let uncertainSince = 0;
+        const timeoutMs = 40000;
+        function stopUncertain() {
+            cancel();
+            console.warn("Generate forever stopped: previous submission could not be confirmed.");
+            alert("Generate forever stopped because the previous submission could not be confirmed. Check the active job before restarting.");
+        }
+
+        // Native Batch Count 0 already repeats on the server.
+        if (nativeInfinite(tab)) {
+            if (!task) idleGenerateButton(tab)?.click();
+            return null;
+        }
+
+        return setInterval(function () {
+            if (nativeInfinite(tab)) {
+                cancel();
+                return;
             }
 
-            regen_txt2img = setInterval(function () {
-                if (interrupt.style.display == "none") {
-                    generate.click();
-                    interrupt.style.display = "block";
-                }
-            }, 500);
-        }
-    };
-    appendContextMenuOption("#txt2img_generate", "Generate forever", generateOnRepeat_txt2img);
-    appendContextMenuOption("#txt2img_interrupt", "Generate forever", generateOnRepeat_txt2img);
+            const current = localGet(key);
+            if (current && current !== task) {
+                task = current;
+                awaitingTask = false;
+                uncertainSince = 0;
+            }
 
-    let cancel_regen_txt2img = function () {
+            if (task || awaitingTask) {
+                if (!uncertainSince) uncertainSince = Date.now();
+                if (Date.now() - uncertainSince >= timeoutMs) {
+                    stopUncertain();
+                    return;
+                }
+            }
+
+            if (task) {
+                if (checking) return;
+                checking = true;
+                const previous = task;
+                // A missing browser task id can also mean a failed progress poll.
+                // Only confirmed server completion permits another submission.
+                request("./internal/progress", { id_task: previous, live_preview: false }, function (res) {
+                    checking = false;
+                    if (task !== previous) return;
+                    if (res.completed && !res.active && !res.queued && !localGet(key)) {
+                        task = null;
+                        uncertainSince = 0;
+                    } else if (res.active || res.queued) {
+                        uncertainSince = 0;
+                    }
+                }, function () {
+                    checking = false;
+                });
+                return;
+            }
+
+            if (awaitingTask) return;
+            const generate = idleGenerateButton(tab);
+            if (!generate) return;
+            awaitingTask = true;
+            uncertainSince = Date.now();
+            generate.click();
+            task = localGet(key);
+            if (task) awaitingTask = false;
+        }, 500);
+    }
+
+    function cancelTxt2img() {
         clearInterval(regen_txt2img);
         regen_txt2img = null;
-    };
-    appendContextMenuOption("#txt2img_interrupt", "Cancel generate forever", cancel_regen_txt2img);
-    appendContextMenuOption("#txt2img_generate", "Cancel generate forever", cancel_regen_txt2img);
-
-    let generateOnRepeat_img2img = function () {
-        if (regen_txt2img == null && regen_img2img == null) {
-            let generate = gradioApp().querySelector("#img2img_generate");
-            let interrupt = gradioApp().querySelector("#img2img_interrupt");
-            if (!interrupt.offsetParent) {
-                generate.click();
-            }
-
-            regen_img2img = setInterval(function () {
-                if (interrupt.style.display == "none") {
-                    generate.click();
-                    interrupt.style.display = "block";
-                }
-            }, 500);
-        }
-    };
-    appendContextMenuOption("#img2img_generate", "Generate forever", generateOnRepeat_img2img);
-    appendContextMenuOption("#img2img_interrupt", "Generate forever", generateOnRepeat_img2img);
-
-    let cancel_regen_img2img = function () {
+    }
+    function cancelImg2img() {
         clearInterval(regen_img2img);
         regen_img2img = null;
-    };
-    appendContextMenuOption("#img2img_interrupt", "Cancel generate forever", cancel_regen_img2img);
-    appendContextMenuOption("#img2img_generate", "Cancel generate forever", cancel_regen_img2img);
+    }
+
+    function repeatTxt2img() {
+        if (regen_txt2img == null && regen_img2img == null) regen_txt2img = startRepeat("txt2img", cancelTxt2img);
+    }
+    function repeatImg2img() {
+        if (regen_txt2img == null && regen_img2img == null) regen_img2img = startRepeat("img2img", cancelImg2img);
+    }
+
+    for (const [tab, repeat, cancel] of [["txt2img", repeatTxt2img, cancelTxt2img], ["img2img", repeatImg2img, cancelImg2img]]) {
+        appendContextMenuOption("#" + tab + "_generate", "Generate forever", repeat);
+        appendContextMenuOption("#" + tab + "_interrupt", "Generate forever", repeat);
+        for (const name of ["generate", "interrupt", "interrupting"]) {
+            appendContextMenuOption("#" + tab + "_" + name, "Cancel generate forever", cancel);
+        }
+    }
 })();
 
 onAfterUiUpdate(addContextMenuEventListener);

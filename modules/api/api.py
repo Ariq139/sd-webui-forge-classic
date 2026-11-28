@@ -228,8 +228,8 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
-        from modules_forge.native_requests import PageJobOwner
-        self.native_owner = PageJobOwner()
+        from modules_forge.native_requests import NativeTaskOwner
+        self.native_owner = NativeTaskOwner()
         self.add_api_route("/sdapi/v1/native/ideogram", self.native_ideogram, methods=["POST"])
         self.add_api_route("/sdapi/v1/native/ltx2", self.native_ltx2, methods=["POST"])
         self.add_api_route("/sdapi/v1/native/{task_id}/interrupt", self.native_interrupt, methods=["POST"])
@@ -584,19 +584,35 @@ class Api:
 
         return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
 
+    @contextmanager
+    def native_api_task(self, value, preset):
+        from modules_forge.native_requests import native_task_id, DuplicateNativeTask, CancelledNativeTask
+
+        try:
+            task_id = native_task_id(value)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            with self.native_owner.reserve(task_id):
+                add_task_to_queue(task_id)
+                with self.queue_lock, api_generation_task(task_id, "native_" + preset, allow_native=True):
+                    if opts.forge_preset != preset:
+                        raise HTTPException(status_code=409, detail=f"Select the {preset} preset first.")
+                    with self.native_owner.active(task_id):
+                        yield task_id
+        except DuplicateNativeTask as error:
+            raise HTTPException(status_code=409, detail="Native task ID is already in use.") from error
+        except CancelledNativeTask as error:
+            raise HTTPException(status_code=409, detail="Native task cancelled before generation.") from error
+
     def native_ideogram(self, req: native_models.IdeogramRequest):
         from modules import ui_ideogram
         from modules_forge import main_thread, native_validation
         from modules_forge.native_outputs import gallery_metadata
 
-        task_id = create_task_id("ideogram")
         seed = native_validation.actual_seed(req.seed)
-        add_task_to_queue(task_id)
-        with self.queue_lock, api_generation_task(task_id, "native_ideogram", allow_native=True):
-            if opts.forge_preset != "ideogram":
-                raise HTTPException(status_code=409, detail="Select the Ideogram preset first.")
-            with self.native_owner.active(task_id):
-                result = main_thread.run_and_wait_result(ui_ideogram.generate_from_preset, req.prompt, width=req.width, height=req.height, num_images=req.num_images, steps=req.steps, guidance=req.guidance, seed=seed)
+        with self.native_api_task(req.task_id, "ideogram") as task_id:
+            result = main_thread.run_and_wait_result(ui_ideogram.generate_from_preset, req.prompt, width=req.width, height=req.height, num_images=req.num_images, steps=req.steps, guidance=req.guidance, seed=seed)
             if not result or not result[0]:
                 raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
             output, status = result
@@ -612,14 +628,9 @@ class Api:
             if req.image.startswith(("http://", "https://")):
                 raise HTTPException(status_code=422, detail="Supply a base64 image, not a URL.")
             condition = decode_base64_to_image(req.image).convert("RGB")
-        task_id = create_task_id("ltx2")
         seed = native_validation.actual_seed(req.seed)
-        add_task_to_queue(task_id)
-        with self.queue_lock, api_generation_task(task_id, "native_ltx2", allow_native=True):
-            if opts.forge_preset != "ltx2":
-                raise HTTPException(status_code=409, detail="Select the LTX2 preset first.")
-            with self.native_owner.active(task_id):
-                result = main_thread.run_and_wait_result(ui_ltx2_video.generate_from_preset, req.prompt, req.negative_prompt, condition, width=req.width, height=req.height, frames=req.frames, steps=req.steps, guidance=req.guidance, seed=seed)
+        with self.native_api_task(req.task_id, "ltx2") as task_id:
+            result = main_thread.run_and_wait_result(ui_ltx2_video.generate_from_preset, req.prompt, req.negative_prompt, condition, width=req.width, height=req.height, frames=req.frames, steps=req.steps, guidance=req.guidance, seed=seed)
             if not result or not result[0]:
                 raise HTTPException(status_code=422, detail=result[1] if result else "Native generation failed")
             path, status = result
@@ -635,6 +646,12 @@ class Api:
         return FileResponse(path, media_type="video/mp4", filename=filename)
 
     def native_interrupt(self, task_id: str):
+        from modules_forge.native_requests import native_task_id
+
+        try:
+            task_id = native_task_id(task_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return {"interrupted": self.native_owner.interrupt(task_id, shared.state.interrupt)}
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
@@ -678,25 +695,30 @@ class Api:
         if shared.state.job_count == 0:
             return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
 
-        # avoid dividing zero
-        progress = 0.01
+        textinfo = shared.state.textinfo
+        if shared.state.infinite_generation:
+            from modules.infinite_generation import progress_text
 
-        if shared.state.job_count > 0:
-            progress += shared.state.job_no / shared.state.job_count
-        if shared.state.sampling_steps > 0:
-            progress += 1 / shared.state.job_count * shared.state.sampling_step / shared.state.sampling_steps
+            # The public API reports overall progress; an infinite request has no total or ETA.
+            progress = 0
+            eta_relative = 0
+            textinfo = progress_text(shared.state)
+        else:
+            progress = 0.01
+            if shared.state.job_count > 0:
+                progress += shared.state.job_no / shared.state.job_count
+                if shared.state.sampling_steps > 0:
+                    progress += 1 / shared.state.job_count * shared.state.sampling_step / shared.state.sampling_steps
 
-        time_since_start = time.time() - shared.state.time_start
-        eta = time_since_start / progress
-        eta_relative = eta - time_since_start
-
-        progress = min(progress, 1)
+            time_since_start = time.time() - shared.state.time_start
+            eta_relative = max(0, time_since_start / progress - time_since_start)
+            progress = min(progress, 1)
 
         current_image = None
         if shared.state.current_image and not req.skip_current_image:
             current_image = encode_pil_to_base64(shared.state.current_image)
 
-        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=shared.state.textinfo, current_task=generation_progress.current_task)
+        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=textinfo, current_task=generation_progress.current_task
 
     def interruptapi(self):
         shared.state.interrupt()

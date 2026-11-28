@@ -10,7 +10,7 @@ class TotalTQDM:
     def reset(self):
         self._tqdm = tqdm.tqdm(
             desc="Total progress",
-            total=shared.state.job_count * shared.state.sampling_steps,
+            total=None if shared.state.infinite_generation else shared.state.job_count * shared.state.sampling_steps,
             position=1,
             file=shared.progress_print_out
         )

@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class NativeRequest(BaseModel):
+    task_id: Optional[str] = Field(default=None, min_length=1, max_length=87, description="Unique short ID or native-prefixed ID; use it to cancel before the response returns.")
     prompt: str = Field(min_length=1)
     width: Optional[int] = Field(default=None, ge=32, le=4096)
     height: Optional[int] = Field(default=None, ge=32, le=4096)

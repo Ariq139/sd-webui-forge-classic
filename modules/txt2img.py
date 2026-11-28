@@ -109,7 +109,8 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
 
     # catch situation where user tries to hires-fix the grid: probably a mistake, results can be bad aspect ratio - just don't do it
     first_image_index = ui_result_utils.first_image_index(geninfo)
-    if gallery_index < first_image_index or not ui_result_utils.image_infotext(geninfo, gallery_index):
+    if (gallery_index < first_image_index or ui_result_utils.gallery_kinds(geninfo, len(gallery), legacy_missing_is_auxiliary=True)[gallery_index] != "image"
+            or not ui_result_utils.image_infotext(geninfo, gallery_index)):
         return gallery, generation_info, "Unable to upscale grid or control images.", ""
 
     p = txt2img_create_processing(id_task, request, *args, force_enable_hr=True)
@@ -168,7 +169,7 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
     return gr.update(value=new_gallery, selected_index=selected), json.dumps(geninfo), plaintext_to_html(geninfo["infotexts"][selected]), plaintext_to_html(processed.comments, classname="comments")
 
 
-def txt2img_function(id_task: str, request: gr.Request, *args):
+def txt2img_function(id_task: str, request: gr.Request, *args, _native_seed=None):
     capabilities = get_capabilities(
         opts.forge_preset,
         getattr(opts, f"forge_checkpoint_{opts.forge_preset}", getattr(opts, "sd_model_checkpoint", "")),
@@ -182,7 +183,7 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
         native = inspect.signature(txt2img_create_processing).bind(id_task, request, *args).arguments
         runner = modules.scripts.scripts_txt2img
         steps = native_requests.script_control(runner, native["args"], "ScriptSampler", "steps")
-        seed = native_validation.actual_seed(native_requests.script_control(runner, native["args"], "ScriptSeed", "seed", getattr(opts, f"{opts.forge_preset}_seed", -1)))
+        seed = _native_seed if _native_seed is not None else native_validation.actual_seed(native_requests.script_control(runner, native["args"], "ScriptSeed", "seed", getattr(opts, f"{opts.forge_preset}_seed", -1)))
         count = native_requests.positive_integer(native["n_iter"], "Batch Count")
         batch_size = native_requests.positive_integer(native["batch_size"], "Batch Size / Frames")
         prompt = shared.prompt_styles.apply_styles_to_prompt(native["prompt"], native["prompt_styles"] or [])
@@ -259,4 +260,10 @@ def txt2img_upscale_ui(id_task: str, request: gr.Request, gallery, gallery_index
 
 
 def txt2img(id_task: str, request: gr.Request, *args):
-    return main_thread.run_and_wait_result(txt2img_function, id_task, request, *args)
+    seed = None
+    if opts.forge_preset in ("ltx2", "ideogram"):
+        native = inspect.signature(txt2img_create_processing).bind(id_task, request, *args).arguments
+        seed = native_validation.actual_seed(native_requests.script_control(
+            modules.scripts.scripts_txt2img, native["args"], "ScriptSeed", "seed",
+            getattr(opts, f"{opts.forge_preset}_seed", -1)))
+    return main_thread.run_and_wait_result(txt2img_function, id_task, request, *args, _native_seed=seed)

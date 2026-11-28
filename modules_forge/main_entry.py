@@ -311,7 +311,7 @@ def checkpoint_value_for_preset(preset: str, choices: list[str]) -> str | None:
     choices = [str(choice) for choice in choices if choice not in (None, "")]
     if preset in NATIVE_PIPELINE_PRESETS:
         value = ltx2_model_value() if preset == PresetArch.ltx2.name else ideogram_model_value()
-        return value if value in choices else (choices[0] if choices else None)
+        return value if value in choices else None
     value = getattr(shared.opts, f"forge_checkpoint_{preset}", None) or shared.opts.sd_model_checkpoint
     value = str(value or "").strip()
     if value.lower() in {"none", "null"}:
@@ -668,10 +668,6 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
         native_checkpoint = native_model_value(ui_forge_preset)
         if native_checkpoint:
             checkpoint_change(native_checkpoint, ui_forge_preset, save=True, refresh=False)
-        else:
-            shared.opts.set(f"forge_checkpoint_{ui_forge_preset}", "")
-            shared.opts.set(f"{ui_forge_preset}_model_path", "")
-            shared.opts.save(shared.config_filename)
         return
 
     restore_standard_preset(ui_forge_preset)

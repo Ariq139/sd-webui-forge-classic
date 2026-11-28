@@ -111,6 +111,28 @@ def release_runtime(pipe):
             setattr(pipe, name, None)
 
 
+def verify_cpu_loading(pipe):
+    for name, component in pipe.components.items():
+        if not hasattr(component, "parameters"):
+            continue
+        if any(parameter.device.type != "cpu" for parameter in component.parameters()):
+            raise RuntimeError(f"Native CPU placement failed for {name}; no CUDA fallback is permitted.")
+        if hasattr(component, "buffers") and any(buffer.device.type != "cpu" for buffer in component.buffers()):
+            raise RuntimeError(f"Native CPU buffer placement failed for {name}.")
+
+
+def unload_native_pipelines(modules):
+    failures = []
+    for name in ("modules.ui_ltx2_video", "modules.ui_ideogram"):
+        module = modules.get(name)
+        if module is not None:
+            try:
+                module.unload()
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+    return failures
+
+
 def require_pipeline_directory(path, marker):
     """A local full pipeline, not an upsampler/decoder repo or a remote model ID."""
     import json

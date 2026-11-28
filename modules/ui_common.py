@@ -74,9 +74,7 @@ def save_files(js_data, images, do_make_zip, index):
     if not images:
         return gr.update(value=[], visible=False), plaintext_to_html("No images to save.")
 
-    kinds = data.get("gallery_kinds")
-    if not isinstance(kinds, list) or len(kinds) != len(images) or any(kind not in ("image", "grid", "auxiliary") for kind in kinds):
-        kinds = ["grid" if i < first else "image" for i in range(len(images))]
+    kinds = ui_result_utils.gallery_kinds(data, len(images))
     try:
         selected_index = int(index)
     except (TypeError, ValueError, OverflowError):

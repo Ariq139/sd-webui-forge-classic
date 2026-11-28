@@ -38,7 +38,7 @@ def native_quantization_kwargs(model_path, mode, dtype, device, offload, denoise
                 if "bitsandbytes" in method or quant.get("load_in_4bit") or quant.get("load_in_8bit"):
                     require_dependency("bitsandbytes", "Prequantized native checkpoint")
     if mode == "Checkpoint":
-        return {}
+        return {"device_map": "cpu"} if prequantized and (device.type != "cuda" or offload != "none") else {}
     if prequantized:
         raise ValueError("Checkpoint already contains quantized components; select Checkpoint mode.")
     if device.type != "cuda" or offload not in ("model", "none"):
@@ -52,13 +52,25 @@ def native_quantization_kwargs(model_path, mode, dtype, device, offload, denoise
     if mode.endswith("text encoder"):
         from transformers import BitsAndBytesConfig as TextBitsAndBytesConfig
         mapping["text_encoder"] = TextBitsAndBytesConfig(**options)
-    return {"quantization_config": PipelineQuantizationConfig(quant_mapping=mapping)}
+    kwargs = {"quantization_config": PipelineQuantizationConfig(quant_mapping=mapping)}
+    if offload != "none":
+        kwargs["device_map"] = "cpu"
+    return kwargs
 
 
 def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
     # The model selector accepts complete local pipeline directories only.
     # Missing weights must never trigger an implicit Hub download.
-    return pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs, local_files_only=True))
+    pipe = pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs, local_files_only=True))
+    if pipeline_kwargs.get("device_map") == "cpu":
+        native_runtime.verify_cpu_loading(pipe)
+        # 0.39.0 uses a device-type string for explicit CPU placement.
+        # Remove that marker only after verifying no weights are on CUDA/meta.
+        if pipe.hf_device_map == "cpu":
+            pipe.hf_device_map = None
+        elif pipe.hf_device_map is not None:
+            raise RuntimeError("Unexpected native CPU device map; refusing to stack offload hooks.")
+    return pipe
 
 
 def resolve_vae_tiling_mode(auto: bool, force: bool) -> str:

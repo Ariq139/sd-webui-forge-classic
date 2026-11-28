@@ -43,9 +43,17 @@ def compatible_model_directories(marker: str) -> list[str]:
     return sorted(set(values), key=str.casefold)
 
 
+DEFAULT_MODEL_IDS = {"LTX2": "diffusers/LTX-2.3-Diffusers", "Ideogram4": "ideogram-ai/ideogram-v4"}
+
+
 def select_model_path(marker, *values):
+    default = DEFAULT_MODEL_IDS[marker]
     for value in values:
-        if is_compatible_model(value, marker):
-            return os.path.abspath(resolve_model_path(value))
-    choices = compatible_model_directories(marker)
-    return choices[0] if choices else ""
+        value = str(value or "").strip()
+        if value and value != default:
+            # Preserve a missing/incompatible explicit selection for a clear
+            # loader error and for the user to correct in the checkpoint menu.
+            return resolve_model_path(value)
+    if any(str(value or "").strip() == default for value in values) and is_compatible_model(default, marker):
+        return resolve_model_path(default)
+    return ""

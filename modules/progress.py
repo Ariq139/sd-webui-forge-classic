@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 import modules.shared as shared
 from modules.shared import opts
+from modules.infinite_generation import progress_text
 
 current_task = None
 pending_tasks = OrderedDict()
@@ -34,6 +35,7 @@ def finish_task(id_task):
     if current_task == id_task:
         current_task = None
 
+    pending_tasks.pop(id_task, None)
     finished_tasks.append(id_task)
     if len(finished_tasks) > 16:
         finished_tasks.pop(0)
@@ -111,11 +113,17 @@ def progressapi(req: ProgressRequest):
     if sampling_steps > 0 and job_count > 0:
         progress += 1 / job_count * sampling_step / sampling_steps
 
-    progress = min(progress, 1)
-
-    elapsed_since_start = time.time() - shared.state.time_start
-    predicted_duration = elapsed_since_start / progress if progress > 0 else None
-    eta = predicted_duration - elapsed_since_start if predicted_duration is not None else None
+    textinfo = shared.state.textinfo
+    if shared.state.infinite_generation:
+        # Only the current sampling pass has a meaningful percentage, never the entire run.
+        progress = sampling_step / sampling_steps if sampling_steps > 0 else 0
+        textinfo = progress_text(shared.state)
+        eta = None
+    else:
+        elapsed_since_start = time.time() - shared.state.time_start
+        predicted_duration = elapsed_since_start / progress if progress > 0 else None
+        eta = max(0, predicted_duration - elapsed_since_start) if predicted_duration is not None else None
+    progress = max(0, min(progress, 1))
 
     live_preview = None
     id_live_preview = req.id_live_preview
@@ -146,7 +154,7 @@ def progressapi(req: ProgressRequest):
                 live_preview = f"data:image/{_format};base64,{base64_image}"
                 id_live_preview = shared.state.id_live_preview
 
-    return ProgressResponse(active=active, queued=queued, completed=completed, progress=progress, eta=eta, live_preview=live_preview, id_live_preview=id_live_preview, textinfo=shared.state.textinfo)
+    return ProgressResponse(active=active, queued=queued, completed=completed, progress=progress, eta=eta, live_preview=live_preview, id_live_preview=id_live_preview, textinfo=textinfo)
 
 
 def restore_progress(id_task):
