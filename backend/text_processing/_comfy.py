@@ -6,6 +6,7 @@ from typing import Final, TypeAlias
 import torch
 
 from backend import memory_management
+from backend.single_gpu_fastpaths import single_gpu_flag
 
 EMBEDDINGS: TypeAlias = list[int]
 TOKEN_WEIGHTS: TypeAlias = list[list[tuple[int, float]]]
@@ -226,7 +227,14 @@ class SDClipModel(torch.nn.Module, ClipTokenWeightEncoder):
         else:
             intermediate_output = self.layer_idx
 
-        outputs = self.transformer(None, attention_mask_model, embeds=embeds, num_tokens=num_tokens, intermediate_output=intermediate_output, final_layer_norm_intermediate=self.layer_norm_hidden_state, dtype=torch.float32, embeds_info=embeds_info)
+        extra_options = {}
+        if (getattr(self, "intermediate_only", False) and self.layer != "last"
+                and not self.layer_norm_hidden_state and single_gpu_flag("qwen_intermediate_only")):
+            from backend.nn.llm.llama import Qwen3_4B, Qwen3_8B
+            from backend.sampling.invariant_cache import cache_dependencies_safe
+            if type(self.transformer) in (Qwen3_4B, Qwen3_8B) and cache_dependencies_safe(self.transformer):
+                extra_options["intermediate_only"] = True
+        outputs = self.transformer(None, attention_mask_model, embeds=embeds, num_tokens=num_tokens, intermediate_output=intermediate_output, final_layer_norm_intermediate=self.layer_norm_hidden_state, dtype=torch.float32, embeds_info=embeds_info, **extra_options)
 
         if self.layer == "last":
             z = outputs[0].float()
