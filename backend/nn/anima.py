@@ -27,6 +27,7 @@ from backend.operations import (
 )
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
+from backend.activation_quantization import shared_activation_scope
 from backend.utils import pad_to_patch_size
 
 BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
@@ -151,9 +152,16 @@ class SelfCrossAttention(nn.Module):
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
     def compute_qkv(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.q_proj(x)
-        k = self.k_proj(x if context is None else context)
-        v = self.v_proj(x if context is None else context)
+        if context is None:
+            with shared_activation_scope(x):
+                q = self.q_proj(x)
+                k = self.k_proj(x)
+                v = self.v_proj(x)
+        else:
+            q = self.q_proj(x)
+            with shared_activation_scope(context):
+                k = self.k_proj(context)
+                v = self.v_proj(context)
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
             (q, k, v),
@@ -192,8 +200,9 @@ class SelfCrossAttention(nn.Module):
                 return rearrange(value, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim)
 
             def compute_kv():
-                k = project(self.k_proj(context))
-                v = project(self.v_proj(context))
+                with shared_activation_scope(context):
+                    k = project(self.k_proj(context))
+                    v = project(self.v_proj(context))
                 return self.k_norm(k), self.v_norm(v)
 
             q = self.q_norm(project(self.q_proj(x)))

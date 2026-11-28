@@ -8,6 +8,7 @@ from backend import memory_management
 from backend.args import args as cli_args
 from backend.memory_management import cast_to_device, logger
 from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
+from backend.activation_quantization import quantize_shared_activation
 from backend.performance import record_region
 
 from .operations import (
@@ -381,7 +382,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         scale = getattr(self, "input_scale", None)
                         if scale is not None:
                             scale = cast_to_device(scale, input.device, None)
-                        input = QuantizedTensor.from_float(input_reshaped, self.layout_type, scale=scale)
+                        input = quantize_shared_activation(input, input_reshaped, self.layout_type, scale, QuantizedTensor.from_float)
 
                 weight_only_quant = _use_quantized and not quantize_input and isinstance(self.weight, QuantizedTensor)
 

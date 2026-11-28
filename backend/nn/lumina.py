@@ -14,6 +14,7 @@ from backend.nn.flux import EmbedND
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
+from backend.activation_quantization import shared_activation_scope
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -127,7 +128,9 @@ class FeedForward(nn.Module):
         return clamp_fp16(F.silu(x1) * x3)
 
     def forward(self, x):
-        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+        with shared_activation_scope(x):
+            w1, w3 = self.w1(x), self.w3(x)
+        return self.w2(self._forward_silu_gating(w1, w3))
 
 
 class JointTransformerBlock(nn.Module):

@@ -14,6 +14,7 @@ from backend.args import dynamic_args
 from backend.attention import attention_function
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
+from backend.activation_quantization import shared_activation_scope
 from backend.utils import fp16_fix, pad_to_patch_size
 
 
@@ -92,7 +93,9 @@ class YakMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        with shared_activation_scope(x):
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        down_proj = self.down_proj(self.act_fn(gate) * up)
         return down_proj
 
 

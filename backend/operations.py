@@ -530,7 +530,13 @@ class ForgeOperationsGGUF(ForgeOperations):
             if self.weight is not None and self.weight.dtype != x.dtype and getattr(self.weight, "gguf_cls", None) is None:
                 self.weight = utils.tensor2parameter(self.weight.to(x.dtype))
 
-            if isinstance(self.weight, QuantizedTensor) and not self.weight_function and not self.bias_function and x.ndim >= 2:
+            activation_loras = None
+            if args.activation_space_lora and self.weight is not None and len(self.weight.shape) == 2:
+                activation_loras = activation_space_lora_patches(
+                    self.weight_function, self.bias_function, self.weight.shape[1], self.weight.shape[0])
+            base_only = not self.weight_function or activation_loras is not None
+
+            if isinstance(self.weight, QuantizedTensor) and base_only and not self.bias_function and x.ndim >= 2:
                 input_shape = x.shape
                 input_reshaped = x.reshape(-1, input_shape[-1]) if x.ndim >= 3 else x
                 quantized_input = QuantizedTensor.from_float(input_reshaped, self.weight._layout_cls)
@@ -539,38 +545,43 @@ class ForgeOperationsGGUF(ForgeOperations):
                     quantized_input,
                     skip_weight_dtype=True,
                     skip_bias_dtype=True,
+                    skip_weight_functions=activation_loras is not None,
                 )
                 with main_stream_worker(weight, bias, signal):
                     output = torch.nn.functional.linear(quantized_input, weight, bias)
                 if x.ndim >= 3:
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
-                return output
+                return apply_activation_space_lora(output, x, activation_loras)
 
             if (
                 getattr(self.weight, "gguf_cls", None) is not None
-                and not self.weight_function
+                and base_only
                 and not self.bias_function
                 and can_use_llamacpp_cuda_linear(self.weight, x, self.bias)
             ):
                 # Keep the transferred copy packed and byte-exact. The copy is
                 # temporary, so a failed kernel can bake/dequantize it in place.
                 weight, bias, signal = weights_manual_cast(
-                    self, x, weight_fn=lambda value: value, skip_weight_dtype=True, skip_bias_dtype=True
+                    self, x, weight_fn=lambda value: value, skip_weight_dtype=True, skip_bias_dtype=True,
+                    skip_weight_functions=activation_loras is not None
                 )
                 fast_output = try_llamacpp_cuda_linear(weight, x, bias)
                 if fast_output is not None:
                     with main_stream_worker(weight, bias, signal):
-                        return fast_output
+                        return apply_activation_space_lora(fast_output, x, activation_loras)
                 with record_region("forge::gguf_dequantize_fallback"):
                     weight = dequantize_tensor(weight, input=x) if args.enable_triton_backend else dequantize_tensor(weight)
                 with main_stream_worker(weight, bias, signal):
-                    return torch.nn.functional.linear(x, weight, bias)
+                    output = torch.nn.functional.linear(x, weight, bias)
+                    return apply_activation_space_lora(output, x, activation_loras)
 
             weight_fn = (lambda weight: dequantize_tensor(weight, input=x)) if args.enable_triton_backend else dequantize_tensor
-            weight, bias, signal = weights_manual_cast(self, x, weight_fn=weight_fn, skip_bias_dtype=True)
+            weight, bias, signal = weights_manual_cast(self, x, weight_fn=weight_fn, skip_bias_dtype=True,
+                                                       skip_weight_functions=activation_loras is not None)
             with main_stream_worker(weight, bias, signal):
                 with record_region("forge::gguf_dequantized_linear"):
-                    return torch.nn.functional.linear(x, weight, bias)
+                    output = torch.nn.functional.linear(x, weight, bias)
+            return apply_activation_space_lora(output, x, activation_loras)
 
     class Conv2d(torch.nn.Conv2d, ForgeWeights):
         def __init__(self, *args, **kwargs):
