@@ -138,23 +138,62 @@ def test_prefetch_take_event_and_version_guard_with_mock_stream():
     module = torch.nn.Linear(2, 2)
     device = torch.device("cuda:0")
     value = mock.Mock(dtype=source.dtype)
-    event = object()
-    with mock.patch.object(torch.cuda, "Stream"), mock.patch.object(torch.cuda, "current_stream") as current:
+    ready = mock.Mock()
+    ready.query.return_value = False
+    done = mock.Mock()
+    done.query.return_value = False
+    with mock.patch.object(torch.cuda, "Event", return_value=done), mock.patch.object(torch.cuda, "current_stream") as current:
         state = wp.WeightPrefetch(device, 1024)
-        state.pending[module] = (source, source._version, value, event, False, 16)
+        state.pending[module] = (source, source._version, value, ready, False, 16)
         state.bytes = 16
         assert state.take(module, source, device, source.dtype) is value
-        current.return_value.wait_event.assert_called_once_with(event)
+        current.return_value.wait_event.assert_called_once_with(ready)
         value.record_stream.assert_called_once_with(current.return_value)
-        assert state.bytes == 0 and not state.pending
-        state.pending[module] = (source, source._version, value, event, False, 16)
+        assert state.bytes == 16 and not state.pending and module in state.in_use
+        state.discard(module)
+        done.record.assert_called_once_with(current.return_value)
+        assert state.bytes == 16 and not state.in_use
+        done.query.return_value = True
+        state._reap()
+        assert state.bytes == 0 and not state.retired
+        state.pending[module] = (source, source._version, value, ready, False, 16)
         state.bytes = 16
         source.add_(1)
         assert state.take(module, source, device, source.dtype) is None
-        assert state.bytes == 0 and not state.pending
-        current.return_value.wait_event.assert_called_once_with(event)
+        assert state.bytes == 16 and not state.pending
+        current.return_value.wait_event.assert_called_once_with(ready)
+        ready.query.return_value = True
+        state._reap()
+        assert state.bytes == 0
         state.close()
-        current.return_value.wait_stream.assert_called_once_with(state.stream)
+        current.return_value.wait_stream.assert_not_called()
+
+
+def test_prefetch_close_waits_only_for_unfinished_copies():
+    state = wp.WeightPrefetch(torch.device("cuda:0"), 1024)
+    state.stream = mock.Mock()
+    state.last_copy = mock.Mock()
+    state.last_copy.query.return_value = False
+    state.close()
+    state.last_copy.synchronize.assert_called_once_with()
+    state.stream.synchronize.assert_not_called()
+    state.last_copy = None
+    state.close()
+    state.stream.synchronize.assert_called_once_with()
+
+
+def test_prefetch_without_candidates_avoids_cuda_calls():
+    import sys
+    from types import SimpleNamespace
+
+    device = torch.device("cuda:0")
+    with mock.patch.dict(sys.modules, {"backend.operations_gguf": SimpleNamespace(ParameterGGUF=type("ParameterGGUF", (), {}))}), mock.patch.object(torch.cuda, "Stream") as stream, mock.patch.object(torch.cuda, "mem_get_info") as free:
+        state = wp.WeightPrefetch(device, 1024)
+        # A mismatched dtype is rejected before any transfer preparation.
+        state.stage(torch.nn.Linear(2, 2, dtype=torch.float32), torch.float16)
+        state.close()
+        stream.assert_not_called()
+        free.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -172,7 +211,8 @@ def test_prefetch_cuda_pinned_copy_and_cleanup():
             weight = state.take(layer, layer.weight, device, torch.float16)
             assert weight is not None
             torch.testing.assert_close(weight.cpu(), layer.weight)
-            assert state.bytes == 0
+            assert state.bytes > 0
+            state.discard(layer)
             state.stage(layer, torch.float16)
             state.discard(layer)
             assert not state.pending
