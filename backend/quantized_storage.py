@@ -1,5 +1,5 @@
-"""Version-pinned storage adapter for ordinary weight-only INT8 wrappers."""
-from dataclasses import dataclass, replace
+"""Version-pinned storage adapters for supported packed weight wrappers."""
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import version, PackageNotFoundError
 
@@ -59,7 +59,11 @@ class Int8Storage:
 
     def rebuild(self, parts):
         cls, _ = _layout_types()
-        return cls(parts[0], "TensorWiseINT8Layout", replace(self.source._params, scale=parts[1]))
+        dtype, shape, is_weight, convrot, group_size, transposed = self.metadata
+        params = _layout_types()[1](scale=parts[1], orig_dtype=dtype, orig_shape=shape,
+                                    is_weight=is_weight, convrot=convrot,
+                                    convrot_groupsize=group_size, transposed=transposed)
+        return cls(parts[0], "TensorWiseINT8Layout", params)
 
 
 def int8_storage(source):
@@ -194,7 +198,8 @@ def packed_storage(source):
     """Snapshot supported original packed storage, never dequantized weights."""
     if type(source).__name__ != "QuantizedTensor":
         return None
-    if source._layout_cls == "TensorWiseINT8Layout":
+    base = _layout_types()
+    if base is not None and type(source) is base[0] and source._layout_cls == "TensorWiseINT8Layout":
         return int8_storage(source)
     types = _extra_layout_types()
     if types is None or type(source) is not types[0]:

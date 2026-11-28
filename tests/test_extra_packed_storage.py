@@ -132,3 +132,8 @@ def test_real_pinned_dependency_roundtrip(index):
     rebuilt = snapshot.rebuild(tuple(t.clone() for t in snapshot.parts))
     assert rebuilt._layout_cls == weight._layout_cls and rebuilt.shape == weight.shape
     assert qs.packed_storage(rebuilt) is not None
+
+
+def test_untrusted_wrapper_name_is_not_a_layout_contract():
+    impostor = type("QuantizedTensor", (), {})()
+    assert qs.packed_storage(impostor) is None
