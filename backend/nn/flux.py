@@ -23,6 +23,7 @@ from backend.sampling.invariant_cache import invariant_scope_active, retain_refe
 from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
 from backend.gate_up_packing import try_packed_gate_up
+from backend.segmented_int8 import try_segmented_int8_linear
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor, mask=None, transformer_options={}) -> torch.Tensor:
@@ -454,7 +455,9 @@ class SingleStreamBlock(nn.Module):
             mlp = silu_gate(gate, up) if can_fuse_silu(self.mlp_act, gate) else self.mlp_act(gate) * up
         else:
             mlp = self.mlp_act(mlp)
-        output = self.linear2(torch.cat((attn, mlp), 2))
+        output = try_segmented_int8_linear(self.linear2, attn, mlp)
+        if output is None:
+            output = self.linear2(torch.cat((attn, mlp), 2))
         x = gated_residual_(x, output, mod.gate, modulation_dims)
 
         x = fp16_fix(x)

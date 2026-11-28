@@ -75,29 +75,21 @@ def _native_rows(cuda, flat, convrot, stream):
     return q, scales
 
 
-def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, destination_factory=None):
-    if (not source.is_cuda or source.dtype not in (torch.float16, torch.bfloat16)
-            or torch.cuda.get_device_capability(source.device) != (8, 6)
-            or not source.is_contiguous() or source.data_ptr() % 16 or weight.data_ptr() % 16
-            or cuda._DISABLE_CUTLASS_INT8):
-        return None
-    n, k = weight.shape
-    m = source.numel() // k
-    if (m <= 2 or k % 16 or n % 16 or not cuda._cuda_device_supports_cutlass_int8_dequant(source)
-            or cuda._prefer_cublas_int8_fallback(m, n, k, source.get_device())
-            or (cuda._prefer_turing_fused_int8(m, n, k)
-                and cuda._cuda_device_should_use_turing_kernels(source.get_device()))):
-        return None
-    flat = source.reshape(m, k)
-    if convrot and (k < 256 or k % 256 or k > cuda._CONVROT_FUSED_MAX_K
-                    or not cuda._convrot_fused_shared_memory_fits(flat, k, 256)):
-        return None
-    stream = torch.cuda.current_stream(source.device).cuda_stream
-    rows = shared_rows(source, convrot, stream, cache,
-                       lambda x, rotated: _native_rows(cuda, x, rotated, stream))
-    if rows is None:
-        return None
+def cutlass_eligible(source, m, n, k, cuda):
+    return (source.is_cuda and source.dtype in (torch.float16, torch.bfloat16)
+            and torch.cuda.get_device_capability(source.device) == (8, 6)
+            and m > 2 and k > 0 and n > 0 and k % 16 == n % 16 == 0
+            and not cuda._DISABLE_CUTLASS_INT8
+            and cuda._cuda_device_supports_cutlass_int8_dequant(source)
+            and not cuda._prefer_cublas_int8_fallback(m, n, k, source.get_device())
+            and not (cuda._prefer_turing_fused_int8(m, n, k)
+                     and cuda._cuda_device_should_use_turing_kernels(source.get_device())))
+
+
+def cutlass_rows(source, weight, scale, bias, rows, cuda, *, destination_factory=None):
     q, row_scale = rows
+    m, n = q.shape[0], weight.shape[0]
+    stream = torch.cuda.current_stream(source.device).cuda_stream
     weight_scale = cuda._int8_weight_scale_arg(scale, source.device)
     if weight_scale.numel() != n:
         weight_scale = weight_scale.reshape(1).expand(n).contiguous()
@@ -111,9 +103,29 @@ def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, des
     used = cuda._C.cutlass_int8_dequant(
         wrap(q), wrap(weight), wrap(row_scale), wrap(weight_scale), wrap(bias_arg),
         wrap(out), cuda.DTYPE_TO_CODE[source.dtype], stream)
-    # A rejected CUTLASS shape takes the original authoritative dispatch. Device
-    # failures are not swallowed or retried.
-    if not used:
-        cache.pop(row_key(source, convrot, stream), None)
+    return out.reshape(*source.shape[:-1], n) if used else None
+
+
+def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, destination_factory=None):
+    if (not source.is_cuda or source.dtype not in (torch.float16, torch.bfloat16)
+            or not source.is_contiguous() or source.data_ptr() % 16 or weight.data_ptr() % 16):
         return None
-    return out.reshape(*source.shape[:-1], n)
+    n, k = weight.shape
+    if not k:
+        return None
+    m = source.numel() // k
+    if not cutlass_eligible(source, m, n, k, cuda):
+        return None
+    flat = source.reshape(m, k)
+    if convrot and (k < 256 or k % 256 or k > cuda._CONVROT_FUSED_MAX_K
+                    or not cuda._convrot_fused_shared_memory_fits(flat, k, 256)):
+        return None
+    stream = torch.cuda.current_stream(source.device).cuda_stream
+    rows = shared_rows(source, convrot, stream, cache,
+                       lambda x, rotated: _native_rows(cuda, x, rotated, stream))
+    if rows is None:
+        return None
+    out = cutlass_rows(source, weight, scale, bias, rows, cuda, destination_factory=destination_factory)
+    if out is None:
+        cache.pop(row_key(source, convrot, stream), None)
+    return out
