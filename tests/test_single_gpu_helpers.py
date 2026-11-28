@@ -144,7 +144,7 @@ def test_prefetch_take_event_and_version_guard_with_mock_stream():
     done.query.return_value = False
     with mock.patch.object(torch.cuda, "Event", return_value=done), mock.patch.object(torch.cuda, "current_stream") as current:
         state = wp.WeightPrefetch(device, 1024)
-        state.pending[module] = (source, source._version, value, ready, False, 16)
+        state.pending[module] = (source, wp.TransferSource(source, source), value, ready, False, 16)
         state.bytes = 16
         assert state.take(module, source, device, source.dtype) is value
         current.return_value.wait_event.assert_called_once_with(ready)
@@ -156,7 +156,7 @@ def test_prefetch_take_event_and_version_guard_with_mock_stream():
         done.query.return_value = True
         state._reap()
         assert state.bytes == 0 and not state.retired
-        state.pending[module] = (source, source._version, value, ready, False, 16)
+        state.pending[module] = (source, wp.TransferSource(source, source), value, ready, False, 16)
         state.bytes = 16
         source.add_(1)
         assert state.take(module, source, device, source.dtype) is None

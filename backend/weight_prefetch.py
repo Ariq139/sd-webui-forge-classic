@@ -10,6 +10,7 @@ from contextvars import ContextVar
 import torch
 
 from backend.args import args
+from backend.packed_weight_identity import TransferSource
 from backend.performance import record_region
 
 _ACTIVE = ContextVar("forge_weight_prefetch", default=None)
@@ -25,6 +26,7 @@ class WeightPrefetch:
         self.budget = budget
         self.stream = None
         self.last_copy = None
+        self.copy_owners = None
         self.pending = {}
         self.in_use = {}
         self.retired = []
@@ -83,9 +85,10 @@ class WeightPrefetch:
             if any(not part.is_contiguous() or not part.is_pinned() for part in parts):
                 continue
             try:
-                version = storage if packed == "int8" else source._version
+                version = storage if packed == "int8" else TransferSource(source, raw)
             except RuntimeError:
                 continue
+            parts = storage.transfer_parts if packed == "int8" else (version.raw,)
             size = sum(part.numel() * part.element_size() for part in parts)
             if not size or size > allowance:
                 continue
@@ -109,12 +112,14 @@ class WeightPrefetch:
                     break
                 ready = torch.cuda.Event()
                 self.last_copy = None  # close must synchronize if recording fails
+                self.copy_owners = (parts, values)
                 with record_region("forge::weight_prefetch_copy"):
                     for dst, src in zip(values, parts):
                         dst.copy_(src, non_blocking=True)
                     ready.record(self.stream)
                 self.last_copy = ready
             self.pending[module] = (source, version, value, ready, packed, size)
+            self.copy_owners = None
             self.bytes += size
             allowance -= size
             if allowance <= 0:
@@ -129,7 +134,7 @@ class WeightPrefetch:
         original, version, value, ready, packed, _ = entry
         try:
             valid = (version.matches(source) if packed == "int8"
-                     else original is source and source._version == version)
+                     else version.matches(source, source.data if packed else source))
         except RuntimeError:
             valid = False
         incompatible = (dtype not in (None, version.orig_dtype) if packed == "int8"
@@ -174,6 +179,7 @@ class WeightPrefetch:
                 self.stream.synchronize()
             elif not self.last_copy.query():
                 self.last_copy.synchronize()
+        self.copy_owners = None
         self.pending.clear()
         self.in_use.clear()
         self.retired.clear()

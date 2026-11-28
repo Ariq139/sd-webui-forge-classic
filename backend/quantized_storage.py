@@ -5,6 +5,8 @@ from importlib.metadata import version, PackageNotFoundError
 
 import torch
 
+from backend.packed_weight_identity import TransferSource
+
 
 @lru_cache(maxsize=1)
 def _layout_types():
@@ -36,6 +38,11 @@ class Int8Storage:
     parts: tuple
     metadata: tuple
     versions: tuple
+    stamps: tuple
+
+    @property
+    def transfer_parts(self):
+        return tuple(stamp.raw for stamp in self.stamps)
 
     @property
     def orig_dtype(self):
@@ -47,7 +54,8 @@ class Int8Storage:
         other = int8_storage(source)
         return (other is not None and self.metadata == other.metadata
                 and all(a is b for a, b in zip(self.parts, other.parts))
-                and self.versions == other.versions)
+                and self.versions == other.versions
+                and all(stamp.matches(part, part) for stamp, part in zip(self.stamps, other.parts)))
 
     def rebuild(self, parts):
         cls, _ = _layout_types()
@@ -74,4 +82,6 @@ def int8_storage(source):
     return Int8Storage(source, (q, s),
                        (p.orig_dtype, tuple(p.orig_shape), p.is_weight, p.convrot,
                         p.convrot_groupsize, p.transposed),
-                       (_version(source), _version(q), _version(s)))
+                       (_version(source), _version(q), _version(s)),
+                       tuple(TransferSource(part, part) for part in (q, s))
+                       if _version(q) is not None and _version(s) is not None else ())

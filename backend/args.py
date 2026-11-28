@@ -28,6 +28,7 @@ parser.add_argument("--native-int8-mlp-activation", action="store_true", help="E
 parser.add_argument("--flux-reference-cache", action="store_true", help="Cache immutable native FLUX/Klein reference tokens and compatible dense projections with the invariant cache budget")
 parser.add_argument("--target-only-output-head", action="store_true", help="Experimentally skip output projection for discarded reference and caption tokens; can change rounding")
 parser.add_argument("--assembled-condition-cache", action="store_true", help="Cache native assembled conditioning tensors within the invariant cache budget")
+parser.add_argument("--conditioning-reconstruction-cache", action="store_true", help="Experimental one-entry native conditioning reconstruction cache (up to 32 MiB)")
 parser.add_argument("--pin-quantized-weights", action="store_true", help="Permit eligible packed GGUF/INT8 storage to use existing shared-memory pinning limits")
 parser.add_argument("--nunchaku-rope-cache", action="store_true", help="Experimental sampling-scoped Nunchaku Z-Image packed rotary reuse; requires invariant cache budget")
 parser.add_argument("--fused-flux-residual", action="store_true", help="Experimental in-place fused FLUX gated residual updates; can change rounding")
