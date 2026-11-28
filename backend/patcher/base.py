@@ -503,11 +503,22 @@ class ModelPatcher:
         if key in self.pinned:
             return
         weight, _, _ = get_key_weight(self.model, key)
+        from backend.single_gpu_fastpaths import single_gpu_flag
+        if single_gpu_flag("pin_quantized_weights"):
+            from backend.quantized_storage import int8_storage
+            storage = int8_storage(weight)
+            if storage is not None:
+                # Retain only registrations we actually own, including partial success.
+                for part in storage.parts:
+                    if memory_management.pin_raw_memory(part):
+                        self.pinned.add(key)
+                        self.pinned_quantized_sources.setdefault(key, []).append(part)
+                return
         raw = memory_management.packed_gguf_pin_storage(weight)
         if memory_management.pin_memory(weight):
             self.pinned.add(key)
             if raw is not None:
-                self.pinned_quantized_sources[key] = raw
+                self.pinned_quantized_sources[key] = [raw]
 
     def unpin_weight(self, key):
         if key in self.pinned:
@@ -515,8 +526,10 @@ class ModelPatcher:
             if raw is not None:
                 # Retain the original registration owner even if the module's
                 # weight was replaced or repacked. Do not free it on failure.
-                if not memory_management.unpin_memory(raw):
-                    raise RuntimeError(f"Unable to unregister packed GGUF storage: {key}")
+                while raw:
+                    if not memory_management.unpin_memory(raw[-1]):
+                        raise RuntimeError(f"Unable to unregister packed weight storage: {key}")
+                    raw.pop()
                 del self.pinned_quantized_sources[key]
             else:
                 weight, _, _ = get_key_weight(self.model, key)

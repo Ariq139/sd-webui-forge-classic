@@ -1822,7 +1822,14 @@ def pin_memory(tensor):
         if raw is None:
             return False
         tensor = raw
+    return pin_raw_memory(tensor)
 
+
+def pin_raw_memory(tensor):
+    global TOTAL_PINNED_MEMORY
+    if (not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0
+            or type(tensor) not in (torch.Tensor, torch.nn.Parameter)):
+        return False
     if not is_device_cpu(tensor.device):
         return False
 

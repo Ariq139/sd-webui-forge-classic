@@ -70,17 +70,23 @@ class WeightPrefetch:
                     continue
             elif type(source) in (torch.Tensor, torch.nn.Parameter) and source.dtype == dtype:
                 raw = source
+            elif getattr(args, "pin_quantized_weights", False):
+                from backend.quantized_storage import int8_storage
+                storage = int8_storage(source)
+                if storage is None or None in storage.versions or storage.orig_dtype != dtype:
+                    continue
+                packed = "int8"
+                raw = storage.parts
             else:
                 continue
-            if not raw.is_contiguous() or not raw.is_pinned():
-                # Externally registered storage must be recognized as pinned by
-                # this PyTorch build; never assume async DMA from registration alone.
+            parts = raw if packed == "int8" else (raw,)
+            if any(not part.is_contiguous() or not part.is_pinned() for part in parts):
                 continue
             try:
-                version = source._version
+                version = storage if packed == "int8" else source._version
             except RuntimeError:
                 continue
-            size = raw.numel() * raw.element_size()
+            size = sum(part.numel() * part.element_size() for part in parts)
             if not size or size > allowance:
                 continue
             # Fully resident blocks should not create a stream or query VRAM.
@@ -96,14 +102,16 @@ class WeightPrefetch:
                 self.stream = torch.cuda.Stream(device=self.device)
             with torch.cuda.stream(self.stream):
                 try:
-                    value = torch.empty_like(raw, device=self.device)
+                    values = tuple(torch.empty_like(part, device=self.device) for part in parts)
+                    value = values if packed == "int8" else values[0]
                 except torch.cuda.OutOfMemoryError:
                     # Only a failed speculative allocation is recoverable here.
                     break
                 ready = torch.cuda.Event()
                 self.last_copy = None  # close must synchronize if recording fails
                 with record_region("forge::weight_prefetch_copy"):
-                    value.copy_(raw, non_blocking=True)
+                    for dst, src in zip(values, parts):
+                        dst.copy_(src, non_blocking=True)
                     ready.record(self.stream)
                 self.last_copy = ready
             self.pending[module] = (source, version, value, ready, packed, size)
@@ -120,18 +128,23 @@ class WeightPrefetch:
             return None
         original, version, value, ready, packed, _ = entry
         try:
-            valid = original is source and source._version == version
+            valid = (version.matches(source) if packed == "int8"
+                     else original is source and source._version == version)
         except RuntimeError:
             valid = False
-        if (not valid or (packed and dtype is not None)
-                or (not packed and dtype not in (None, value.dtype))):
+        incompatible = (dtype not in (None, version.orig_dtype) if packed == "int8"
+                        else dtype is not None if packed else dtype not in (None, value.dtype))
+        if not valid or incompatible:
             self.retired.append((entry, ready))
             return None
         current = torch.cuda.current_stream(device)
         with record_region("forge::weight_prefetch_wait"):
             current.wait_event(ready)
-        value.record_stream(current)
+        for part in value if packed == "int8" else (value,):
+            part.record_stream(current)
         self.in_use[module] = (entry, current)
+        if packed == "int8":
+            return version.rebuild(value)
         return source.copy_with_data(value) if packed else value
 
     def discard(self, block):
