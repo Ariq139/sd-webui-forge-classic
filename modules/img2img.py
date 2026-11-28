@@ -10,6 +10,7 @@ import modules.processing as processing
 import modules.scripts
 import modules.shared as shared
 from modules import images
+from modules.batch_gallery import BatchGallery
 from modules.infotext_utils import (
     create_override_settings_dict,
     parse_generation_parameters,
@@ -58,8 +59,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     height = p.height
     override_settings = p.override_settings
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
-    batch_results = None
-    discard_further_results = False
+    gallery = BatchGallery(shared.opts.img2img_batch_show_results_limit)
     requested_batch_size, requested_n_iter = p.batch_size, p.n_iter
     png_info_props = png_info_props or []
     for i, image in enumerate(batch_images):
@@ -146,7 +146,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             if model_info is not None:
                 p.override_settings["sd_model_checkpoint"] = model_info.name
             elif sd_model_checkpoint_override:
-                p.override_settings["sd_model_checkpoint"] = sd_model_checkpoint_override
+                p.override_settings["sd_model_checkpoint"] = sd_model_checkpoint_override.name
             else:
                 p.override_settings.pop("sd_model_checkpoint", None)
 
@@ -166,19 +166,9 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             # A grouped single-image fallback must not shrink later inputs.
             p.batch_size, p.n_iter = requested_batch_size, requested_n_iter
 
-        if not discard_further_results and proc:
-            if batch_results:
-                batch_results.images.extend(proc.images)
-                batch_results.infotexts.extend(proc.infotexts)
-            else:
-                batch_results = proc
+        gallery.add(proc)
 
-            if 0 <= shared.opts.img2img_batch_show_results_limit < len(batch_results.images):
-                discard_further_results = True
-                batch_results.images = batch_results.images[: int(shared.opts.img2img_batch_show_results_limit)]
-                batch_results.infotexts = batch_results.infotexts[: int(shared.opts.img2img_batch_show_results_limit)]
-
-    return batch_results
+    return gallery.finish()
 
 
 def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, sketch_fg, init_img_with_mask, init_img_with_mask_fg, inpaint_color_sketch, inpaint_color_sketch_fg, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, distilled_cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):

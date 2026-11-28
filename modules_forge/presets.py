@@ -355,8 +355,8 @@ def register(options_templates: dict):
                     (f"ui_{name}", name.upper(), "presets"),
                     {
                         f"{name}_batch1": OptionRow(),
-                        f"{name}_t2i_batch_size": OptionInfo(121 if arch is PresetArch.ltx2 else 1, "txt2img Frames", Slider, {"minimum": 9 if arch is PresetArch.ltx2 else 1, "maximum": fps * (30 if arch is PresetArch.ltx2 else 15) + 1, "step": fps}),
-                        f"{name}_i2i_batch_size": OptionInfo(121 if arch is PresetArch.ltx2 else 1, "img2img Frames", Slider, {"minimum": 9 if arch is PresetArch.ltx2 else 1, "maximum": fps * (30 if arch is PresetArch.ltx2 else 15) + 1, "step": fps}),
+                        f"{name}_t2i_batch_size": OptionInfo(121 if arch is PresetArch.ltx2 else 1, "txt2img Frames", Slider, {"minimum": 9 if arch is PresetArch.ltx2 else 1, "maximum": fps * (30 if arch is PresetArch.ltx2 else 15) + 1, "step": 8 if arch is PresetArch.ltx2 else fps}),
+                        f"{name}_i2i_batch_size": OptionInfo(121 if arch is PresetArch.ltx2 else 1, "img2img Frames", Slider, {"minimum": 9 if arch is PresetArch.ltx2 else 1, "maximum": fps * (30 if arch is PresetArch.ltx2 else 15) + 1, "step": 8 if arch is PresetArch.ltx2 else fps}),
                         f"{name}_batch0": OptionRow(),
                     },
                 )
@@ -416,6 +416,7 @@ def register(options_templates: dict):
                         "ltx2_guidance_blocks": OptionInfo("28", "Spatio-temporal guidance blocks", Textbox),
                         "ltx2_seed": OptionInfo(-1, "Seed", Number, {"minimum": -1, "maximum": 2**31 - 1, "step": 1}),
                         "ltx2_include_audio": OptionInfo(True, "Include generated audio", Checkbox),
+                        "ltx2_cross_timestep_mode": OptionInfo("Automatic", "Cross timestep mode", Dropdown, {"choices": ["Automatic", "LTX-2.3", "LTX-2.0"]}),
                     },
                 )
             )
@@ -433,6 +434,7 @@ def register(options_templates: dict):
                         "ideogram_tile_vae": OptionInfo(True, "Force VAE tiling", Checkbox).info("used when automatic VAE tiling is disabled"),
                         "ideogram_prompt_cache": OptionInfo(True, "Cache prompt embeddings", Checkbox).info("cache the last four encoded prompts"),
                         "ideogram_compile": OptionInfo(False, "Compile denoiser", Checkbox).info("experimental; requires CUDA and CPU offload set to none"),
+                        "ideogram_polish_guidance": OptionInfo(True, "Final CFG polishing", Checkbox),
                         "ideogram_mu": OptionInfo(0.0, "Flow schedule mu", Number, {"minimum": -10, "maximum": 10, "step": 0.1}),
                         "ideogram_std": OptionInfo(1.5, "Flow schedule std", Number, {"minimum": 0.01, "maximum": 10, "step": 0.1}),
                         "ideogram_prompt_upsampling": OptionInfo(False, "Prompt upsampling", Checkbox),

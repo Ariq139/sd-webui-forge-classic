@@ -698,12 +698,17 @@ def on_preset_change(preset: str, checkpoint_override: str | None = None):
     if (fps := is_video(preset)) > 1:
         max_frames = fps * (30 if preset == PresetArch.ltx2.name else 15) + 1
         min_frames = 9 if preset == PresetArch.ltx2.name else 1
-        batch_args_t2i = {"minimum": min_frames, "maximum": max_frames, "step": fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+        batch_args_t2i = {"minimum": min_frames, "maximum": max_frames, "step": 8 if preset == PresetArch.ltx2.name else fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
     else:
         batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
 
     batch_args_i2i = batch_args_t2i.copy()
     batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
+    if preset == PresetArch.ltx2.name:
+        for frame_args in (batch_args_t2i, batch_args_i2i):
+            # Bring legacy persisted frame values onto the supported UI lattice.
+            value = int(frame_args["value"] or 121)
+            frame_args["value"] = min(frame_args["maximum"], max(9, 1 + 8 * ((value - 1) // 8)))
 
     native_pipeline = preset in NATIVE_PIPELINE_PRESETS
     ideogram = preset == PresetArch.ideogram.name

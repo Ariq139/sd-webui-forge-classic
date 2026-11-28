@@ -561,9 +561,9 @@ class Processed:
 
     def js(self):
         obj = {
-            "prompt": self.all_prompts[0],
+            "prompt": self.all_prompts[0] if self.all_prompts else self.prompt,
             "all_prompts": self.all_prompts,
-            "negative_prompt": self.all_negative_prompts[0],
+            "negative_prompt": self.all_negative_prompts[0] if self.all_negative_prompts else self.negative_prompt,
             "all_negative_prompts": self.all_negative_prompts,
             "seed": self.seed,
             "all_seeds": self.all_seeds,
@@ -595,6 +595,8 @@ class Processed:
             "version": self.version,
         }
 
+        if hasattr(self, "gallery_kinds"):
+            obj["gallery_kinds"] = self.gallery_kinds
         return json.dumps(obj, default=lambda o: None)
 
     def infotext(self, p: StableDiffusionProcessing, index):
@@ -1440,6 +1442,7 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                         if save_samples and opts.save_mask:
                             images.save_image(image_mask, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-mask")
                         if opts.return_mask:
+                            image_mask._forge_auxiliary = True
                             output_images.append(image_mask)
 
                     if opts.return_mask_composite or opts.save_mask_composite:
@@ -1447,6 +1450,7 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                         if save_samples and opts.save_mask_composite:
                             images.save_image(image_mask_composite, p.outpath_samples, "", p.seeds[sample_index], image_prompt, opts.samples_format, info=infotext(sample_index), p=p, suffix="-mask-composite")
                         if opts.return_mask_composite:
+                            image_mask_composite._forge_auxiliary = True
                             output_images.append(image_mask_composite)
 
                 # Every gallery image, including returned masks, needs an infotext.

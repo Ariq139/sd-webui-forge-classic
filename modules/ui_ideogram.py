@@ -7,7 +7,7 @@ import torch
 
 from backend import memory_management
 from modules import shared
-from modules_forge import main_thread
+from modules_forge import main_thread, native_requests, native_validation
 from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
@@ -78,6 +78,7 @@ def _sync_preset_controls(preset: str):
         _option("ideogram_prompt_upsampling", False),
         _option("ideogram_prompt_temperature", 1.0),
         _option("ideogram_seed", -1),
+        _option("ideogram_polish_guidance", True),
     ]
 
 
@@ -206,6 +207,7 @@ def generate(
     prompt_upsampling: bool,
     prompt_temperature: float,
     seed: int,
+    polish_guidance: bool = True,
     progress=gr.Progress(track_tqdm=True),
 ):
     if not model_path or not model_path.strip():
@@ -213,24 +215,39 @@ def generate(
     if not prompt or not prompt.strip():
         return [], "Enter a prompt."
 
+    pipeline_attempted = False
     try:
-        width, height = int(width), int(height)
-        num_images, steps = int(num_images), int(steps)
-        if width < 64 or height < 64 or width % 16 or height % 16:
-            return [], "Ideogram 4 width and height must be at least 64 and divisible by 16."
+        width = native_requests.positive_integer(width, "Width")
+        height = native_requests.positive_integer(height, "Height")
+        num_images = native_requests.positive_integer(num_images, "Batch size")
+        steps = native_requests.positive_integer(steps, "Sampling steps")
+        if width < 64 or height < 64:
+            return [], "Ideogram 4 width and height must be at least 64."
         if not 1 <= num_images <= 8:
             return [], "Ideogram 4 supports 1 to 8 images per prompt in this UI."
         if not 1 <= steps <= 150:
             return [], "Ideogram 4 steps must be between 1 and 150."
 
+        guidance_kwargs = native_validation.ideogram_guidance(steps, guidance, polish_guidance)
+        mu = native_validation.finite_number(mu, "Schedule mu", -10, 10)
+        std = native_validation.finite_number(std, "Schedule std", 0.01, 10)
+        prompt_temperature = native_validation.finite_number(prompt_temperature, "Upsampling temperature", 0.1, 2)
+        seed = native_validation.actual_seed(seed)
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _IdeogramInterrupted()
+
+        pipeline_attempted = True
         pipe = _get_pipeline(model_path, precision, offload, attention_backend, compile_enabled, prompt_cache)
+        divisor = pipe.vae_scale_factor * pipe.patch_size
+        if width % divisor or height % divisor:
+            return [], f"Ideogram 4 width and height must be divisible by {divisor} for this model."
         configure_vae_tiling(
             pipe.vae,
             resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),
             _device(),
             width,
             height,
-            1,
+            num_images,
         )
 
         if prompt_upsampling and getattr(pipe, "prompt_enhancer_head", None) is None:
@@ -244,9 +261,7 @@ def generate(
         shared.state.id_live_preview += 1
         shared.state.textinfo = "Ideogram 4: loading and preparing"
 
-        generator = None
-        if int(seed) >= 0:
-            generator = torch.Generator(device=_device()).manual_seed(int(seed))
+        generator = torch.Generator(device=_device()).manual_seed(seed)
 
         def on_step_end(_pipe, step, _timestep, callback_kwargs):
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
@@ -258,13 +273,14 @@ def generate(
             return callback_kwargs
 
         with _pipeline_lock:
+            if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                raise _IdeogramInterrupted()
             result = pipe(
                 prompt=prompt,
                 height=height,
                 width=width,
                 num_inference_steps=steps,
-                guidance_scale=float(guidance),
-                guidance_schedule=None,
+                **guidance_kwargs,
                 mu=float(mu),
                 std=float(std),
                 prompt_upsampling=bool(prompt_upsampling),
@@ -276,19 +292,22 @@ def generate(
                 callback_on_step_end=on_step_end,
             )
 
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _IdeogramInterrupted()
         images = list(result.images if hasattr(result, "images") else result[0])
         shared.state.current_image = images[0] if images else None
         shared.state.sampling_step = steps
         shared.state.textinfo = "Ideogram 4: finished"
 
-        return images, f"Ideogram 4 generated {len(images)} image(s)."
+        return images, f"Ideogram 4 generated {len(images)} image(s). Request seed: {seed}."
     except Exception as error:
         # Callback exceptions bypass Diffusers' normal final offload hooks.
         # Invalidate the failed pipeline rather than reusing partial hook state.
-        try:
-            unload()
-        except Exception:
-            logger.exception("Native pipeline cleanup failed")
+        if pipeline_attempted:
+            try:
+                unload()
+            except Exception:
+                logger.exception("Native pipeline cleanup failed")
         if isinstance(error, _IdeogramInterrupted):
             shared.state.textinfo = "Ideogram 4: interrupted"
             return [], "Ideogram 4 generation interrupted."
@@ -324,6 +343,7 @@ def generate_from_preset(prompt: str, *, width=None, height=None, num_images=Non
         _option("ideogram_prompt_upsampling", False),
         _option("ideogram_prompt_temperature", 1.0),
         seed if seed is not None else _option("ideogram_seed", -1),
+        _option("ideogram_polish_guidance", True),
     )
 
 
@@ -381,6 +401,7 @@ def create_ui():
                     with gr.Row():
                         prompt_upsampling = gr.Checkbox(value=_option("ideogram_prompt_upsampling", False), label="Prompt upsampling")
                         prompt_temperature = gr.Number(value=_option("ideogram_prompt_temperature", 1.0), minimum=0.1, maximum=2, step=0.1, label="Upsampling temperature")
+                    polish_guidance = gr.Checkbox(value=_option("ideogram_polish_guidance", True), label="Final CFG polishing", info="Use up to three final steps capped at CFG 3; disable for constant CFG.")
             with gr.Column(scale=2):
                 output = gr.Gallery(label="Output", columns=2, height=512, object_fit="contain", type="pil")
 
@@ -403,6 +424,7 @@ def create_ui():
             prompt_upsampling,
             prompt_temperature,
             seed,
+            polish_guidance,
         ]
 
         settings_to_save = {
@@ -424,6 +446,7 @@ def create_ui():
             prompt_upsampling: "ideogram_prompt_upsampling",
             prompt_temperature: "ideogram_prompt_temperature",
             seed: "ideogram_seed",
+            polish_guidance: "ideogram_polish_guidance",
         }
         for component, key in settings_to_save.items():
             if component is model_path:
@@ -450,6 +473,7 @@ def create_ui():
             prompt_upsampling,
             prompt_temperature,
             seed,
+            polish_guidance,
         ]
         from modules_forge.native_requests import PageJobOwner
         from uuid import uuid4

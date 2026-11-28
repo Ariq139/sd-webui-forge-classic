@@ -21,7 +21,7 @@ import pytz
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 from pillow_heif import register_heif_opener
 
-from modules import batch_planning, errors, script_callbacks, sd_samplers, shared
+from modules import batch_planning, errors, script_callbacks, sd_samplers, shared, video_stream
 from modules.paths_internal import roboto_ttf_file
 from modules.shared import opts
 
@@ -952,9 +952,9 @@ def fix_png_transparency(image: Image.Image):
     return image
 
 
-def save_video(p, frames: list[np.ndarray], fps: int = 16, *, basename: str = "", info: str = None, audio_copy: os.PathLike = None) -> str:
-    height, width, channels = frames[0].shape
-    assert channels == 3, "Frames must be in (H, W, 3) RGB format"
+def save_video(p, frames, fps=16, *, basename: str = "", info: str = None, audio_copy: os.PathLike = None) -> str:
+    shape, frames = video_stream.first_frame(frames)
+    height, width, _ = shape
 
     folder = opts.outdir_samples or opts.outdir_videos
     extension = opts.video_container
@@ -1034,17 +1034,12 @@ def save_video(p, frames: list[np.ndarray], fps: int = 16, *, basename: str = ""
         profile,
         "-metadata",
         f"description={str(info)}",
-        fullfn,
     ]
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    for frame in frames:
-        proc.stdin.write(frame.tobytes())
-    proc.stdin.close()
-    proc.wait()
+    video_stream.encode_frames(cmd, fullfn, shape, frames)
 
     if opts.save_txt and info is not None:
-        txt_fullfn = os.path.join(folder, f"{file_decoration}.txt")
+        txt_fullfn = os.path.splitext(fullfn)[0] + ".txt"
         with open(txt_fullfn, "w", encoding="utf8") as file:
             file.write(f"{info}\n")
 

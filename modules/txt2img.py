@@ -13,7 +13,7 @@ from modules.infotext_utils import (
 )
 from modules.shared import opts
 from modules.ui import plaintext_to_html
-from modules_forge import main_thread, native_requests
+from modules_forge import main_thread, native_requests, native_validation
 from modules_forge.presets import get_capabilities
 
 
@@ -182,7 +182,7 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
         native = inspect.signature(txt2img_create_processing).bind(id_task, request, *args).arguments
         runner = modules.scripts.scripts_txt2img
         steps = native_requests.script_control(runner, native["args"], "ScriptSampler", "steps")
-        seed = native_requests.script_control(runner, native["args"], "ScriptSeed", "seed")
+        seed = native_validation.actual_seed(native_requests.script_control(runner, native["args"], "ScriptSeed", "seed", getattr(opts, f"{opts.forge_preset}_seed", -1)))
         count = native_requests.positive_integer(native["n_iter"], "Batch Count")
         batch_size = native_requests.positive_integer(native["batch_size"], "Batch Size / Frames")
         prompt = shared.prompt_styles.apply_styles_to_prompt(native["prompt"], native["prompt_styles"] or [])

@@ -9,7 +9,7 @@ import torch
 
 from backend import memory_management
 from modules import paths, shared
-from modules_forge import main_thread
+from modules_forge import main_thread, native_validation
 from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
@@ -148,6 +148,7 @@ def _sync_preset_controls(preset: str):
         _option("ltx2_guidance_blocks", "28"),
         _option("ltx2_seed", -1),
         _option("ltx2_include_audio", True),
+        _option("ltx2_cross_timestep_mode", "Automatic"),
     ]
 
 
@@ -339,6 +340,7 @@ def generate(
     guidance_blocks: str,
     seed: int,
     include_audio: bool,
+    cross_timestep_mode: str = "Automatic",
     progress=gr.Progress(track_tqdm=True),
 ):
     if not model_path or not model_path.strip():
@@ -346,14 +348,33 @@ def generate(
     if not prompt or not prompt.strip():
         return None, "Enter a prompt."
 
+    pipeline_attempted = False
     try:
-        width, height, frames, steps = int(width), int(height), int(frames), int(steps)
-        if width < 64 or height < 64 or width % 32 or height % 32:
-            return None, "LTX-2.3 width and height must be at least 64 and divisible by 32."
-        if frames < 9:
-            return None, "LTX-2.3 requires at least 9 frames."
+        width, height, frames, fps, steps = native_validation.ltx_dimensions(width, height, frames, fps, steps)
+        guidance = native_validation.finite_number(guidance, "Video CFG", 0, 24)
+        stg = native_validation.finite_number(stg, "Video STG", 0)
+        modality = native_validation.finite_number(modality, "Video modality", 0)
+        audio_guidance = native_validation.audio_override(audio_guidance, guidance, "Audio CFG")
+        audio_stg = native_validation.audio_override(audio_stg, stg, "Audio STG")
+        audio_modality = native_validation.audio_override(audio_modality, modality, "Audio modality")
+        guidance_rescale = native_validation.finite_number(guidance_rescale, "Guidance rescale", 0, 1)
+        blocks = _parse_blocks(guidance_blocks)
+        if (stg > 0 or audio_stg > 0) and not blocks:
+            raise ValueError("Supply STG block indices when using STG.")
+        if blocks and (min(blocks) < 0 or len(set(blocks)) != len(blocks)):
+            raise ValueError("STG block indices must be unique and nonnegative.")
+        seed = native_validation.actual_seed(seed)
+        if shared.state.interrupted or shared.state.stopping_generation:
+            raise _LTXInterrupted()
 
+        pipeline_attempted = True
         pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None)
+        temporal_ratio = getattr(pipe, "vae_temporal_compression_ratio", 8)
+        native_validation.ltx_dimensions(width, height, frames, fps, steps, temporal_ratio)
+        cross_timestep = native_validation.ltx_cross_timestep(pipe.transformer.config, cross_timestep_mode)
+        num_layers = getattr(pipe.transformer.config, "num_layers", None)
+        if blocks and num_layers is not None and max(blocks) >= num_layers:
+            raise ValueError(f"STG block indices must be below {num_layers}.")
         configure_vae_tiling(
             pipe.vae,
             resolve_vae_tiling_mode(auto_vae_tiling, tile_vae),
@@ -371,9 +392,7 @@ def generate(
         shared.state.id_live_preview += 1
         shared.state.textinfo = "LTX-2.3: loading and preparing"
 
-        generator = None
-        if int(seed) >= 0:
-            generator = torch.Generator(device=_device()).manual_seed(int(seed))
+        generator = torch.Generator(device=_device()).manual_seed(seed)
 
         def on_step_end(_pipe, step, timestep, callback_kwargs):
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
@@ -399,7 +418,8 @@ def generate(
             audio_stg_scale=float(audio_stg),
             audio_modality_scale=float(audio_modality),
             guidance_rescale=float(guidance_rescale),
-            spatio_temporal_guidance_blocks=_parse_blocks(guidance_blocks),
+            spatio_temporal_guidance_blocks=blocks,
+            use_cross_timestep=cross_timestep,
             generator=generator,
             output_type="np",
             return_dict=False,
@@ -410,7 +430,11 @@ def generate(
             kwargs["image"] = image
 
         with _pipeline_lock:
+            if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                raise _LTXInterrupted()
             video, audio = pipe(**kwargs)
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _LTXInterrupted()
         output_path = _output_path()
 
         from diffusers.utils import encode_video
@@ -421,17 +445,26 @@ def generate(
             audio_tensor = audio[0].float().cpu()
             audio_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
 
-        encode_video(video[0], fps=int(fps), audio=audio_tensor, audio_sample_rate=audio_rate, output_path=output_path)
+        temporary = os.path.splitext(output_path)[0] + ".partial.mp4"
+        try:
+            encode_video(video[0], fps=fps, audio=audio_tensor, audio_sample_rate=audio_rate, output_path=temporary)
+            if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                raise _LTXInterrupted()
+            os.replace(temporary, output_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         shared.state.sampling_step = steps
         shared.state.textinfo = "LTX-2.3: finished"
-        return output_path, f"Saved: {output_path}"
+        return output_path, f"Saved: {output_path} | Seed: {seed} | Frames: {len(video[0])} | Cross timestep: {cross_timestep}"
     except Exception as error:
         # Callback exceptions bypass Diffusers' normal final offload hooks.
         # Invalidate the failed pipeline rather than reusing partial hook state.
-        try:
-            unload()
-        except Exception:
-            logger.exception("Native pipeline cleanup failed")
+        if pipeline_attempted:
+            try:
+                unload()
+            except Exception:
+                logger.exception("Native pipeline cleanup failed")
         if isinstance(error, _LTXInterrupted):
             shared.state.textinfo = "LTX-2.3: interrupted"
             return None, "LTX-2.3 generation interrupted."
@@ -476,6 +509,7 @@ def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width
         _option("ltx2_guidance_blocks", "28"),
         seed if seed is not None else _option("ltx2_seed", -1),
         _option("ltx2_include_audio", True),
+        _option("ltx2_cross_timestep_mode", "Automatic"),
     )
 
 
@@ -541,7 +575,8 @@ def create_ui():
                         audio_modality = gr.Number(value=_option("ltx2_audio_modality", 3.0), minimum=0, maximum=10, step=0.1, label="Audio modality")
                     with gr.Row():
                         guidance_blocks = gr.Textbox(value=_option("ltx2_guidance_blocks", "28"), label="Spatio-temporal guidance blocks")
-                        include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio")
+                        include_audio = gr.Checkbox(value=_option("ltx2_include_audio", True), label="Include generated audio", info="Controls exported audio, not joint denoising.")
+                    cross_timestep_mode = gr.Dropdown(choices=["Automatic", "LTX-2.3", "LTX-2.0"], value=_option("ltx2_cross_timestep_mode", "Automatic"), label="Cross timestep mode", info="Automatic detects prompt modulation in the transformer config.")
             with gr.Column(scale=2):
                 video_output = gr.Video(label="Output", autoplay=True, include_audio=True)
 
@@ -570,6 +605,7 @@ def create_ui():
             guidance_blocks,
             seed,
             include_audio,
+            cross_timestep_mode,
         ]
 
         settings_to_save = {
@@ -596,6 +632,7 @@ def create_ui():
             guidance_blocks: "ltx2_guidance_blocks",
             seed: "ltx2_seed",
             include_audio: "ltx2_include_audio",
+            cross_timestep_mode: "ltx2_cross_timestep_mode",
         }
         for component, key in settings_to_save.items():
             if component is model_path:
@@ -630,6 +667,7 @@ def create_ui():
             guidance_blocks,
             seed,
             include_audio,
+            cross_timestep_mode,
         ]
         from modules_forge.native_requests import PageJobOwner
         from uuid import uuid4

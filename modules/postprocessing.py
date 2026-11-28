@@ -1,6 +1,8 @@
 import os
+from itertools import chain
 
 import av
+import gradio as gr
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -110,63 +112,74 @@ def run_postprocessing(extras_mode, image, image_folder, input_dir, output_dir, 
     return outputs, ui_common.plaintext_to_html(infotext), ""
 
 
+class _VideoInterrupted(Exception):
+    pass
+
+
 def run_postprocessing_video(_mode, _img, _folder, _in_dir, _out_dir, _show, video_input, *args, save_output: bool = True):
     devices.torch_gc()
-
     shared.state.begin(job="extras")
-
-    outputs: list[np.ndarray] = []
-
-    container = av.open(video_input)
-
-    video_stream = container.streams.best("video")
-    frames = video_stream.frames
-
-    def get_frames():
-        for frame in tqdm(container.decode(video=0), desc="Processing Video", total=frames, unit="frame"):
-            yield frame.to_image()
-
+    last_image = None
     infotext = ""
 
-    shared.state.job_count = frames
+    def check_interrupted():
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _VideoInterrupted()
 
-    for i, image_data in enumerate(get_frames()):
+    try:
+        if not video_input:
+            raise ValueError("Select an input video.")
+        with av.open(video_input) as container:
+            video_stream = container.streams.best("video")
+            if video_stream is None:
+                raise ValueError("Input has no video stream.")
+            fps = video_stream.average_rate
+            if fps is None or fps <= 0:
+                raise ValueError("Input video has no usable frame rate.")
+            total = video_stream.frames or None
+            shared.state.job_count = total or -1
 
-        shared.state.nextjob()
-        shared.state.textinfo = str(i)
-        shared.state.skipped = False
+            def processed_frames():
+                nonlocal last_image, infotext
+                for index, frame in enumerate(tqdm(container.decode(video_stream), desc="Processing Video", total=total, unit="frame")):
+                    check_interrupted()
+                    shared.state.textinfo = str(index)
+                    pp = scripts_postprocessing.PostprocessedImage(frame.to_image())
+                    scripts.scripts_postproc.run(pp, args)
+                    # Dropping a frame would desynchronize copied audio. Abort the clip.
+                    check_interrupted()
+                    if last_image is None:
+                        infotext = ", ".join([k if k == v else f"{k}: {infotext_utils.quote(v)}" for k, v in pp.info.items() if v is not None])
+                    last_image = pp.image.convert("RGB")
+                    shared.state.assign_current_image(last_image)
+                    shared.state.nextjob()
+                    yield np.asarray(last_image, dtype=np.uint8)
+                check_interrupted()
 
-        if shared.state.interrupted or shared.state.stopping_generation:
-            break
-
-        initial_pp = scripts_postprocessing.PostprocessedImage(image_data)
-
-        scripts.scripts_postproc.run(initial_pp, args)
-
-        if shared.state.skipped:
-            continue
-
-        if not infotext:
-            infotext = ", ".join([k if k == v else f"{k}: {infotext_utils.quote(v)}" for k, v in initial_pp.info.items() if v is not None])
-
-        shared.state.assign_current_image(initial_pp.image)
-
-        outputs.append(np.array(initial_pp.image, dtype=np.uint8))
-
-    if outputs and save_output and not (shared.state.interrupted or shared.state.stopping_generation):
-        images.save_video(
-            os.path.splitext(os.path.basename(video_input))[0],
-            outputs,
-            fps=round(float(container.streams.video[0].average_rate)),
-            basename=None,
-            info=infotext,
-            audio_copy=video_input,
-        )
-
-    container.close()
-    devices.torch_gc()
-    shared.state.end()
-    return outputs[-1:], ui_common.plaintext_to_html(infotext), ""
+            frames = processed_frames()
+            first = next(frames, None)
+            if first is None:
+                return [], ui_common.plaintext_to_html("No video frames decoded."), ""
+            if save_output:
+                path = images.save_video(
+                    os.path.splitext(os.path.basename(video_input))[0],
+                    chain((first,), frames),
+                    fps=fps,
+                    basename=None,
+                    info=infotext,
+                    audio_copy=video_input,
+                )
+                status = f"Saved: {path}"
+            else:
+                for _ in frames:
+                    pass
+                status = "Video processed without saving."
+            return [last_image], ui_common.plaintext_to_html(infotext), ui_common.plaintext_to_html(status)
+    except _VideoInterrupted:
+        return gr.skip(), gr.skip(), ui_common.plaintext_to_html("Video processing interrupted; no partial output published.")
+    finally:
+        devices.torch_gc()
+        shared.state.end()
 
 
 def run_postprocessing_webui(id_task, *args, **kwargs):

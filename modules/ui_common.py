@@ -74,7 +74,21 @@ def save_files(js_data, images, do_make_zip, index):
     if not images:
         return gr.update(value=[], visible=False), plaintext_to_html("No images to save.")
 
-    selected = ui_result_utils.selected_range(len(images), index, first, shared.opts.save_selected_only)
+    kinds = data.get("gallery_kinds")
+    if not isinstance(kinds, list) or len(kinds) != len(images) or any(kind not in ("image", "grid", "auxiliary") for kind in kinds):
+        kinds = ["grid" if i < first else "image" for i in range(len(images))]
+    try:
+        selected_index = int(index)
+    except (TypeError, ValueError, OverflowError):
+        selected_index = -1
+    if 0 <= selected_index < len(kinds) and kinds[selected_index] == "grid":
+        selected_index = -1  # A grid is a batch overview, not a selected sample.
+    selected = ui_result_utils.selected_range(len(images), selected_index, first, shared.opts.save_selected_only)
+    ordinals = []
+    generated = 0
+    for kind in kinds:
+        ordinals.append(generated)
+        generated += kind == "image"
     path = shared.opts.outdir_save
     save_to_dirs = shared.opts.use_save_to_dirs_for_ui
     extension = shared.opts.samples_format
@@ -95,7 +109,7 @@ def save_files(js_data, images, do_make_zip, index):
 
         for image_index in selected:
             image = images[image_index][0]
-            is_grid = image_index < first
+            is_grid = kinds[image_index] == "grid"
             raw = ui_result_utils.image_infotext(data, image_index)
             parameters = {}
             if raw:
@@ -109,9 +123,9 @@ def save_files(js_data, images, do_make_zip, index):
             seed = parameters.get("Seed")
             p = MyObject(data)
             p.batch_size = ui_result_utils.safe_batch_size(data)
-            ordinal = max(0, image_index - first)
+            ordinal = ordinals[image_index]
             p.iteration, p.batch_index = divmod(ordinal, p.batch_size)
-            p.n_iter = max(1, (len(images) - first + p.batch_size - 1) // p.batch_size)
+            p.n_iter = max(1, (generated + p.batch_size - 1) // p.batch_size)
             p.prompt = prompt
             p.negative_prompt = parameters.get("Negative prompt", data.get("negative_prompt", "") if native else "")
             p.sd_model_name = parameters.get("Model", data.get("sd_model_name", ""))
