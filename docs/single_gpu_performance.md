@@ -27,3 +27,25 @@ The development environment was CPU-only and did not have a complete Forge check
 Start by enabling one flag at a time on one visible GPU (`--gpu-device-id 0` for the correct physical device). Compare identical prompt, seed, sampler, resolution, steps, batch and precision, warm up the compiler separately, then record at least five warm generations. Record denoise time, end-to-end time, peak allocated/reserved VRAM, H2D transfer waits, per-step output differences, OOM/interrupt recovery, and whether the intended profiling regions actually execute. Reject a flag that does not help the measured workload or materially changes output beyond the intended numerical tolerance. Keep the draft unmerged until the RTX 3060 Ti validation is completed.
 
 Final audit notes: native CFG condition reuse checks the diffusion module (not the KModel wrapper's training flag) and rejects custom fields and hooks. Direct pixels require the original native VAE and decode methods and exclude interrupted/skipped output. New invariant caching requires an exact supported native model class; inherited Nunchaku Z-Image models do not enter native block prefetch. All new optimizations remain experimental. The original sampling path remains authoritative for unsupported layouts, regions, masks, custom conditions, decoder overrides and extension hooks. Do not interpret these guards as a claim of complete runtime coverage or an observed speedup. Separate profiling of the retained preview snapshot does not accelerate it. Packed GGUF prefetch requires actually pinned original bytes, and ordinary mixed-precision tensor-subclass storage remains excluded.
+
+## Z-Image / FLUX.1 / FLUX.2 Klein follow-up
+
+The new opt-in flags below are experiments for one RTX 3060 Ti 8 GiB, not measured speedups. Existing flags and fallback behavior are retained.
+
+| Flag | Added path |
+| --- | --- |
+| `--native-token-assembly` | Z-Image no-op pad elimination, broadcast pad/position assembly, batched uniform unpatchify. |
+| `--static-sigma-control` | Versioned schedule snapshots for DPM++ 2M, LCM, Euler churn and rectified-flow Euler ancestral control flow; GPU arithmetic is retained. |
+| `--qwen-intermediate-only` | Native Qwen3 4B/8B stops after required hidden states; no final output is consumed by these conditioning engines. |
+| `--qwen-batched-prompts` | Two equal-length, single-section unweighted prompts, only for resident native encoder with conservative VRAM headroom. |
+| `--flux-fused-qk-rope` | Eligible native CUDA/Triton RMSNorm+rotary in FLUX double/single streams. |
+| `--native-int8-mlp-activation` | Pinned Comfy-Kitchen 0.2.40 CUDA ConvRot activation producer; packed GELU/SiLU in native FLUX and BF16 paired activation in ZIT/YakMLP. |
+| `--fused-flux-residual` | In-place gated residual multiply/add for matching dtype and nonsegmented modulation. |
+| `--flux-reference-cache` | Requires invariant cache budget; versioned reference transfer/patchification and eligible resident dense image projection, plus reference-layout RoPE. |
+| `--target-only-output-head` | Dense, tokenwise native FLUX reference and ZIT caption/padding head trimming. |
+| `--assembled-condition-cache` | Requires invariant cache and direct full-area CFG flags; reuse eligible assembled native conditioning. |
+| `--pin-quantized-weights` | Requires existing shared-memory pinning; register original full-storage packed GGUF bytes, retain registration owner, unregister before model migration. |
+
+The CFG schedule allowlist now permits ordinary `sampling_sigmas` metadata. Uncached Nunchaku FLUX no longer reads a timestep scalar unnecessarily. Both are source-level fixes. Existing prefetch now allows a large eligible allocation to occupy the remaining byte budget; in-flight allocations still count. CPU helper tests cover layer selection conventions, schedule metadata, uniform unpatchify, snapshot mutation and reference identity/version. Full Forge integration and GPU tests remain required. Run `python -m pytest -q tests/test_additional_static_paths.py tests/test_qwen_shortcut.py tests/test_single_gpu_integration.py` in the real installation.
+
+Deferred hardware work: load-time packed INT8 gate/up weight packing with zero duplicate permanent storage; general quantized tensor-subclass pin/stage reconstruction; single-stream segmented activation quantization and producer QKV destinations; cross-step Nunchaku packed rotary caching; full CUDA Graph replay; full assembled conditioning reconstruction and predictor coefficient precomputation. These require real layout/kernel/lifetime validation and are not represented as completed. Native ZIT already has RMS+RoPE and Nunchaku already packs gate/up; no redundant implementation. Existing outer WebUI prompt conditioning cache remains authoritative; no additional cross-job text cache. Reference projection and head trimming, fused RMS/rotary and native INT8 producer may change numerical rounding. Custom extension mutation via untracked tensor storage is not supported by snapshot reuse. Test each flag independently and record actual kernel dispatch, output tolerance, VRAM, host pinning and timing before merging.

@@ -57,6 +57,7 @@ class SigmaControl:
         self.sigmas = sigmas
         self.values = None
         self.version = None
+        self.thresholds = {}
         self.enabled = (single_gpu_flag("static_sigma_control") and sigmas.is_cuda
                         and type(sigmas) is torch.Tensor and sigmas.ndim == 1)
 
@@ -71,6 +72,20 @@ class SigmaControl:
             self.values = self.sigmas.detach().cpu().tolist()
             self.version = version
         return self.values[index]
+
+    def in_range(self, index, lower, upper):
+        value = self.value(index)
+        if isinstance(value, torch.Tensor):
+            return lower <= value <= upper
+        # Torch comparisons cast Python scalars to the schedule dtype.
+        # Preserve that behavior at non-representable churn boundaries.
+        key = (lower, upper)
+        bounds = self.thresholds.get(key)
+        if bounds is None:
+            bounds = tuple(torch.tensor(bound, dtype=self.sigmas.dtype, device="cpu").item()
+                           for bound in key)
+            self.thresholds[key] = bounds
+        return bounds[0] <= value <= bounds[1]
 
 
 def reference_signature(refs):

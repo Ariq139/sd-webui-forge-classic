@@ -267,8 +267,15 @@ def _assembled_native_conditions(groups, model, x, model_options, condition_cach
         return cond_cat(groups)
     from backend.sampling.invariant_cache import cached_invariant
     source = groups[0][names[0]].cond
+    def version(tensor):
+        try:
+            return tensor._version
+        except RuntimeError:
+            # Native inference tensors use the existing semantic schedule key.
+            return None
     geometry = tuple(tuple((name, tuple(group[name].cond.shape), group[name].cond.dtype,
-                            group[name].cond.device) for name in names) for group in groups)
+                            group[name].cond.device, version(group[name].cond)) for name in names)
+                     for group in groups)
     def assemble():
         merged = cond_cat(groups)
         return tuple(merged[name] for name in names)

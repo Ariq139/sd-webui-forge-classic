@@ -166,7 +166,7 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     sigma_control = SigmaControl(sigmas) if s_churn > 0 else None
     for i in trange(len(sigmas) - 1, disable=disable):
         if s_churn > 0:
-            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma_control.value(i) <= s_tmax else 0.0
+            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if sigma_control.in_range(i, s_tmin, s_tmax) else 0.0
             sigma_hat = sigmas[i] * (gamma + 1)
         else:
             gamma = 0

@@ -35,3 +35,36 @@ def test_uniform_unpatchify_matches_original(batch, patch, channels):
     assert actual.is_contiguous()
     if batch > 1:
         assert uniform_unpatchify(x, [(h, w)] * batch, [start] + [start + 1] * (batch - 1), patch, channels) is None
+
+
+def test_sigma_control_invalidation_and_churn_boundary(monkeypatch):
+    from backend import single_gpu_fastpaths as fast
+    monkeypatch.setattr(fast, "single_gpu_flag", lambda name: True)
+    sigmas = torch.tensor([1, 0.5, 0], dtype=torch.float16)
+    control = fast.SigmaControl(sigmas)
+    control.enabled = True  # Test snapshot/version logic independently of CUDA.
+    assert control.value(2) == 0
+    assert control.in_range(1, 0.50001, 1.0) == bool(0.50001 <= sigmas[1] <= 1.0)
+    sigmas[2] = 0.25
+    assert control.value(2) == 0.25
+    with torch.inference_mode():
+        unversioned = torch.tensor([1.0, 0.0])
+        other = fast.SigmaControl(unversioned)
+        other.enabled = True
+        assert isinstance(other.value(1), torch.Tensor)
+
+
+def test_reference_signature_detects_mutations_and_versions_inference_input(monkeypatch):
+    from backend import single_gpu_fastpaths as fast
+    monkeypatch.setattr(fast, "single_gpu_flag", lambda name: True)
+    ref = torch.zeros(1, 4, 8, 8)
+    initial = fast.reference_signature([ref])
+    ref.add_(1)
+    assert fast.reference_signature([ref]) != initial
+    with torch.inference_mode():
+        source = torch.ones_like(ref)
+        assert fast.reference_signature([source]) is None
+        converted, = fast.version_reference_latents([source])
+        assert not converted.is_inference()
+        assert fast.reference_signature([converted]) is not None
+        torch.testing.assert_close(converted, source, rtol=0, atol=0)

@@ -399,7 +399,11 @@ class NextDiT(nn.Module):
         pH = pW = self.patch_size
         device = x[0].device
         dtype = x[0].dtype
-        fast_assembly = type(self) is NextDiT and single_gpu_flag("native_token_assembly") and not self.training and not torch.is_grad_enabled()
+        fast_assembly = (type(self) is NextDiT and single_gpu_flag("native_token_assembly")
+                         and not self.training and not torch.is_grad_enabled()
+                         and transformer_options.keys() <= {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                                            "uncond_indices", "sampling_sigmas"}
+                         and cache_dependencies_safe(self))
 
         if self.pad_tokens_multiple is not None:
             pad_extra = (-cap_feats.shape[1]) % self.pad_tokens_multiple

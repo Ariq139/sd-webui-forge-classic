@@ -101,7 +101,15 @@ class YakMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with shared_activation_scope(x, (self.gate_proj, self.up_proj)):
             gate = self.gate_proj(x)
-            if can_fuse_silu(self.act_fn, gate):
+            if (single_gpu_flag("native_int8_mlp_activation") and gate.dtype == torch.bfloat16
+                    and type(self) is YakMLP and type(self.act_fn) is nn.SiLU
+                    and not self.act_fn.inplace and cache_dependencies_safe(self)):
+                up = self.up_proj(x)
+                fused = try_native_int8_input_act(self.down_proj, (gate, up), "swiglu")
+                if fused is not None:
+                    return fused
+                hidden = self.act_fn(gate) * up
+            elif can_fuse_silu(self.act_fn, gate):
                 hidden = silu_gate(gate, self.up_proj(x))
             else:
                 hidden = self.act_fn(gate) * self.up_proj(x)
@@ -261,6 +269,21 @@ def apply_mod(tensor: torch.Tensor, m_mult: float, m_add: bool = None, modulatio
         return tensor
 
 
+def gated_residual_(x, output, gate, modulation_dims=None):
+    if (single_gpu_flag("fused_flux_residual") and modulation_dims is None
+            and type(x) is torch.Tensor and type(output) is torch.Tensor
+            and x.is_cuda and not torch.is_grad_enabled()
+            and x.dtype == output.dtype == gate.dtype
+            and x.device == output.device == gate.device
+            and x.shape == output.shape):
+        # Fused rounding is intentional and opt-in. Keep segmented modulation
+        # and mixed-dtype arithmetic on the original expression.
+        x.addcmul_(output, gate)
+    else:
+        x += apply_mod(output, gate, None, modulation_dims)
+    return x
+
+
 class SiLUActivation(nn.Module):
     def __init__(self):
         super().__init__()
@@ -349,14 +372,14 @@ class DoubleStreamBlock(nn.Module):
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img blocks
-        img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
+        img = gated_residual_(img, self.img_attn.proj(img_attn), img_mod1.gate, modulation_dims_img)
         del img_attn
-        img += apply_mod(run_native_mlp(self.img_mlp, apply_norm_scale_shift(self.img_norm2, img, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+        img = gated_residual_(img, run_native_mlp(self.img_mlp, apply_norm_scale_shift(self.img_norm2, img, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, modulation_dims_img)
 
         # calculate the txt blocks
-        txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
+        txt = gated_residual_(txt, self.txt_attn.proj(txt_attn), txt_mod1.gate, modulation_dims_txt)
         del txt_attn
-        txt += apply_mod(run_native_mlp(self.txt_mlp, apply_norm_scale_shift(self.txt_norm2, txt, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+        txt = gated_residual_(txt, run_native_mlp(self.txt_mlp, apply_norm_scale_shift(self.txt_norm2, txt, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, modulation_dims_txt)
 
         txt = fp16_fix(txt)
 
@@ -428,7 +451,7 @@ class SingleStreamBlock(nn.Module):
         else:
             mlp = self.mlp_act(mlp)
         output = self.linear2(torch.cat((attn, mlp), 2))
-        x += apply_mod(output, mod.gate, None, modulation_dims)
+        x = gated_residual_(x, output, mod.gate, modulation_dims)
 
         x = fp16_fix(x)
 
@@ -702,6 +725,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
                 and type(self) is IntegratedFluxTransformer2DModel
                 and type(self.final_layer) is LastLayer and not self.training
                 and not torch.is_grad_enabled() and not patches and not patches_replace and control is None
+                and transformer_options.keys() <= {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                                   "uncond_indices", "sampling_sigmas", "total_blocks", "block_type", "block_index"}
                 and (vec_orig.ndim == 2 or (vec_orig.ndim == 3 and vec_orig.shape[1] == 1))
                 and dense_tokenwise_head(self.final_layer)):
             img = img[:, :target_tokens]

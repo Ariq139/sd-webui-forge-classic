@@ -1846,6 +1846,9 @@ def pin_memory(tensor):
     ptr = tensor.data_ptr()
     if ptr == 0 or ptr in PINNED_MEMORY or size == 0:
         return False
+    # Reject overlapping registrations, including distinct views of storage.
+    if any(ptr < other + length and other < ptr + size for other, length in PINNED_MEMORY.items()):
+        return False
 
     if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
         PINNED_MEMORY[ptr] = size
