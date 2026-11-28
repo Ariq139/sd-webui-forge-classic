@@ -136,6 +136,13 @@ let regen_img2img = null;
         let task = localGet(key);
         let awaitingTask = false;
         let checking = false;
+        let uncertainSince = 0;
+        const timeoutMs = 40000;
+        function stopUncertain() {
+            cancel();
+            console.warn("Generate forever stopped: previous submission could not be confirmed.");
+            alert("Generate forever stopped because the previous submission could not be confirmed. Check the active job before restarting.");
+        }
 
         // Native Batch Count 0 already repeats on the server.
         if (nativeInfinite(tab)) {
@@ -153,7 +160,16 @@ let regen_img2img = null;
             if (current) {
                 task = current;
                 awaitingTask = false;
+                uncertainSince = 0;
                 return;
+            }
+
+            if (task || awaitingTask) {
+                if (!uncertainSince) uncertainSince = Date.now();
+                if (Date.now() - uncertainSince >= timeoutMs) {
+                    stopUncertain();
+                    return;
+                }
             }
 
             if (task) {
@@ -164,7 +180,13 @@ let regen_img2img = null;
                 // Only confirmed server completion permits another submission.
                 request("./internal/progress", { id_task: previous, live_preview: false }, function (res) {
                     checking = false;
-                    if (res.completed && !res.active && !res.queued && task === previous) task = null;
+                    if (task !== previous) return;
+                    if (res.completed && !res.active && !res.queued) {
+                        task = null;
+                        uncertainSince = 0;
+                    } else if (res.active || res.queued) {
+                        uncertainSince = 0;
+                    }
                 }, function () {
                     checking = false;
                 });
@@ -175,6 +197,7 @@ let regen_img2img = null;
             const generate = idleGenerateButton(tab);
             if (!generate) return;
             awaitingTask = true;
+            uncertainSince = Date.now();
             generate.click();
             task = localGet(key);
             if (task) awaitingTask = false;
