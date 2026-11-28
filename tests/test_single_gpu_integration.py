@@ -162,8 +162,8 @@ class _CFGModel:
 def test_full_area_cfg_direct_predictions_match_existing_accumulation(batched):
     x = torch.zeros(2, 1, 8, 8)
     sigma = torch.ones(2)
-    cond = compile_conditions(torch.full((2, 1, 1), 3.0))
-    uncond = compile_conditions(torch.full((2, 1, 1), 1.0))
+    cond = compile_conditions(torch.full((2, 1, 1), 3.0), cache_namespace=("positive",))
+    uncond = compile_conditions(torch.full((2, 1, 1), 1.0), cache_namespace=("negative",))
     assert sf._unit_full_area(cond[0], x)
     assert not sf._unit_full_area(dict(cond[0], strength=0.5), x)
     assert not sf._unit_full_area(dict(cond[0], mask=torch.ones(2, 8, 8)), x)
@@ -178,6 +178,8 @@ def test_full_area_cfg_direct_predictions_match_existing_accumulation(batched):
             actual = sf.calc_cond_uncond_batch(_CFGModel(), cond, uncond, x, sigma, {}, {})
     for a, b in zip(actual, expected):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+    torch.testing.assert_close(actual[0], torch.full_like(x, 3.0), rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], torch.ones_like(x), rtol=0, atol=0)
 
 
 def test_vae_direct_float_pixels_preserve_layout_and_legacy_contract():
