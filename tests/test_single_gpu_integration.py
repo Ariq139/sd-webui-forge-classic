@@ -224,3 +224,41 @@ def test_krea_cfg1_direct_path_carries_namespaced_condition_key():
             cond = compile_conditions(text)
             sf.calc_single_condition(model, cond, x, sigma, {}, condition_cache)
         assert model.calls == 3
+
+@pytest.mark.parametrize("with_weight", [True, False])
+def test_offload_stream_fences_even_on_kernel_failure(with_weight):
+    source = torch.ones(1)
+    offload_stream = mock.Mock()
+    current = mock.Mock()
+    signal = (offload_stream, source if with_weight else None, None if with_weight else source)
+    failure = RuntimeError("kernel failed")
+    with mock.patch.object(operations.memory_management, "current_stream", return_value=current):
+        with pytest.raises(RuntimeError) as raised:
+            with operations.main_stream_worker(None, None, signal):
+                raise failure
+    assert raised.value is failure
+    offload_stream.wait_stream.assert_called_once_with(current)
+
+
+def test_gguf_forced_cast_does_not_bypass_legacy_lora_merge():
+    from gguf import GGMLQuantizationType
+    from backend.operations_gguf import ParameterGGUF
+
+    layer = operations.ForgeOperationsGGUF.Linear()
+    layer.weight = ParameterGGUF(torch.arange(8, dtype=torch.uint8), tensor_type=GGMLQuantizationType.Q4_0, tensor_shape=(2, 4))
+    layer.bias = None
+    layer.weight_function = [object()]
+    layer.bias_function = []
+    layer.forge_force_cast_weights = True
+    x = torch.ones(1, 4)
+    dense = torch.ones(2, 4)
+    with (
+        mock.patch.object(operations.args, "activation_space_lora", True, create=True),
+        mock.patch.object(operations, "activation_space_lora_patches") as validate,
+        mock.patch.object(operations, "try_llamacpp_cuda_linear") as packed,
+        mock.patch.object(operations, "weights_manual_cast", return_value=(dense, None, None)) as cast,
+    ):
+        torch.testing.assert_close(layer(x), F.linear(x, dense))
+    validate.assert_not_called()
+    packed.assert_not_called()
+    assert not cast.call_args.kwargs["skip_weight_functions"]
