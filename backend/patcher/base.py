@@ -505,11 +505,14 @@ class ModelPatcher:
         weight, _, _ = get_key_weight(self.model, key)
         from backend.single_gpu_fastpaths import single_gpu_flag
         if single_gpu_flag("pin_quantized_weights"):
-            from backend.quantized_storage import int8_storage
-            storage = int8_storage(weight)
+            from backend.quantized_storage import packed_storage
+            storage = packed_storage(weight)
             if storage is not None:
                 # Retain only registrations we actually own, including partial success.
-                for part in storage.parts:
+                for source_part in storage.parts:
+                    # Registration owns the exact allocation even if the wrapper
+                    # later rebinds a scale or packed data tensor.
+                    part = source_part.detach()
                     if memory_management.pin_raw_memory(part):
                         self.pinned.add(key)
                         self.pinned_quantized_sources.setdefault(key, []).append(part)

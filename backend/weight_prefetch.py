@@ -77,23 +77,23 @@ class WeightPrefetch:
             elif type(source) in (torch.Tensor, torch.nn.Parameter) and source.dtype == dtype:
                 raw = source
             elif getattr(args, "pin_quantized_weights", False):
-                from backend.quantized_storage import int8_storage
-                storage = int8_storage(source)
+                from backend.quantized_storage import packed_storage
+                storage = packed_storage(source)
                 if storage is None or None in storage.versions or storage.orig_dtype != dtype:
                     continue
-                packed = "int8"
+                packed = "quantized"
                 raw = storage.parts
             else:
                 continue
-            parts = raw if packed == "int8" else (raw,)
+            parts = raw if packed == "quantized" else (raw,)
             if any(not part.is_contiguous() or not part.is_pinned() for part in parts):
                 continue
             try:
-                version = storage if packed == "int8" else TransferSource(
+                version = storage if packed == "quantized" else TransferSource(
                     source, raw, _gguf_metadata(source) if packed else ())
             except RuntimeError:
                 continue
-            parts = storage.transfer_parts if packed == "int8" else (version.raw,)
+            parts = storage.transfer_parts if packed == "quantized" else (version.raw,)
             size = sum(part.numel() * part.element_size() for part in parts)
             if not size or size > allowance:
                 continue
@@ -111,7 +111,7 @@ class WeightPrefetch:
             with torch.cuda.stream(self.stream):
                 try:
                     values = tuple(torch.empty_like(part, device=self.device) for part in parts)
-                    value = values if packed == "int8" else values[0]
+                    value = values if packed == "quantized" else values[0]
                 except torch.cuda.OutOfMemoryError:
                     # Only a failed speculative allocation is recoverable here.
                     break
@@ -138,12 +138,12 @@ class WeightPrefetch:
             return None
         original, version, value, ready, packed, _ = entry
         try:
-            valid = (version.matches(source) if packed == "int8"
+            valid = (version.matches(source) if packed == "quantized"
                      else original is source and version.matches(
                          source, source.data if packed else source, _gguf_metadata(source) if packed else ()))
         except RuntimeError:
             valid = False
-        incompatible = (dtype not in (None, version.orig_dtype) if packed == "int8"
+        incompatible = (dtype not in (None, version.orig_dtype) if packed == "quantized"
                         else dtype is not None if packed else dtype not in (None, value.dtype))
         if not valid or incompatible:
             self.retired.append((entry, ready))
@@ -151,10 +151,10 @@ class WeightPrefetch:
         current = torch.cuda.current_stream(device)
         with record_region("forge::weight_prefetch_wait"):
             current.wait_event(ready)
-        for part in value if packed == "int8" else (value,):
+        for part in value if packed == "quantized" else (value,):
             part.record_stream(current)
         self.in_use[module] = (entry, current)
-        if packed == "int8":
+        if packed == "quantized":
             return version.rebuild(value)
         return source.copy_with_data(value) if packed else value
 
