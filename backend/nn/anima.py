@@ -80,7 +80,7 @@ class VideoRopePosition3DEmb(nn.Module):
             except RuntimeError:
                 return self._compute_positions(x_B_T_H_W_C, device)
             return cached_invariant(self, "anima_rope", x_B_T_H_W_C, transformer_options,
-                                    lambda: self._compute_positions(x_B_T_H_W_C, device), geometry=geometry)
+                                    lambda: self._compute_positions(x_B_T_H_W_C, device), geometry=geometry, geometry_only=True)
         return self._compute_positions(x_B_T_H_W_C, device)
 
     def _compute_positions(self, x_B_T_H_W_C: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -209,7 +209,8 @@ class SelfCrossAttention(nn.Module):
 
             q = self.q_norm(project(self.q_proj(x)))
             k, v = cached_invariant(self, "anima_cross_kv", context, transformer_options,
-                                    compute_kv, geometry=(x.dtype, x.device))
+                                    compute_kv, geometry=(x.dtype, x.device),
+                                    dependencies=(self.k_proj, self.v_proj, self.k_norm, self.v_norm))
         else:
             q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
         return self.compute_attention(q, k, v, transformer_options=transformer_options)

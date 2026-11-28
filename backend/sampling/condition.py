@@ -84,6 +84,12 @@ def conditioning_shape(row):
     return tuple((key, value.shape) for key, value in row.items()) if isinstance(row, dict) else row.shape
 
 
+def _condition_namespace(namespace, *parts):
+    # An omitted namespace is not a semantic identity. In particular,
+    # independent positive/negative calls must not share a (None, field) key.
+    return (namespace, *parts) if namespace is not None else None
+
+
 def compile_conditions(cond, cache_namespace=None):
     if cond is None:
         return None
@@ -95,7 +101,7 @@ def compile_conditions(cond, cache_namespace=None):
             groups.setdefault(conditioning_shape(row), []).append(i)
         result = []
         for indices in groups.values():
-            group_cache_namespace = (cache_namespace, tuple(indices))
+            group_cache_namespace = _condition_namespace(cache_namespace, tuple(indices))
             compiled = compile_conditions(stack_conditioning([cond[i] for i in indices]), cache_namespace=group_cache_namespace)[0]
             compiled["batch_indices"] = indices
             result.append(compiled)
@@ -105,7 +111,7 @@ def compile_conditions(cond, cache_namespace=None):
         result = dict(
             cross_attn=cond,
             model_conds=dict(
-                c_crossattn=ConditionCrossAttn(cond, cache_key=(cache_namespace, "crossattn")),
+                c_crossattn=ConditionCrossAttn(cond, cache_key=_condition_namespace(cache_namespace, "crossattn")),
             ),
         )
         return [result]
@@ -117,13 +123,13 @@ def compile_conditions(cond, cache_namespace=None):
         cross_attn=cross_attn,
         pooled_output=pooled_output,
         model_conds=dict(
-            c_crossattn=ConditionCrossAttn(cross_attn, cache_key=(cache_namespace, "crossattn")),
-            y=Condition(pooled_output, cache_key=(cache_namespace, "vector")),
+            c_crossattn=ConditionCrossAttn(cross_attn, cache_key=_condition_namespace(cache_namespace, "crossattn")),
+            y=Condition(pooled_output, cache_key=_condition_namespace(cache_namespace, "vector")),
         ),
     )
 
     if "guidance" in cond:
-        result["model_conds"]["guidance"] = Condition(cond["guidance"], cache_key=(cache_namespace, "guidance"))
+        result["model_conds"]["guidance"] = Condition(cond["guidance"], cache_key=_condition_namespace(cache_namespace, "guidance"))
 
     return [result]
 
@@ -142,7 +148,7 @@ def compile_weighted_conditions(cond, weights, cache_namespace=None):
         for (term, _, weight), rows in groups.items():
             image_indices = [image for image, _ in rows]
             condition_indices = [index for _, index in rows]
-            group_cache_namespace = (cache_namespace, term, tuple(image_indices), tuple(condition_indices))
+            group_cache_namespace = _condition_namespace(cache_namespace, term, tuple(image_indices), tuple(condition_indices))
             compiled = compile_conditions(
                 stack_conditioning([cond[index] for index in condition_indices]),
                 cache_namespace=group_cache_namespace,
@@ -166,7 +172,7 @@ def compile_weighted_conditions(cond, weights, cache_namespace=None):
         else:
             feed = cond[current_indices]
 
-        h = compile_conditions(feed, cache_namespace=(cache_namespace, tuple(current_indices)))
+        h = compile_conditions(feed, cache_namespace=_condition_namespace(cache_namespace, tuple(current_indices)))
         h[0]["strength"] = current_weight
         results += h
 

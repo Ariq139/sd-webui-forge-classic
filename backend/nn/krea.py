@@ -361,7 +361,8 @@ class SingleStreamDiT(nn.Module):
         if _edit:
             context = compute_text_features()
         else:
-            context = cached_krea_text_features(self, context, transformer_options, compute_text_features)
+            context = cached_krea_text_features(self, context, transformer_options, compute_text_features,
+                                                dependencies=(self.txtfusion, self.txtmlp))
 
         txtlen, imglen = context.shape[1], img.shape[1]
         if _edit:

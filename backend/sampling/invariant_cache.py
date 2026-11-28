@@ -103,17 +103,33 @@ def invariants_enabled(module, tensor, options):
             and isinstance(options, dict) and options.keys() <= _SAFE_OPTIONS)
 
 
-def cached_invariant(module, kind, tensor, options, compute, *, geometry=(), clone=False):
+def cache_dependencies_safe(*dependencies):
+    """Do not skip a module whose forward may be externally observable."""
+    if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
+        return False
+    return all(not child.training and not child._forward_hooks and not child._forward_pre_hooks
+               for dependency in dependencies if dependency is not None
+               for child in dependency.modules())
+
+
+def cached_invariant(module, kind, tensor, options, compute, *, geometry=(), clone=False,
+                     geometry_only=False, dependencies=()):
     """Cache only an explicitly proved invariant, never a denoiser output."""
     if not invariants_enabled(module, tensor, options):
         return compute()
     cache = _CACHE.get()
+    if dependencies and not cache_dependencies_safe(*dependencies):
+        cache.clear()
+        return compute()
     try:
         version = tensor._version
     except RuntimeError:
         version = None  # only semantically keyed, native inference calls reach here
-    key = (_REVISION.get(), _CONDITION.get(), module, kind, tensor.device,
-           tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()), version, geometry)
+    # Position embeddings depend on the audited geometry, not prompt contents
+    # or the latent's version. Retain the condition-scope eligibility check.
+    key = (_REVISION.get(), None if geometry_only else _CONDITION.get(), module, kind, tensor.device,
+           tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()),
+           None if geometry_only else version, geometry)
     try:
         hash(key)
     except TypeError:

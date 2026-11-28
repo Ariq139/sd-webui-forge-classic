@@ -193,3 +193,34 @@ def test_vae_direct_float_pixels_preserve_layout_and_legacy_contract():
     torch.testing.assert_close(raw, pixels.movedim(-1, 1), rtol=0, atol=0)
     torch.testing.assert_close(legacy, (pixels.movedim(-1, 1) * 2 - 1).to(latent.dtype), rtol=0, atol=0)
     assert raw.dtype == torch.float32 and legacy.dtype == latent.dtype
+
+
+def test_krea_cfg1_direct_path_carries_namespaced_condition_key():
+    from backend.sampling.krea_cache import cached_krea_text_features, sampling_krea_cache_scope, krea_text_fusion_revision
+
+    class KreaLikeModel:
+        def __init__(self):
+            self.features = torch.nn.Identity().eval()
+            self.calls = 0
+
+        def apply_model(self, x, timestep, c_crossattn, transformer_options):
+            def compute():
+                self.calls += 1
+                return c_crossattn.clone()
+            return cached_krea_text_features(self.features, c_crossattn, transformer_options, compute)
+
+    model = KreaLikeModel()
+    x = torch.zeros(1, 1, 8, 8)
+    sigma = torch.ones(1)
+    text = torch.ones(1, 2, 3)
+    with (torch.no_grad(), sampling_krea_cache_scope("test"), krea_text_fusion_revision("r1"),
+          mock.patch.object(sf.args, "invariant_cache_mib", 32, create=True)):
+        condition_cache = {}
+        for _ in range(2):
+            cond = compile_conditions(text, cache_namespace="positive")
+            sf.calc_single_condition(model, cond, x, sigma, {}, condition_cache)
+        assert model.calls == 1
+        for _ in range(2):
+            cond = compile_conditions(text)
+            sf.calc_single_condition(model, cond, x, sigma, {}, condition_cache)
+        assert model.calls == 3

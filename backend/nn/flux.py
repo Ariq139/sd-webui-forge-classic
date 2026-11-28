@@ -510,7 +510,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         # DoubleStreamBlock updates its text stream in-place. The cached
         # projection must never be exposed to those writes.
         txt = cached_invariant(self, "flux_text_projection", txt, transformer_options,
-                               project_text, clone=True, geometry=(img.dtype, img.device))
+                               project_text, clone=True, geometry=(img.dtype, img.device),
+                               dependencies=(self.txt_norm, self.txt_in))
 
         vec_orig = vec
         if self.global_modulation:
@@ -529,7 +530,8 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             if position_geometry is not None and not patches and not patches_replace:
                 pe = cached_invariant(self.pe_embedder, "flux_rope", ids, transformer_options,
                                       lambda: self.pe_embedder(ids),
-                                      geometry=(position_geometry, tuple(self.pe_embedder.axes_dim), self.pe_embedder.theta))
+                                      geometry=(position_geometry, tuple(self.pe_embedder.axes_dim), self.pe_embedder.theta),
+                                      geometry_only=True)
             else:
                 pe = self.pe_embedder(ids)
         else:

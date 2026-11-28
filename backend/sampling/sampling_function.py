@@ -544,8 +544,17 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
     transformer_options["uncond_indices"] = []
     c["transformer_options"] = transformer_options
     keys = tuple((name, getattr(value, "cache_key", None)) for name, value in item["model_conds"].items())
-    invariant_key = (id(model), ((keys, area, None, 0),)) if keys and all(key is not None for _, key in keys) else None
-    with record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key):
+    invariant_key = None
+    if (condition_cache is not None and condition_cache_allowed(model_options)
+            and keys and all(key is not None for _, key in keys)):
+        candidate = (id(model), getattr(model, "patches_uuid", None), ((keys, area, None, 0),))
+        try:
+            hash(candidate)
+            invariant_key = candidate
+        except TypeError:
+            pass
+    krea_key = invariant_key if getattr(args, "invariant_cache_mib", 0) > 0 else None
+    with record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key), krea_text_fusion_condition(krea_key):
         return model.apply_model(x, timestep, **c)
 
 

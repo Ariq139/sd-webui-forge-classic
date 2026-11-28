@@ -410,7 +410,7 @@ class NextDiT(nn.Module):
                     tuple(self.rope_embedder.axes_dim), self.rope_embedder.theta, dtype)
         freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
                                     lambda: self.rope_embedder(position_ids).movedim(1, 2).to(dtype),
-                                    geometry=geometry)
+                                    geometry=geometry, geometry_only=True)
 
         def refine_context():
             features = cap_feats
@@ -421,7 +421,7 @@ class NextDiT(nn.Module):
         # A dynamic mask can alter the context-refiner output; do not cache it.
         if cap_mask is None:
             cap_feats = cached_invariant(self, "lumina_context_refiner", cap_feats, transformer_options,
-                                         refine_context, geometry=geometry)
+                                         refine_context, geometry=geometry, dependencies=(self.context_refiner,))
         else:
             cap_feats = refine_context()
 
@@ -446,7 +446,8 @@ class NextDiT(nn.Module):
         adaln_input = t
 
         cap_feats = cached_invariant(self, "lumina_text_projection", cap_feats, transformer_options,
-                                     lambda: self.cap_embedder(cap_feats), geometry=(x.dtype, x.device))
+                                     lambda: self.cap_embedder(cap_feats), geometry=(x.dtype, x.device),
+                                     dependencies=(self.cap_embedder,))
 
         if self.clip_text_pooled_proj is not None:
             pooled = kwargs.get("clip_text_pooled", None)
