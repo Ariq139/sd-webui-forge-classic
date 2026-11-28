@@ -12,6 +12,7 @@ import torch
 from backend import memory_management, stream, utils
 from backend.args import args, dynamic_args
 from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
+from backend.weight_prefetch import take_prefetched_weight
 from backend.performance import record_region
 
 
@@ -175,8 +176,11 @@ def weights_manual_cast(
     if skip_bias_dtype or bias_has_function:
         bias_args.pop("dtype")
 
+    if layer.weight is not None and not layer.weight_function and not layer.bias_function and fp8_scale is None:
+        weight = take_prefetched_weight(layer, layer.weight, target_device, weight_args.get("dtype"))
+
     needs_offload_transfer = (
-        layer.weight is not None and layer.weight.device != target_device
+        weight is None and layer.weight is not None and layer.weight.device != target_device
         or layer.bias is not None and layer.bias.device != target_device
     )
     if needs_offload_transfer and stream.should_use_stream():
@@ -186,7 +190,7 @@ def weights_manual_cast(
         offload_stream = None
         context = None
 
-    if layer.weight is not None:
+    if layer.weight is not None and weight is None:
         region = "forge::weight_transfer" if layer.weight.device != target_device else "forge::weight_prepare"
         with record_region(region):
             weight = memory_management.cast_to(

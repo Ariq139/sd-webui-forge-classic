@@ -28,6 +28,7 @@ from backend.operations import (
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
 from backend.activation_quantization import shared_activation_scope
+from backend.weight_prefetch import weight_prefetch_scope
 from backend.utils import pad_to_patch_size
 
 BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
@@ -540,23 +541,28 @@ class Anima(nn.Module):
 
         shard = getattr(self, "_anima_shard_devices", None)
 
-        for index, block in enumerate(self.blocks):
-            if shard and index == shard[2]:
-                secondary = shard[1]
-                x_B_T_H_W_D = x_B_T_H_W_D.to(secondary)
-                t_embedding_B_T_D = t_embedding_B_T_D.to(secondary)
-                crossattn_emb = crossattn_emb.to(secondary)
-                for name in ("rope_emb_L_1_1_D", "adaln_lora_B_T_3D", "extra_per_block_pos_emb"):
-                    value = block_kwargs[name]
-                    if value is not None:
-                        block_kwargs[name] = value.to(secondary)
-            with torch.cuda.device(x_B_T_H_W_D.device) if shard else nullcontext():
-                x_B_T_H_W_D = block(
-                    x_B_T_H_W_D,
-                    t_embedding_B_T_D,
-                    crossattn_emb,
-                    **block_kwargs,
-                )
+        with weight_prefetch_scope(x_B_T_H_W_D.device, block_kwargs['transformer_options'], enabled=not shard and not self.training) as prefetch:
+            for index, block in enumerate(self.blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.blocks[index + 1] if index + 1 < len(self.blocks) else None, t_embedding_B_T_D.dtype)
+                if shard and index == shard[2]:
+                    secondary = shard[1]
+                    x_B_T_H_W_D = x_B_T_H_W_D.to(secondary)
+                    t_embedding_B_T_D = t_embedding_B_T_D.to(secondary)
+                    crossattn_emb = crossattn_emb.to(secondary)
+                    for name in ("rope_emb_L_1_1_D", "adaln_lora_B_T_3D", "extra_per_block_pos_emb"):
+                        value = block_kwargs[name]
+                        if value is not None:
+                            block_kwargs[name] = value.to(secondary)
+                with torch.cuda.device(x_B_T_H_W_D.device) if shard else nullcontext():
+                    x_B_T_H_W_D = block(
+                        x_B_T_H_W_D,
+                        t_embedding_B_T_D,
+                        crossattn_emb,
+                        **block_kwargs,
+                    )
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         if shard:
             primary = shard[0]

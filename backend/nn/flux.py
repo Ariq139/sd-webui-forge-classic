@@ -15,6 +15,7 @@ from backend.attention import attention_function
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
+from backend.weight_prefetch import weight_prefetch_scope
 from backend.utils import fp16_fix, pad_to_patch_size
 
 
@@ -527,30 +528,35 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.double_blocks)
         transformer_options["block_type"] = "double"
-        for i, block in enumerate(self.double_blocks):
-            if shard and i == shard[2]:
-                img, txt, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, txt, vec, pe, attn_mask))
-            transformer_options["block_index"] = i
-            if ("double_block", i) in blocks_replace:
+        with weight_prefetch_scope(img.device, transformer_options, enabled=not shard and not patches and not patches_replace and control is None and not self.training) as prefetch:
+            for i, block in enumerate(self.double_blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.double_blocks[i + 1] if i + 1 < len(self.double_blocks) else None, img.dtype)
+                if shard and i == shard[2]:
+                    img, txt, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, txt, vec, pe, attn_mask))
+                transformer_options["block_index"] = i
+                if ("double_block", i) in blocks_replace:
 
-                def block_wrap(args):
-                    out = {}
-                    out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], attn_mask=args.get("attn_mask"), transformer_options=args.get("transformer_options"))
-                    return out
+                    def block_wrap(args):
+                        out = {}
+                        out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], attn_mask=args.get("attn_mask"), transformer_options=args.get("transformer_options"))
+                        return out
 
-                out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
-                txt = out["txt"]
-                img = out["img"]
-            else:
-                with torch.cuda.device(img.device) if shard else nullcontext():
-                    img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                    out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
+                    txt = out["txt"]
+                    img = out["img"]
+                else:
+                    with torch.cuda.device(img.device) if shard else nullcontext():
+                        img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
-            if control is not None:  # Controlnet
-                control_i = control.get("input")
-                if i < len(control_i):
-                    add = control_i[i]
-                    if add is not None:
-                        img[:, : add.shape[1]] += add.to(img.device) if shard else add
+                if control is not None:  # Controlnet
+                    control_i = control.get("input")
+                    if i < len(control_i):
+                        add = control_i[i]
+                        if add is not None:
+                            img[:, : add.shape[1]] += add.to(img.device) if shard else add
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         img = fp16_fix(img)
         img = torch.cat((txt, img), 1)
@@ -562,29 +568,34 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         transformer_options["total_blocks"] = len(self.single_blocks)
         transformer_options["block_type"] = "single"
-        for i, block in enumerate(self.single_blocks):
-            if shard and len(self.double_blocks) + i == shard[2]:
-                img, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, vec, pe, attn_mask))
-            transformer_options["block_index"] = i
-            if ("single_block", i) in blocks_replace:
+        with weight_prefetch_scope(img.device, transformer_options, enabled=not shard and not patches and not patches_replace and control is None and not self.training) as prefetch:
+            for i, block in enumerate(self.single_blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.single_blocks[i + 1] if i + 1 < len(self.single_blocks) else None, img.dtype)
+                if shard and len(self.double_blocks) + i == shard[2]:
+                    img, vec, pe, attn_mask = (_shard_to(v, shard[1]) for v in (img, vec, pe, attn_mask))
+                transformer_options["block_index"] = i
+                if ("single_block", i) in blocks_replace:
 
-                def block_wrap(args):
-                    out = {}
-                    out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], attn_mask=args.get("attn_mask"), transformer_options=args.get("transformer_options"))
-                    return out
+                    def block_wrap(args):
+                        out = {}
+                        out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], attn_mask=args.get("attn_mask"), transformer_options=args.get("transformer_options"))
+                        return out
 
-                out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
-                img = out["img"]
-            else:
-                with torch.cuda.device(img.device) if shard else nullcontext():
-                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
+                    out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attn_mask": attn_mask, "transformer_options": transformer_options}, {"original_block": block_wrap})
+                    img = out["img"]
+                else:
+                    with torch.cuda.device(img.device) if shard else nullcontext():
+                        img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
 
-            if control is not None:  # Controlnet
-                control_o = control.get("output")
-                if i < len(control_o):
-                    add = control_o[i]
-                    if add is not None:
-                        img[:, txt.shape[1] : txt.shape[1] + add.shape[1], ...] += add.to(img.device) if shard else add
+                if control is not None:  # Controlnet
+                    control_o = control.get("output")
+                    if i < len(control_o):
+                        add = control_o[i]
+                        if add is not None:
+                            img[:, txt.shape[1] : txt.shape[1] + add.shape[1], ...] += add.to(img.device) if shard else add
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         img = img[:, txt.shape[1] :, ...]
 

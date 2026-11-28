@@ -15,6 +15,7 @@ from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
+from backend.weight_prefetch import weight_prefetch_scope
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -444,14 +445,19 @@ class NextDiT(nn.Module):
         freqs_cis = freqs_cis.to(x.device)
 
         shard = getattr(self, "_anima_shard_devices", None)
-        for i, layer in enumerate(self.layers):
-            if shard and i == shard[2]:
-                x = x.to(shard[1])
-                mask = mask.to(shard[1]) if mask is not None else None
-                freqs_cis = freqs_cis.to(shard[1])
-                adaln_input = adaln_input.to(shard[1])
-            with torch.cuda.device(x.device) if shard else nullcontext():
-                x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+        with weight_prefetch_scope(x.device, transformer_options, enabled=not shard and not self.training) as prefetch:
+            for i, layer in enumerate(self.layers):
+                if prefetch is not None:
+                    prefetch.stage(self.layers[i + 1] if i + 1 < len(self.layers) else None, x.dtype)
+                if shard and i == shard[2]:
+                    x = x.to(shard[1])
+                    mask = mask.to(shard[1]) if mask is not None else None
+                    freqs_cis = freqs_cis.to(shard[1])
+                    adaln_input = adaln_input.to(shard[1])
+                with torch.cuda.device(x.device) if shard else nullcontext():
+                    x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+                if prefetch is not None:
+                    prefetch.discard(layer)
 
         if shard:
             x, adaln_input = x.to(shard[0]), adaln_input.to(shard[0])
