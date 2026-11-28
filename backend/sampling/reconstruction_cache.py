@@ -9,7 +9,8 @@ def condition_source_key(value, dict_type=dict):
         except RuntimeError:
             # Native inference schedule entries are read-only by contract.
             version = None
-        return (id(value), version, value.device, value.dtype, tuple(value.shape), tuple(value.stride()))
+        return (id(value), version, value.device, value.dtype, value.data_ptr(),
+                tuple(value.shape), tuple(value.stride()))
     if type(value) in (dict, dict_type) and value and value.keys() <= {"crossattn", "vector", "guidance"}:
         fields = tuple((name, condition_source_key(tensor)) for name, tensor in value.items())
         if all(key is not None for _, key in fields):

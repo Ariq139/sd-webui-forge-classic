@@ -20,6 +20,10 @@ _SAFE_OPTIONS = frozenset({"cond_or_uncond", "sigmas", "cond_mark", "cond_indice
 _MIN_HEADROOM = 384 * 1024 * 1024
 
 
+def _gguf_metadata(source):
+    return (source.tensor_type, source.gguf_cls, tuple(source.real_shape), source.baked, source.computation_dtype)
+
+
 class WeightPrefetch:
     def __init__(self, device, budget):
         self.device = device
@@ -85,7 +89,8 @@ class WeightPrefetch:
             if any(not part.is_contiguous() or not part.is_pinned() for part in parts):
                 continue
             try:
-                version = storage if packed == "int8" else TransferSource(source, raw)
+                version = storage if packed == "int8" else TransferSource(
+                    source, raw, _gguf_metadata(source) if packed else ())
             except RuntimeError:
                 continue
             parts = storage.transfer_parts if packed == "int8" else (version.raw,)
@@ -134,7 +139,8 @@ class WeightPrefetch:
         original, version, value, ready, packed, _ = entry
         try:
             valid = (version.matches(source) if packed == "int8"
-                     else version.matches(source, source.data if packed else source))
+                     else original is source and version.matches(
+                         source, source.data if packed else source, _gguf_metadata(source) if packed else ()))
         except RuntimeError:
             valid = False
         incompatible = (dtype not in (None, version.orig_dtype) if packed == "int8"

@@ -84,3 +84,19 @@ def test_sigma_transform_fallback_and_predictor_revision():
         sigma = torch.tensor([0.5, 0.2])
         cache = SigmaTransform(sigma, lambda x: x + 1, True)
         assert cache.value(0) == 1.5 and cache.values is None
+
+
+def test_storage_metadata_changes_reject_prefetch():
+    weight = torch.ones(2, 3)
+    stamp = TransferSource(weight, weight, ("Q4", False))
+    assert stamp.matches(weight, weight, ("Q4", False))
+    assert not stamp.matches(weight, weight, ("Q4", True))
+
+
+def test_condition_key_detects_data_rebind_without_version_change():
+    value = torch.ones(2, 3)
+    old = condition_source_key(value)
+    version = value._version
+    value.data = torch.zeros_like(value)
+    assert value._version == version
+    assert condition_source_key(value) != old

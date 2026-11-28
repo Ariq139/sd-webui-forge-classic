@@ -770,9 +770,12 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 
         ref_latents: list[torch.Tensor] = dynamic_args.ref_latents
 
+        native_geometry = (type(self) is IntegratedFluxTransformer2DModel
+                           and getattr(self.forward_orig, "__func__", None) is _NATIVE_FORWARD_ORIG
+                           and getattr(self.process_img, "__func__", None) is _NATIVE_PROCESS_IMG)
         reference_key = None
         project_refs = False
-        if (ref_latents and type(self) is IntegratedFluxTransformer2DModel
+        if (ref_latents and native_geometry
                 and single_gpu_flag("flux_reference_cache") and invariant_scope_active()
                 and invariants_enabled(self, x, transformer_options) and control is None):
             reference_key = reference_signature(ref_latents)
@@ -844,12 +847,19 @@ class IntegratedFluxTransformer2DModel(nn.Module):
             geometry = None if reference_key is None else (*geometry, reference_key, ref_latents_method, self.ref_index_scale)
         # Preserve custom subclass/extension signatures when neither new path is active.
         extra = {}
+        if native_geometry and invariant_scope_active() and type(self.pe_embedder) is EmbedND:
+            extra["position_geometry"] = geometry
         if project_refs:
             extra["projected_img"] = True
-        if ref_latents and single_gpu_flag("target_only_output_head") and type(self) is IntegratedFluxTransformer2DModel:
+        if ref_latents and native_geometry and single_gpu_flag("target_only_output_head"):
             extra["target_tokens"] = img_tokens
         out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options,
-                                attn_mask=kwargs.get("attention_mask", None), position_geometry=geometry, **extra)
+                                attn_mask=kwargs.get("attention_mask", None), **extra)
         out = out[:, :img_tokens]
 
         return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=self.patch_size, pw=self.patch_size)[:, :, :h_orig, :w_orig]
+
+
+# Preserve the public call contract for subclasses and extension replacements.
+_NATIVE_FORWARD_ORIG = IntegratedFluxTransformer2DModel.forward_orig
+_NATIVE_PROCESS_IMG = IntegratedFluxTransformer2DModel.process_img
