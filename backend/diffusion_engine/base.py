@@ -103,7 +103,8 @@ class ForgeDiffusionEngine:
             return sample.to(x)
 
     @torch.inference_mode()
-    def decode_first_stage(self, x: torch.Tensor, output_device=None):
+    def decode_first_stage_pixels(self, x: torch.Tensor, output_device=None):
+        """Native float32 VAE output in [0, 1], with the public image layout."""
         output_device = x.device if output_device is None else output_device
         sample = self.forge_objects.vae.first_stage_model.process_out(x)
         sample = self.forge_objects.vae.decode(sample, output_device=output_device)
@@ -113,6 +114,12 @@ class ForgeDiffusionEngine:
             sample = sample.movedim(-1, 1)
         else:
             raise RuntimeError(f"Decoded image has unsupported shape {tuple(sample.shape)}")
+        return sample
+
+    @torch.inference_mode()
+    def decode_first_stage(self, x: torch.Tensor, output_device=None):
+        output_device = x.device if output_device is None else output_device
+        sample = self.decode_first_stage_pixels(x, output_device=output_device)
         sample = sample.mul_(2.0).sub_(1.0)
         return sample.to(device=output_device, dtype=x.dtype)
 

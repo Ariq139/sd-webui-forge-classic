@@ -15,6 +15,8 @@ parser.add_argument("--weight-prefetch-mib", type=int, default=0, metavar="MIB",
 parser.add_argument("--fused-denoiser-pointwise", action="store_true", help="Experimentally compile pure denoiser modulation and gated-MLP expressions; may slightly change rounding")
 parser.add_argument("--native-lumina-gqa", action="store_true", help="Use native PyTorch flash grouped-query attention in compatible unmasked Lumina/Z-Image layers")
 parser.add_argument("--direct-full-area-cfg", action="store_true", help="Skip redundant condition copies and unit-weight CFG accumulation for native full-area denoising")
+parser.add_argument("--vae-direct-pixels", action="store_true", help="Use native full VAE float32 pixels directly; avoids latent-dtype rounding and may slightly change output")
+parser.add_argument("--fast-image-postprocess", action="store_true", help="Convert CHW float images directly into contiguous HWC uint8 output")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')
