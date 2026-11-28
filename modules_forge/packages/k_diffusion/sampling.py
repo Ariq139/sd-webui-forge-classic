@@ -9,7 +9,7 @@ from scipy import integrate
 from tqdm.auto import trange
 
 from backend.patcher.base import set_model_options_post_cfg_function
-from backend.single_gpu_fastpaths import SigmaControl
+from backend.single_gpu_fastpaths import AncestralControl, SigmaControl
 
 from . import utils
 
@@ -194,13 +194,14 @@ def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
 
     noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
+    ancestral_control = AncestralControl(sigmas, eta)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
-        sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
+        sigma_down, sigma_up, down_zero = ancestral_control.step(i, get_ancestral_step)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
 
-        if sigma_down == 0:
+        if (down_zero if down_zero is not None else sigma_down == 0):
             x = denoised
         else:
             d = to_d(x, sigmas[i], denoised)
@@ -245,9 +246,10 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)"""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         if s_churn > 0:
-            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.0
+            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if sigma_control.in_range(i, s_tmin, s_tmax) else 0.0
             sigma_hat = sigmas[i] * (gamma + 1)
         else:
             gamma = 0
@@ -262,7 +264,7 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigma_hat, "denoised": denoised})
         dt = sigmas[i + 1] - sigma_hat
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Euler method
             x = x + d * dt
         else:
@@ -280,9 +282,10 @@ def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None,
     """A sampler inspired by DPM-Solver-2 and Algorithm 2 from Karras et al. (2022)"""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         if s_churn > 0:
-            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.0
+            gamma = min(s_churn / (len(sigmas) - 1), 2**0.5 - 1) if sigma_control.in_range(i, s_tmin, s_tmax) else 0.0
             sigma_hat = sigmas[i] * (gamma + 1)
         else:
             gamma = 0
@@ -295,7 +298,7 @@ def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None,
         d = to_d(x, sigma_hat, denoised)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigma_hat, "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Euler method
             dt = sigmas[i + 1] - sigma_hat
             x = x + d * dt
@@ -363,12 +366,14 @@ def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, 
     sigma_fn = lambda t: t.neg().exp()
     t_fn = lambda sigma: sigma.log().neg()
 
+    sigma_control = SigmaControl(sigmas)
+    ancestral_control = AncestralControl(sigmas, eta)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
-        sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
+        sigma_down, sigma_up, down_zero = ancestral_control.step(i, get_ancestral_step)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigma_down == 0:
+        if (down_zero if down_zero is not None else sigma_down == 0):
             # Euler method
             d = to_d(x, sigmas[i], denoised)
             dt = sigma_down - sigmas[i]
@@ -383,7 +388,7 @@ def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, 
             denoised_2 = model(x_2, sigma_fn(s) * s_in, **extra_args)
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_2
         # Noise addition
-        if sigmas[i + 1] > 0:
+        if sigma_control.value(i + 1) > 0:
             x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
     return x
 
@@ -400,6 +405,7 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
 
     # logged_x = x.unsqueeze(0)
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         downstep_ratio = 1 + (sigmas[i + 1] / sigmas[i] - 1) * eta
@@ -410,14 +416,14 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
         # sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Euler method
             d = to_d(x, sigmas[i], denoised)
             dt = sigma_down - sigmas[i]
             x = x + d * dt
         else:
             # DPM-Solver++(2S)
-            if sigmas[i] == 1.0:
+            if sigma_control.value(i) == 1.0:
                 sigma_s = 0.9999
             else:
                 t_i, t_down = lambda_fn(sigmas[i]), lambda_fn(sigma_down)
@@ -433,7 +439,7 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
             x = sigma_down_i_ratio * x + (1 - sigma_down_i_ratio) * D_i
             # print("sigma_i", sigmas[i], "sigma_ip1", sigmas[i+1],"sigma_down", sigma_down, "sigma_down_i_ratio", sigma_down_i_ratio, "sigma_s_i_ratio", sigma_s_i_ratio, "renoise_coeff", renoise_coeff)
         # Noise addition
-        if sigmas[i + 1] > 0 and eta > 0:
+        if sigma_control.value(i + 1) > 0 and eta > 0:
             x = (alpha_ip1 / alpha_down) * x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * renoise_coeff
         # logged_x = torch.cat((logged_x, x.unsqueeze(0)), dim=0)
     return x
@@ -456,11 +462,12 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
     lambda_fn = partial(sigma_to_half_log_snr, model_sampling=model_sampling)
     sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Denoising step
             x = denoised
         else:
@@ -545,11 +552,12 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
     old_denoised = None
     h, h_last = None, None
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Denoising step
             x = denoised
         else:
@@ -597,11 +605,12 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
     denoised_1, denoised_2 = None, None
     h, h_1, h_2 = None, None, None
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Denoising step
             x = denoised
         else:
@@ -678,11 +687,12 @@ def sample_euler_ancestral_cfg_pp(model, x, sigmas, extra_args=None, callback=No
     extra_args["model_options"] = set_model_options_post_cfg_function(model_options, post_cfg_function, disable_cfg1_optimization=True)
 
     s_in = x.new_ones([x.shape[0]])
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             # Denoising step
             x = denoised
         else:
@@ -729,13 +739,14 @@ def sample_dpmpp_2m_cfg_pp(model, x, sigmas, extra_args=None, callback=None, dis
     model_options = extra_args.get("model_options", {}).copy()
     extra_args["model_options"] = set_model_options_post_cfg_function(model_options, post_cfg_function, disable_cfg1_optimization=True)
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
 
         if is_const:
-            if sigmas[i + 1] == 0:
+            if sigma_control.value(i + 1) == 0:
                 x = denoised
             else:
                 t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
@@ -755,7 +766,7 @@ def sample_dpmpp_2m_cfg_pp(model, x, sigmas, extra_args=None, callback=None, dis
         else:
             t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
             h = t_next - t
-            if old_uncond_denoised is None or sigmas[i + 1] == 0:
+            if old_uncond_denoised is None or sigma_control.value(i + 1) == 0:
                 denoised_mix = -torch.exp(-h) * uncond_denoised
             else:
                 h_last = t - t_fn(sigmas[i - 1])
@@ -791,12 +802,14 @@ def res_multistep(model, x, sigmas, extra_args=None, callback=None, disable=None
         model_options = extra_args.get("model_options", {}).copy()
         extra_args["model_options"] = set_model_options_post_cfg_function(model_options, post_cfg_function, disable_cfg1_optimization=True)
 
+    sigma_control = SigmaControl(sigmas)
+    ancestral_control = AncestralControl(sigmas, eta)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
-        sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
+        sigma_down, sigma_up, down_zero = ancestral_control.step(i, get_ancestral_step)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        if sigma_down == 0 or old_denoised is None:
+        if (down_zero if down_zero is not None else sigma_down == 0) or old_denoised is None:
             # Euler method
             if cfg_pp:
                 d = to_d(x, sigmas[i], uncond_denoised)
@@ -822,7 +835,7 @@ def res_multistep(model, x, sigmas, extra_args=None, callback=None, disable=None
                 x = sigma_fn(h) * x + h * (b1 * denoised + b2 * old_denoised)
 
         # Noise addition
-        if sigmas[i + 1] > 0:
+        if sigma_control.value(i + 1) > 0:
             x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
 
         if cfg_pp:
@@ -901,12 +914,13 @@ def sample_er_sde(model, x, sigmas, extra_args=None, callback=None, disable=None
     old_denoised = None
     old_denoised_d = None
 
+    sigma_control = SigmaControl(sigmas)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
         stage_used = min(max_stage, i + 1)
-        if sigmas[i + 1] == 0:
+        if sigma_control.value(i + 1) == 0:
             x = denoised
         else:
             er_lambda_s, er_lambda_t = er_lambdas[i], er_lambdas[i + 1]

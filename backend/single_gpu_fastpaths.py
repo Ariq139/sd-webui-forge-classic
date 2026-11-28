@@ -135,3 +135,42 @@ def version_reference_latents(refs, flag="flux_reference_cache"):
                 ref = ref.clone()
         result.append(ref)
     return result
+
+
+
+def ancestral_coefficients(sigmas, eta):
+    """GPU-side equivalent of the original scalar Python min, including NaNs."""
+    source, target = sigmas[:-1], sigmas[1:]
+    candidate = eta * (target**2 * (source**2 - target**2) / source**2) ** 0.5
+    # min(target, candidate) returns target on ties or unordered comparisons.
+    up = torch.where(candidate < target, candidate, target)
+    down = (target**2 - up**2) ** 0.5
+    return down, up
+
+
+class AncestralControl:
+    def __init__(self, sigmas, eta):
+        self.sigmas = sigmas
+        self.eta = eta
+        self.version = None
+        self.coefficients = None
+        self.zeros = None
+        self.enabled = (single_gpu_flag("static_sigma_control") and type(sigmas) is torch.Tensor
+                        and sigmas.is_cuda and sigmas.ndim == 1 and sigmas.is_floating_point()
+                        and type(eta) in (int, float) and eta > 0)
+
+    def step(self, index, fallback):
+        if self.enabled:
+            try:
+                version = self.sigmas._version
+            except RuntimeError:
+                version = None
+            if version is not None:
+                if self.coefficients is None or version != self.version:
+                    self.coefficients = ancestral_coefficients(self.sigmas, self.eta)
+                    self.zeros = self.coefficients[0].eq(0).cpu().tolist()
+                    self.version = version
+                down, up = self.coefficients
+                return down[index], up[index], self.zeros[index]
+        down, up = fallback(self.sigmas[index], self.sigmas[index + 1], eta=self.eta)
+        return down, up, None

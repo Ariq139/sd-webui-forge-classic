@@ -68,3 +68,31 @@ def test_reference_signature_detects_mutations_and_versions_inference_input(monk
         assert not converted.is_inference()
         assert fast.reference_signature([converted]) is not None
         torch.testing.assert_close(converted, source, rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("eta", [0.5, 1.0, 2.0])
+def test_ancestral_coefficients_match_scalar_reference(dtype, eta):
+    from backend.single_gpu_fastpaths import ancestral_coefficients
+    sigmas = torch.tensor([1.0, 0.73, 0.22, 0.0], dtype=dtype)
+    down, up = ancestral_coefficients(sigmas, eta)
+    for i, (a, b) in enumerate(zip(sigmas[:-1], sigmas[1:])):
+        expected_up = min(b, eta * (b**2 * (a**2 - b**2) / a**2) ** 0.5)
+        expected_down = (b**2 - expected_up**2) ** 0.5
+        torch.testing.assert_close(up[i], expected_up, rtol=0, atol=0)
+        torch.testing.assert_close(down[i], expected_down, rtol=0, atol=0)
+
+
+def test_ancestral_plan_refreshes_after_schedule_mutation(monkeypatch):
+    from backend import single_gpu_fastpaths as fast
+    monkeypatch.setattr(fast, "single_gpu_flag", lambda name: True)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    control = fast.AncestralControl(sigmas, 1.0)
+    control.enabled = True
+    fallback = lambda *a, **kw: pytest.fail("unexpected fallback")
+    down, up, zero = control.step(1, fallback)
+    assert zero and down == 0
+    sigmas[2] = 0.25
+    down, up, zero = control.step(1, fallback)
+    assert not zero and down > 0
