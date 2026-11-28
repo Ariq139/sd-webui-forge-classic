@@ -86,6 +86,10 @@ def invariant_condition(key):
         _CONDITION.reset(token)
 
 
+def invariant_scope_active():
+    return _CACHE.get() is not None and _REVISION.get() is not None
+
+
 def clear_invariants():
     cache = _CACHE.get()
     if cache is not None:

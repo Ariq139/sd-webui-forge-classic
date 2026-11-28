@@ -119,7 +119,7 @@ class ForgeDiffusionEngine:
     @torch.inference_mode()
     def decode_first_stage(self, x: torch.Tensor, output_device=None):
         output_device = x.device if output_device is None else output_device
-        sample = self.decode_first_stage_pixels(x, output_device=output_device)
+        sample = ForgeDiffusionEngine.decode_first_stage_pixels(self, x, output_device=output_device)
         sample = sample.mul_(2.0).sub_(1.0)
         return sample.to(device=output_device, dtype=x.dtype)
 

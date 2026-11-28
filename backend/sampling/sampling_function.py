@@ -30,7 +30,10 @@ from backend.sampling.krea_cache import (
     krea_text_fusion_revision,
 )
 from backend.performance import record_region
-from backend.sampling.invariant_cache import clear_invariants, invariant_condition, invariant_revision
+from backend.sampling.invariant_cache import (
+    cache_dependencies_safe, clear_invariants, invariant_condition,
+    invariant_revision, invariant_scope_active,
+)
 from modules import shared
 
 
@@ -303,11 +306,18 @@ def _native_full_area_cfg(model, x, model_options, condition_cache):
                         ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")))
 
 
+def _standard_condition_fields(fields):
+    return (isinstance(fields, dict) and bool(fields)
+            and fields.keys() <= {"c_crossattn", "y", "guidance"}
+            and all(type(value) in (Condition, ConditionCrossAttn)
+                    and type(value.cond) is torch.Tensor and value.cond.ndim > 0
+                    for value in fields.values()))
+
+
 def _unit_full_area(item, x):
     strength = item.get("strength", 1.0)
-    if (not isinstance(item.get("model_conds"), dict)
-            or any(key in item for key in ("mask", "mask_strength", "batch_indices", "timestep_start",
-                                           "timestep_end", "control", "patches"))
+    if (not _standard_condition_fields(item.get("model_conds"))
+            or item.keys() - {"cross_attn", "pooled_output", "model_conds", "strength", "area"}
             or not isinstance(strength, (int, float)) or strength != 1.0):
         return False
     area = item.get("area")
@@ -528,12 +538,13 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
         name: value.process_cond(batch_size=x.shape[0], device=x.device, area=area, cache=condition_cache)
         for name, value in item["model_conds"].items()
     }
-    if _native_full_area_cfg(model, x, model_options, condition_cache):
-        # The audited native KModel forwards these fields read-only; keep
-        # custom condition subclasses and other inputs on their concat path.
-        c = {name: value.cond if name in ("c_crossattn", "y", "guidance")
-             and type(value) in (Condition, ConditionCrossAttn) else value.concat([])
-             for name, value in conditioning.items()}
+    if (_native_full_area_cfg(model, x, model_options, condition_cache)
+            and _standard_condition_fields(item["model_conds"])
+            and _standard_condition_fields(conditioning)
+            and cache_dependencies_safe(model)):
+        # Do not expose a reused conditioning tensor to extension hooks,
+        # subclasses, or custom condition implementations.
+        c = {name: value.cond for name, value in conditioning.items()}
     else:
         c = cond_cat([conditioning])
     transformer_options = model_options.get("transformer_options", {}).copy()
@@ -553,7 +564,7 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
             invariant_key = candidate
         except TypeError:
             pass
-    krea_key = invariant_key if getattr(args, "invariant_cache_mib", 0) > 0 else None
+    krea_key = invariant_key if invariant_scope_active() else None
     with record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key), krea_text_fusion_condition(krea_key):
         return model.apply_model(x, timestep, **c)
 

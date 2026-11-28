@@ -109,8 +109,11 @@ class JointAttention(nn.Module):
 
         n_rep = self.n_local_heads // self.n_local_kv_heads
         native_gqa = False
-        if (n_rep > 1 and getattr(args, "native_lumina_gqa", False)
-                and xq.is_cuda and x_mask is None and attention_function is attention_pytorch
+        if (n_rep > 1 and self.n_local_heads % self.n_local_kv_heads == 0
+                and getattr(args, "native_lumina_gqa", False)
+                and xq.is_cuda and xq.dtype == xk.dtype == xv.dtype
+                and xq.device == xk.device == xv.device
+                and x_mask is None and attention_function is attention_pytorch
                 and "optimized_attention_override" not in transformer_options
                 and not any(getattr(args, key, None) is not None
                             for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):

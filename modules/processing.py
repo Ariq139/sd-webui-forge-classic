@@ -27,7 +27,7 @@ import modules.shared as shared
 from backend import args, memory_management
 from backend.logging import setup_logger
 from backend.performance import record_region
-from backend.image_postprocessing import chw_to_uint8
+from backend.image_postprocessing import can_decode_direct_pixels, chw_to_uint8
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
 from modules.latent_retention import retain_latents, scripts_require_latents
@@ -1298,13 +1298,12 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                     p.extra_generation_params["VAE Decoder"] = opts.sd_vae_decode_method
                 if (getattr(backend_args, "vae_direct_pixels", False)
                         and opts.sd_vae_decode_method == "Full"
-                        and not (state.interrupted and opts.live_preview_fast_interrupt)
-                        and isinstance(samples_ddim, torch.Tensor)
+                        and not (state.interrupted or state.skipped or state.stopping_generation)
                         and not any(getattr(backend_args, key, None) is not None for key in
                                     ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
                     from backend.diffusion_engine.base import ForgeDiffusionEngine
-                    direct_pixels = (getattr(p.sd_model.decode_first_stage, "__func__", None)
-                                     is ForgeDiffusionEngine.decode_first_stage)
+                    from backend.patcher.vae import VAE
+                    direct_pixels = can_decode_direct_pixels(p.sd_model, samples_ddim, ForgeDiffusionEngine, VAE)
                 if direct_pixels:
                     with record_region("forge::vae_direct_pixels"):
                         x_samples_ddim = p.sd_model.decode_first_stage_pixels(samples_ddim, output_device=devices.cpu)

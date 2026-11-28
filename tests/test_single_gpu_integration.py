@@ -214,7 +214,7 @@ def test_krea_cfg1_direct_path_carries_namespaced_condition_key():
     sigma = torch.ones(1)
     text = torch.ones(1, 2, 3)
     with (torch.no_grad(), sampling_krea_cache_scope("test"), krea_text_fusion_revision("r1"),
-          mock.patch.object(sf.args, "invariant_cache_mib", 32, create=True)):
+          sampling_invariant_scope(1024 * 1024), invariant_revision("r1")):
         condition_cache = {}
         for _ in range(2):
             cond = compile_conditions(text, cache_namespace="positive")
@@ -262,3 +262,17 @@ def test_gguf_forced_cast_does_not_bypass_legacy_lora_merge():
     validate.assert_not_called()
     packed.assert_not_called()
     assert not cast.call_args.kwargs["skip_weight_functions"]
+
+def test_full_area_cfg_rejects_custom_conditions_and_unknown_fields():
+    from backend.sampling.condition import Condition, ConditionCrossAttn
+
+    class CustomCondition(ConditionCrossAttn):
+        pass
+
+    x = torch.zeros(1, 4, 8, 8)
+    text = torch.ones(1, 2, 3)
+    standard = compile_conditions(text)[0]
+    assert sf._unit_full_area(standard, x)
+    assert not sf._unit_full_area(dict(standard, custom_option=True), x)
+    assert not sf._unit_full_area(dict(standard, model_conds={"c_crossattn": CustomCondition(text)}), x)
+    assert not sf._unit_full_area(dict(standard, model_conds={"c_crossattn": Condition(text), "extra": Condition(text)}), x)
