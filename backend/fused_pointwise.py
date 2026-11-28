@@ -32,6 +32,25 @@ def can_fuse_silu(module, x):
             and not torch.nn.modules.module._global_forward_pre_hooks)
 
 
+def _device_failure(error):
+    # Compiler wrappers can hide asynchronous device failures or OOM in an
+    # inner exception. Do not convert those into an eager retry.
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        message = str(current).lower()
+        if (isinstance(current, torch.OutOfMemoryError)
+                or any(marker in message for marker in ("out of memory", "cuda error",
+                       "device-side assert", "illegal memory access", "cublas_status", "cudnn_status"))):
+            return True
+        pending.extend((current.__cause__, current.__context__, getattr(current, "inner_exception", None)))
+    return False
+
+
 def _run(fn, x, *others):
     if not fusion_enabled(x) or fn in _FAILED:
         return fn(x, *others)
@@ -41,7 +60,7 @@ def _run(fn, x, *others):
     except (TorchDynamoException, ImportError) as error:
         # A missing/unsupported compiler is not a reason to change the
         # numerical expression or intercept an actual device-memory error.
-        if "out of memory" in str(error).lower():
+        if _device_failure(error):
             raise
         _FAILED.add(fn)
         logger.warning("Pointwise compilation unavailable for %s; using eager: %s",

@@ -249,16 +249,14 @@ def main_stream_worker(weight, bias, offload_stream: tuple[torch.Stream, torch.T
 
 @contextlib.contextmanager
 def _main_stream_worker_offload(weight, bias, offload_stream):
-    yield
-    os, weight_a, bias_a = offload_stream
-    if weight_a is not None:
-        device = weight_a.device
-    elif bias_a is not None:
-        device = bias_a.device
-    else:
-        return
-    with record_region("forge::weight_transfer_wait"):
-        os.wait_stream(memory_management.current_stream(device))
+    try:
+        yield
+    finally:
+        os, weight_a, bias_a = offload_stream
+        source = weight_a if weight_a is not None else bias_a
+        if source is not None:
+            with record_region("forge::weight_transfer_wait"):
+                os.wait_stream(memory_management.current_stream(source.device))
 
 
 current_device: torch.device = None
@@ -535,7 +533,9 @@ class ForgeOperationsGGUF(ForgeOperations):
                 self.weight = utils.tensor2parameter(self.weight.to(x.dtype))
 
             activation_loras = None
-            if args.activation_space_lora and self.weight is not None and len(self.weight.shape) == 2:
+            if (args.activation_space_lora and self.weight is not None and len(self.weight.shape) == 2
+                    and not getattr(self, "forge_force_cast_weights", False)
+                    and not isinstance(x, QuantizedTensor)):
                 activation_loras = activation_space_lora_patches(
                     self.weight_function, self.bias_function, self.weight.shape[1], self.weight.shape[0])
             base_only = not self.weight_function or activation_loras is not None
@@ -569,13 +569,12 @@ class ForgeOperationsGGUF(ForgeOperations):
                     self, x, weight_fn=lambda value: value, skip_weight_dtype=True, skip_bias_dtype=True,
                     skip_weight_functions=activation_loras is not None
                 )
-                fast_output = try_llamacpp_cuda_linear(weight, x, bias)
-                if fast_output is not None:
-                    with main_stream_worker(weight, bias, signal):
-                        return apply_activation_space_lora(fast_output, x, activation_loras)
-                with record_region("forge::gguf_dequantize_fallback"):
-                    weight = dequantize_tensor(weight, input=x) if args.enable_triton_backend else dequantize_tensor(weight)
                 with main_stream_worker(weight, bias, signal):
+                    fast_output = try_llamacpp_cuda_linear(weight, x, bias)
+                    if fast_output is not None:
+                        return apply_activation_space_lora(fast_output, x, activation_loras)
+                    with record_region("forge::gguf_dequantize_fallback"):
+                        weight = dequantize_tensor(weight, input=x) if args.enable_triton_backend else dequantize_tensor(weight)
                     output = torch.nn.functional.linear(x, weight, bias)
                     return apply_activation_space_lora(output, x, activation_loras)
 

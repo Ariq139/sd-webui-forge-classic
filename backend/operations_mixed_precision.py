@@ -8,7 +8,7 @@ from backend import memory_management
 from backend.args import args as cli_args
 from backend.memory_management import cast_to_device, logger
 from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
-from backend.activation_quantization import quantize_shared_activation
+from backend.activation_quantization import quantize_shared_activation, try_shared_int8_linear
 from backend.performance import record_region
 
 from .operations import (
@@ -404,7 +404,17 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     with record_region(region):
                         if self._full_precision_mm and isinstance(weight, QuantizedTensor):
                             weight = weight.dequantize()
-                        output = torch.nn.functional.linear(input, weight, bias)
+                        output = None
+                        if (weight_only_quant and getattr(cli_args, "shared_activation_quantization", False)
+                                and isinstance(weight, QuantizedTensor) and weight._layout_cls == "TensorWiseINT8Layout"
+                                and getattr(weight._params, "is_weight", True)
+                                and getattr(weight._params, "convrot_groupsize", 256) == 256):
+                            raw_weight, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+                            output = try_shared_int8_linear(input, raw_weight, scale, bias,
+                                                            convrot=getattr(weight._params, "convrot", False),
+                                                            transposed=getattr(weight._params, "transposed", False))
+                        if output is None:
+                            output = torch.nn.functional.linear(input, weight, bias)
 
                 if reshaped_nd:
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
