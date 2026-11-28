@@ -26,7 +26,7 @@ from backend.operations import (
     weights_manual_cast,
 )
 from backend.quant_ops import ck
-from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
+from backend.sampling.invariant_cache import cached_invariant, invariants_enabled, call_native_with_options
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import norm_affine
@@ -498,7 +498,14 @@ class Anima(nn.Module):
         x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).expand(-1, -1, x_B_C_T_H_W.shape[2], -1, -1)], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
-        return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device, transformer_options=transformer_options), None
+        # Invoke the module (not forward directly) to preserve hooks and dispatch.
+        if (type(self.pos_embedder) is VideoRopePosition3DEmb
+                and getattr(self.pos_embedder.forward, "__func__", None) is _NATIVE_ANIMA_POSITION_FORWARD
+                and invariants_enabled(self.pos_embedder, x_B_T_H_W_D, transformer_options)):
+            positions = self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device, transformer_options=transformer_options)
+        else:
+            positions = self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device)
+        return x_B_T_H_W_D, positions, None
 
     def unpatchify(self, x_B_T_H_W_M: torch.Tensor) -> torch.Tensor:
         x_B_C_Tt_Hp_Wp = rearrange(
@@ -523,7 +530,9 @@ class Anima(nn.Module):
         timesteps_B_T = timesteps
         crossattn_emb = context
 
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_None = self.prepare_embedded_sequence(x_B_C_T_H_W, padding_mask=padding_mask, transformer_options=kwargs.get("transformer_options", {}))
+        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_None = call_native_with_options(
+            self.prepare_embedded_sequence, _NATIVE_ANIMA_PREPARE, x_B_C_T_H_W,
+            padding_mask=padding_mask, transformer_options=kwargs.get("transformer_options", {}))
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
@@ -736,3 +745,7 @@ class LLMAdapter(nn.Module):
         for block in self.blocks:
             x = block(x, context, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings_context)
         return self.norm(self.out_proj(x))
+
+
+_NATIVE_ANIMA_PREPARE = Anima.prepare_embedded_sequence
+_NATIVE_ANIMA_POSITION_FORWARD = VideoRopePosition3DEmb.forward

@@ -20,7 +20,7 @@ from backend.fused_pointwise import silu_gate, norm_affine, can_fuse_silu
 from backend.utils import fp16_fix, pad_to_patch_size
 from backend.single_gpu_fastpaths import dense_tokenwise_head, reference_signature, single_gpu_flag
 from backend.sampling.invariant_cache import invariant_scope_active, retain_reference_sources, invariants_enabled
-from backend.sampling.invariant_cache import cache_dependencies_safe
+from backend.sampling.invariant_cache import cache_dependencies_safe, native_bound_method
 from backend.operations_mixed_precision import try_native_int8_input_act
 from backend.gate_up_packing import try_packed_gate_up
 from backend.segmented_int8 import try_segmented_int8_linear
@@ -122,15 +122,24 @@ class YakMLP(nn.Module):
         return down_proj
 
 
+_NATIVE_SEQUENTIAL_FORWARD = nn.Sequential.forward
+_NATIVE_GELU_FORWARD = nn.GELU.forward
+_NATIVE_SILU_FORWARD = nn.SiLU.forward
+
+
 def run_native_mlp(module, x):
     if (not single_gpu_flag("native_int8_mlp_activation")
             or type(module) is not nn.Sequential or len(module) != 3
+            or not native_bound_method(module.forward, _NATIVE_SEQUENTIAL_FORWARD)
             or not cache_dependencies_safe(module)):
         return module(x)
     act = module[1]
-    if type(act) is SiLUActivation and type(act.gate_fn) is nn.SiLU and not act.gate_fn.inplace:
+    if (type(act) is SiLUActivation and native_bound_method(act.forward, _NATIVE_SILU_ACTIVATION_FORWARD)
+            and type(act.gate_fn) is nn.SiLU and not act.gate_fn.inplace
+            and native_bound_method(act.gate_fn.forward, _NATIVE_SILU_FORWARD)):
         kind = "swiglu"
-    elif type(act) is nn.GELU and act.approximate == "tanh":
+    elif (type(act) is nn.GELU and act.approximate == "tanh"
+          and native_bound_method(act.forward, _NATIVE_GELU_FORWARD)):
         kind = "gelu_tanh"
     else:
         return module(x)
@@ -870,3 +879,5 @@ class IntegratedFluxTransformer2DModel(nn.Module):
 # Preserve the public call contract for subclasses and extension replacements.
 _NATIVE_FORWARD_ORIG = IntegratedFluxTransformer2DModel.forward_orig
 _NATIVE_PROCESS_IMG = IntegratedFluxTransformer2DModel.process_img
+
+_NATIVE_SILU_ACTIVATION_FORWARD = SiLUActivation.forward

@@ -110,6 +110,7 @@ def invariants_enabled(module, tensor, options):
     return (_CACHE.get() is not None and _REVISION.get() is not None
             and _CONDITION.get() is not None and not torch.is_grad_enabled()
             and isinstance(tensor, torch.Tensor) and not module.training
+            and not any(name in vars(module) for name in ("forward", "_forward", "_call_impl"))
             and not module._forward_hooks and not module._forward_pre_hooks
             and not torch.nn.modules.module._global_forward_hooks
             and not torch.nn.modules.module._global_forward_pre_hooks
@@ -117,11 +118,24 @@ def invariants_enabled(module, tensor, options):
             and isinstance(options, dict) and options.keys() <= _SAFE_OPTIONS)
 
 
+def native_bound_method(method, original):
+    """Reject instance replacements and class methods changed since import."""
+    return getattr(method, "__func__", None) is original
+
+
+def call_native_with_options(method, original, *args, transformer_options, **kwargs):
+    """Keep the legacy call shape unless the audited sampling path is active."""
+    if invariant_scope_active() and native_bound_method(method, original):
+        kwargs["transformer_options"] = transformer_options
+    return method(*args, **kwargs)
+
+
 def cache_dependencies_safe(*dependencies):
     """Do not skip a module whose forward may be externally observable."""
     if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
         return False
     return all(not child.training and not child._forward_hooks and not child._forward_pre_hooks
+               and not any(name in vars(child) for name in ("forward", "_forward", "_call_impl"))
                for dependency in dependencies if dependency is not None
                for child in dependency.modules())
 

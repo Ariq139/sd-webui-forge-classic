@@ -74,18 +74,18 @@ class CFGDenoiser(torch.nn.Module):
         return schedule[0]
 
     @classmethod
-    def _cond_cache_key(cls, cond, step):
+    def _cond_cache_key(cls, cond, step, *, native_only=False):
         if cond is None:
             return None
         keys = tuple(condition_source_key(cls._selected_schedule_entry(schedule, step).cond,
-                                          prompt_parser.DictWithShape) for schedule in cond)
+                                          prompt_parser.DictWithShape, native_only=native_only) for schedule in cond)
         return keys if all(key is not None for key in keys) else None
 
     @classmethod
-    def _multicond_cache_key(cls, cond, step):
+    def _multicond_cache_key(cls, cond, step, *, native_only=False):
         keys = tuple(
             tuple((condition_source_key(cls._selected_schedule_entry(item.schedules, step).cond,
-                                        prompt_parser.DictWithShape), item.weight) for item in batch)
+                                        prompt_parser.DictWithShape, native_only=native_only), item.weight) for item in batch)
             for batch in cond.batch
         )
         return keys if all(key is not None and type(weight) in (int, float)
@@ -166,6 +166,8 @@ class CFGDenoiser(torch.nn.Module):
         eligible = False
         if (single_gpu_flag("conditioning_reconstruction_cache") and cond_cache_key is not None
                 and (uncond is None or uncond_cache_key is not None)
+                and self._multicond_cache_key(cond, self.step, native_only=True) is not None
+                and (uncond is None or self._cond_cache_key(uncond, self.step, native_only=True) is not None)
                 and self.mask is None and not torch.is_grad_enabled()
                 and not any(script_callbacks.callback_map.get(key) for key in
                             ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))

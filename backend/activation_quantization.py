@@ -12,6 +12,39 @@ from backend.performance import record_region
 _ACTIVE = ContextVar("forge_shared_activation_quantization", default=None)
 _NATIVE_CACHE = object()
 _DESTINATIONS = object()
+MAX_SHARED_BYTES = 32 * 1024**2
+_MIN_HEADROOM = 384 * 1024**2
+
+
+def _storage_bytes(value):
+    if type(value) is torch.Tensor:
+        return value.untyped_storage().nbytes()
+    if type(value) is tuple:
+        sizes = [_storage_bytes(part) for part in value]
+        return sum(sizes) if all(size is not None for size in sizes) else None
+    if (type(value).__name__ == "QuantizedTensor"
+            and getattr(value, "_layout_cls", None) == "TensorWiseINT8Layout"):
+        return _storage_bytes((value._qdata, value._params.scale))
+    return None
+
+
+def _retained_bytes(cache, *, include_native=True):
+    values = [value for key, value in cache.items() if key not in (_NATIVE_CACHE, _DESTINATIONS)]
+    if include_native:
+        values.extend(cache.get(_NATIVE_CACHE, {}).values())
+    sizes = [_storage_bytes(value) for value in values]
+    return sum(sizes) if all(size is not None for size in sizes) else MAX_SHARED_BYTES
+
+
+def _can_retain(cache, source, size):
+    return (size is not None and size > 0 and _retained_bytes(cache) + size <= MAX_SHARED_BYTES
+            and (not source.is_cuda or torch.cuda.mem_get_info(source.device)[0] >= _MIN_HEADROOM + size))
+
+
+def _retain(cache, source, key, value):
+    if _can_retain(cache, source, _storage_bytes(value)):
+        cache[key] = value
+    return value
 
 
 @contextmanager
@@ -24,6 +57,7 @@ def shared_activation_scope(source, modules=()):
                and not torch.nn.modules.module._global_forward_hooks
                and not torch.nn.modules.module._global_forward_pre_hooks
                and not any(m.training or m._forward_hooks or m._forward_pre_hooks
+                           or any(name in vars(m) for name in ("forward", "_forward", "_call_impl"))
                            or getattr(m, "weight_function", None) or getattr(m, "bias_function", None)
                            for m in modules)
                and not any(getattr(args, key, None) is not None
@@ -61,13 +95,14 @@ def quantize_shared_activation(source, reshaped, layout, scale, quantize):
     if (active is None or active[0] is not source
             or layout != "TensorWiseINT8Layout" or scale is not None):
         return quantize(reshaped, layout, scale=scale)
-    key = (layout, source.dtype, source.device, tuple(reshaped.shape), tuple(reshaped.stride()), _source_version(source))
-    if key not in active[1]:
-        active[1][key] = quantize(reshaped, layout, scale=scale)
-    else:
+    stream = torch.cuda.current_stream(source.device).cuda_stream if source.is_cuda else None
+    key = (layout, stream, source.data_ptr(), source.dtype, source.device,
+           tuple(reshaped.shape), tuple(reshaped.stride()), _source_version(source))
+    if key in active[1]:
         with record_region("forge::shared_activation_quantization_hit"):
             return active[1][key]
-    return active[1][key]
+    value = quantize(reshaped, layout, scale=scale)
+    return _retain(active[1], source, key, value)
 
 
 @lru_cache(maxsize=1)
@@ -91,12 +126,15 @@ def _eager_linear_from_shared_rows(source, weight, weight_scale, bias, cache, qu
     The native/triton implementations are deliberately not replaced.
     """
     flat = source.reshape(-1, source.shape[-1])
-    key = ("eager_int8_rows", stream_key, _source_version(source), source.dtype,
+    key = ("eager_int8_rows", stream_key, _source_version(source), source.data_ptr(), source.dtype,
            source.device, tuple(source.shape), tuple(source.stride()))
     rows = cache.get(key)
     if rows is None:
+        estimated = flat.numel() + flat.shape[0] * 4
+        if not _can_retain(cache, source, estimated):
+            return None  # Ordinary INT8 dispatch remains authoritative under pressure.
         rows = quantize(flat)
-        cache[key] = rows
+        _retain(cache, source, key, rows)
     else:
         with record_region("forge::shared_int8_rowwise_hit"):
             pass
@@ -158,7 +196,8 @@ def try_shared_int8_linear(source, weight, weight_scale, bias, *, convrot=False,
         with record_region("forge::shared_int8_cuda_linear"):
             destinations = active[1].get(_DESTINATIONS)
             return try_native_cutlass(source, weight, weight_scale, bias, convrot, native_cache, cuda,
-                                      destination_factory=None if destinations is None else lambda: destinations.take(module))
+                                      destination_factory=None if destinations is None else lambda: destinations.take(module),
+                                      budget=max(0, MAX_SHARED_BYTES - _retained_bytes(active[1], include_native=False)))
     if selected != "eager" or convrot:
         return None
     with record_region("forge::shared_int8_eager_linear"):

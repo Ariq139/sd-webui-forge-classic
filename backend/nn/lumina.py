@@ -14,7 +14,7 @@ from backend.args import args
 from backend.nn.flux import EmbedND
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
-from backend.sampling.invariant_cache import cached_invariant
+from backend.sampling.invariant_cache import cached_invariant, invariants_enabled, native_bound_method
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
@@ -25,6 +25,9 @@ from backend.native_gqa import try_flash_gqa
 from backend.gate_up_packing import try_packed_gate_up
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
+
+
+_NATIVE_ROPE_FORWARD = EmbedND.forward
 
 
 def modulate(x, scale):
@@ -430,14 +433,23 @@ class NextDiT(nn.Module):
                 x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
 
         position_ids = torch.cat((cap_pos_ids, x_pos_ids), dim=1)
-        geometry = (H_tokens, W_tokens, cap_pos_ids.shape[1], self.pad_tokens_multiple,
-                    tuple(self.rope_embedder.axes_dim), self.rope_embedder.theta, dtype)
-        freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
-                                    lambda: self.rope_embedder(position_ids).movedim(1, 2).to(dtype),
-                                    geometry=geometry, geometry_only=True)
-        packed_rope_hook = getattr(self, "_forge_packed_rope_hook", None)
-        if packed_rope_hook is not None and single_gpu_flag("nunchaku_rope_cache"):
-            packed_rope_hook.bind_geometry(self, freqs_cis, geometry, transformer_options)
+        geometry = None
+
+        def compute_rope():
+            return self.rope_embedder(position_ids).movedim(1, 2).to(dtype)
+
+        if (type(self.rope_embedder) is EmbedND
+                and native_bound_method(self.rope_embedder.forward, _NATIVE_ROPE_FORWARD)
+                and invariants_enabled(self.rope_embedder, position_ids, transformer_options)):
+            geometry = (H_tokens, W_tokens, cap_pos_ids.shape[1], self.pad_tokens_multiple,
+                        tuple(self.rope_embedder.axes_dim), self.rope_embedder.theta, dtype)
+            freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
+                                        compute_rope, geometry=geometry, geometry_only=True)
+            packed_rope_hook = getattr(self, "_forge_packed_rope_hook", None)
+            if packed_rope_hook is not None and single_gpu_flag("nunchaku_rope_cache"):
+                packed_rope_hook.bind_geometry(self, freqs_cis, geometry, transformer_options)
+        else:
+            freqs_cis = compute_rope()
 
         def refine_context():
             features = cap_feats
@@ -446,7 +458,7 @@ class NextDiT(nn.Module):
             return features
 
         # A dynamic mask can alter the context-refiner output; do not cache it.
-        if cap_mask is None:
+        if cap_mask is None and geometry is not None:
             cap_feats = cached_invariant(self, "lumina_context_refiner", cap_feats, transformer_options,
                                          refine_context, geometry=geometry, dependencies=(self.context_refiner,))
         else:

@@ -44,15 +44,16 @@ def row_key(source, convrot, stream):
             source.device, tuple(source.shape), tuple(source.stride()))
 
 
-def shared_rows(source, convrot, stream, cache, quantize):
+def shared_rows(source, convrot, stream, cache, quantize, *, budget=None):
     key = row_key(source, convrot, stream)
     if key in cache:
         return cache[key]
     m = source.numel() // source.shape[-1]
     size = source.numel() + 4 * m
-    if size > MAX_ROW_BYTES or (cache and size + sum(
+    budget = MAX_ROW_BYTES if budget is None else min(budget, MAX_ROW_BYTES)
+    if size > budget or (cache and size + sum(
             q.numel() * q.element_size() + s.numel() * s.element_size()
-            for q, s in cache.values()) > MAX_ROW_BYTES):
+            for q, s in cache.values()) > budget):
         return None
     value = quantize(source.reshape(m, source.shape[-1]), convrot)
     cache[key] = value
@@ -106,7 +107,7 @@ def cutlass_rows(source, weight, scale, bias, rows, cuda, *, destination_factory
     return out.reshape(*source.shape[:-1], n) if used else None
 
 
-def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, destination_factory=None):
+def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, destination_factory=None, budget=None):
     if (not source.is_cuda or source.dtype not in (torch.float16, torch.bfloat16)
             or not source.is_contiguous() or source.data_ptr() % 16 or weight.data_ptr() % 16):
         return None
@@ -122,7 +123,7 @@ def try_native_cutlass(source, weight, scale, bias, convrot, cache, cuda, *, des
         return None
     stream = torch.cuda.current_stream(source.device).cuda_stream
     rows = shared_rows(source, convrot, stream, cache,
-                       lambda x, rotated: _native_rows(cuda, x, rotated, stream))
+                       lambda x, rotated: _native_rows(cuda, x, rotated, stream), budget=budget)
     if rows is None:
         return None
     out = cutlass_rows(source, weight, scale, bias, rows, cuda, destination_factory=destination_factory)

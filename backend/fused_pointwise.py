@@ -28,6 +28,7 @@ def fusion_enabled(x):
 def can_fuse_silu(module, x):
     return (fusion_enabled(x) and type(module) is torch.nn.SiLU and not module.inplace
             and not module._forward_hooks and not module._forward_pre_hooks
+            and not any(name in vars(module) for name in ("forward", "_forward", "_call_impl"))
             and not torch.nn.modules.module._global_forward_hooks
             and not torch.nn.modules.module._global_forward_pre_hooks)
 
@@ -118,6 +119,7 @@ def _resident_native_norm(norm, x, rms):
     if (type(norm) not in supported or getattr(norm, "add", False)
             or getattr(norm, "weight_function", None) or getattr(norm, "bias_function", None)
             or norm._forward_hooks or norm._forward_pre_hooks
+            or any(name in vars(norm) for name in ("forward", "_forward", "_call_impl"))
             or torch.nn.modules.module._global_forward_hooks
             or torch.nn.modules.module._global_forward_pre_hooks):
         return False

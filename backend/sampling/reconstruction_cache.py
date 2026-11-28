@@ -2,7 +2,7 @@
 import torch
 
 
-def condition_source_key(value, dict_type=dict):
+def condition_source_key(value, dict_type=dict, *, native_only=True):
     if type(value) is torch.Tensor:
         try:
             version = value._version
@@ -11,8 +11,15 @@ def condition_source_key(value, dict_type=dict):
             version = None
         return (id(value), version, value.device, value.dtype, value.data_ptr(),
                 tuple(value.shape), tuple(value.stride()))
-    if type(value) in (dict, dict_type) and value and value.keys() <= {"crossattn", "vector", "guidance"}:
+    if (type(value) in (dict, dict_type) and value
+            and all(type(name) is str and type(tensor) is torch.Tensor for name, tensor in value.items())
+            and (not native_only or value.keys() <= {"crossattn", "vector", "guidance"})):
+        # Additional plain, versioned tensor fields are safe identities for the
+        # existing device cache, but not admission to native reconstruction.
         fields = tuple((name, condition_source_key(tensor)) for name, tensor in value.items())
+        if any(name not in {"crossattn", "vector", "guidance"} and key[1] is None
+               for name, key in fields):
+            return None
         if all(key is not None for _, key in fields):
             return (id(value), fields)
     return None

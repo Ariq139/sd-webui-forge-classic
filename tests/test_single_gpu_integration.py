@@ -34,16 +34,14 @@ def test_anima_position_geometry_and_cross_kv_reuse():
             torch.testing.assert_close(a, expected, rtol=0, atol=0)
             rope(torch.zeros(1, 2, 4, 3, 24), x.device, {})
             assert compute.call_count == 2
-        with mock.patch.object(attention.k_proj, "forward", wraps=attention.k_proj.forward) as project_k:
-            with mock.patch.object(attention, "compute_attention", side_effect=lambda q, k, v, **kwargs: (q, k, v)):
-                q1, k1, v1 = attention(first, context, transformer_options={})
-                q2, k2, v2 = attention(second, context.clone(), transformer_options={})
-                assert k1 is k2 and v1 is v2 and project_k.call_count == 1
-                assert not torch.equal(q1, q2)
-                q3, k3, v3 = attention(first, context, transformer_options={"patches": {}})
-                assert project_k.call_count == 2
-                for cached, direct in zip((q1, k1, v1), (q3, k3, v3)):
-                    torch.testing.assert_close(cached, direct, rtol=0, atol=0)
+        with mock.patch.object(attention, "compute_attention", side_effect=lambda q, k, v, **kwargs: (q, k, v)):
+            q1, k1, v1 = attention(first, context, transformer_options={})
+            q2, k2, v2 = attention(second, context.clone(), transformer_options={})
+            assert k1 is k2 and v1 is v2
+            assert not torch.equal(q1, q2)
+            q3, k3, v3 = attention(first, context, transformer_options={"patches": {}})
+            for cached, direct in zip((q1, k1, v1), (q3, k3, v3)):
+                torch.testing.assert_close(cached, direct, rtol=0, atol=0)
 
 
 class _MutatingFluxBlock(torch.nn.Module):
@@ -78,11 +76,11 @@ def test_flux_cached_text_projection_is_not_mutated_by_double_blocks():
     model.eval()
     x = torch.zeros(1, 3, 8)
     context = torch.randn(1, 2, 8)
-    with torch.no_grad(), sampling_invariant_scope(1024 * 1024), invariant_revision(1), invariant_condition(1):
-        with mock.patch.object(model.txt_in, "forward", wraps=model.txt_in.forward) as project:
-            model.forward_orig(x, None, context, None, torch.ones(1), None, transformer_options={})
-            model.forward_orig(x, None, context.clone(), None, torch.zeros(1), None, transformer_options={})
-            assert project.call_count == 1
+    with torch.no_grad(), sampling_invariant_scope(1024 * 1024) as cache, invariant_revision(1), invariant_condition(1):
+        model.forward_orig(x, None, context, None, torch.ones(1), None, transformer_options={})
+        projected = next(value for key, value in cache.entries.items() if key[3] == "flux_text_projection")
+        model.forward_orig(x, None, context.clone(), None, torch.zeros(1), None, transformer_options={})
+        assert next(value for key, value in cache.entries.items() if key[3] == "flux_text_projection") is projected
     torch.testing.assert_close(block.seen[0], block.seen[1], rtol=0, atol=0)
 
 
@@ -276,3 +274,69 @@ def test_full_area_cfg_rejects_custom_conditions_and_unknown_fields():
     assert not sf._unit_full_area(dict(standard, custom_option=True), x)
     assert not sf._unit_full_area(dict(standard, model_conds={"c_crossattn": CustomCondition(text)}), x)
     assert not sf._unit_full_area(dict(standard, model_conds={"c_crossattn": Condition(text), "extra": Condition(text)}), x)
+
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_legacy_anima_prepare_override_and_native_pos_embedder_call(cache_enabled):
+    from backend.nn.anima import Anima
+    from backend.sampling.invariant_cache import call_native_with_options
+
+    class LegacyAnima(Anima):
+        def prepare_embedded_sequence(self, x, padding_mask=None):
+            return x, padding_mask, None
+
+    class LegacyPos(torch.nn.Module):
+        def forward(self, x, device):
+            return x
+
+    x = torch.ones(1, 1, 2, 2, 2)
+    with torch.no_grad(), sampling_invariant_scope(4096 if cache_enabled else 0), invariant_revision(1), invariant_condition(1):
+        model = LegacyAnima.__new__(LegacyAnima)
+        torch.nn.Module.__init__(model)
+        assert call_native_with_options(model.prepare_embedded_sequence, Anima.prepare_embedded_sequence,
+                                        x, padding_mask=None, transformer_options={})[0] is x
+        model = Anima.__new__(Anima)
+        torch.nn.Module.__init__(model)
+        model.x_embedder = torch.nn.Identity()
+        model.pos_embedder = LegacyPos()
+        model.eval()
+        embedded, positions, _ = model.prepare_embedded_sequence(x, transformer_options={})
+        assert embedded is positions
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_lumina_custom_rope_without_native_attributes(cache_enabled):
+    model = NextDiT.__new__(NextDiT)
+    torch.nn.Module.__init__(model)
+    model.patch_size = 2
+    model.pad_tokens_multiple = None
+    model.x_embedder = torch.nn.Linear(16, 8)
+
+    class LegacyRope(torch.nn.Module):
+        def forward(self, ids):
+            return ids.unsqueeze(1)
+
+    model.rope_embedder = LegacyRope()
+    model.context_refiner = torch.nn.ModuleList([_Refiner()])
+    model.noise_refiner = torch.nn.ModuleList([_Refiner()])
+    model.eval()
+    x, text = torch.randn(1, 4, 4, 4), torch.randn(1, 3, 8)
+    with torch.no_grad(), sampling_invariant_scope(4096 if cache_enabled else 0) as cache, invariant_revision(1), invariant_condition(1):
+        model.patchify_and_embed(x, text, None, torch.ones(1), None, {})
+        model.patchify_and_embed(x, text, None, torch.ones(1), None, {})
+        assert model.context_refiner[0].calls == 2
+        assert cache is None or not cache.entries
+
+
+@pytest.mark.parametrize("target", ["container", "activation", "down"])
+def test_native_mlp_preserves_instance_forward_overrides(target):
+    from backend.nn import flux
+    module = torch.nn.Sequential(torch.nn.Identity(), torch.nn.GELU(approximate="tanh"), torch.nn.Identity()).eval()
+    child = {"container": module, "activation": module[1], "down": module[2]}[target]
+    original = child.forward
+    child.forward = lambda x: original(x) + 10
+    x = torch.ones(1, 2)
+    with torch.no_grad(), mock.patch.object(flux, "single_gpu_flag", return_value=True), mock.patch.object(flux, "try_native_int8_input_act", return_value=None) as fused:
+        torch.testing.assert_close(flux.run_native_mlp(module, x), module(x))
+        fused.assert_not_called()
