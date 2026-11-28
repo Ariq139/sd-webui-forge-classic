@@ -541,7 +541,7 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
     if (_native_full_area_cfg(model, x, model_options, condition_cache)
             and _standard_condition_fields(item["model_conds"])
             and _standard_condition_fields(conditioning)
-            and cache_dependencies_safe(model)):
+            and cache_dependencies_safe(model.diffusion_model)):
         # Do not expose a reused conditioning tensor to extension hooks,
         # subclasses, or custom condition implementations.
         c = {name: value.cond for name, value in conditioning.items()}
@@ -741,7 +741,14 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
                 and not getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None)
                 and not dynamic_args.ref_latents and dynamic_args.context_handler is None):
             from modules import script_callbacks
-            if not any(script_callbacks.callback_map.get(key) for key in ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")):
+            from backend.nn.anima import Anima
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            from backend.nn.krea import SingleStreamDiT
+            from backend.nn.lumina import NextDiT
+            if (type(getattr(model, "diffusion_model", None)) in
+                    (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
+                    and not any(script_callbacks.callback_map.get(key) for key in
+                                ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))):
                 invariant_revision_key = revision
         with krea_text_fusion_revision(revision), invariant_revision(invariant_revision_key):
             return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)

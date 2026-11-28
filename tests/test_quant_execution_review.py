@@ -67,3 +67,11 @@ def test_actual_cuda_eager_shared_dispatch_and_equivalence():
                     assert actual is not None
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 assert quantize.call_count == 1
+
+
+def test_compiler_non_exception_diagnostic_is_safe():
+    error = TorchDynamoException("compiler rejected graph")
+    error.inner_exception = "unsupported operator"
+    assert not fused._device_failure(error)
+    error.inner_exception = "CUDA error: illegal memory access"
+    assert fused._device_failure(error)

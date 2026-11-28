@@ -466,7 +466,7 @@ class NextDiT(nn.Module):
         freqs_cis = freqs_cis.to(x.device)
 
         shard = getattr(self, "_anima_shard_devices", None)
-        with weight_prefetch_scope(x.device, transformer_options, enabled=not shard and not self.training) as prefetch:
+        with weight_prefetch_scope(x.device, transformer_options, enabled=type(self) is NextDiT and not shard and not self.training) as prefetch:
             for i, layer in enumerate(self.layers):
                 if prefetch is not None:
                     prefetch.stage(self.layers[i + 1] if i + 1 < len(self.layers) else None, x.dtype)

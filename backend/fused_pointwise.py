@@ -47,7 +47,8 @@ def _device_failure(error):
                 or any(marker in message for marker in ("out of memory", "cuda error",
                        "device-side assert", "illegal memory access", "cublas_status", "cudnn_status"))):
             return True
-        pending.extend((current.__cause__, current.__context__, getattr(current, "inner_exception", None)))
+        if isinstance(current, BaseException):
+            pending.extend((current.__cause__, current.__context__, getattr(current, "inner_exception", None)))
     return False
 
 
