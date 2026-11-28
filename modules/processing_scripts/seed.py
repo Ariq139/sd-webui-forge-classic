@@ -56,8 +56,8 @@ class ScriptSeed(scripts.ScriptBuiltinUI):
             PasteField(seed_checkbox, lambda d: "Variation seed" in d or "Seed resize from-1" in d),
             PasteField(subseed, "Variation seed", api="subseed"),
             PasteField(subseed_strength, "Variation seed strength", api="subseed_strength"),
-            PasteField(seed_resize_from_w, "Seed resize from-1", api="seed_resize_from_h"),
-            PasteField(seed_resize_from_h, "Seed resize from-2", api="seed_resize_from_w"),
+            PasteField(seed_resize_from_w, "Seed resize from-1", api="seed_resize_from_w"),
+            PasteField(seed_resize_from_h, "Seed resize from-2", api="seed_resize_from_h"),
         ]
 
         self.on_after_component(lambda x: connect_reuse_seed(self.seed, reuse_seed, x.component, False), elem_id=f"generation_info_{self.tabname}")
@@ -88,9 +88,19 @@ def connect_reuse_seed(seed: gr.Number, reuse_seed: gr.Button, generation_info: 
         res = -1
         try:
             gen_info = json.loads(gen_info_string)
-            infotext = gen_info.get("infotexts")[index]
+            from modules import ui_result_utils
+
+            index = int(index)
+            if index < 0:
+                index = ui_result_utils.first_image_index(gen_info)
+            infotext = ui_result_utils.image_infotext(gen_info, index)
+            if not infotext:
+                return [gr.skip(), gr.skip()]
             gen_parameters = infotext_utils.parse_generation_parameters(infotext, [])
-            res = int(gen_parameters.get("Variation seed" if is_subseed else "Seed", -1))
+            value = ui_result_utils.reusable_seed(gen_parameters, is_subseed)
+            if value is None:
+                return [gr.skip(), gr.skip()]
+            res = value
         except Exception:
             if gen_info_string:
                 errors.report(f"Error retrieving seed from generation info: {gen_info_string}", exc_info=True)

@@ -8,7 +8,7 @@ import torch
 from backend import memory_management
 from modules import shared
 from modules_forge import main_thread
-from modules_forge.native_models import is_compatible_model, resolve_model_path
+from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
@@ -44,10 +44,7 @@ def _auto_vae_tiling_value() -> bool:
 
 
 def _model_path() -> str:
-    for value in (_option("forge_checkpoint_ideogram", ""), _option("ideogram_model_path", "")):
-        if is_compatible_model(value, "Ideogram4"):
-            return value
-    return ""
+    return select_model_path("Ideogram4", _option("forge_checkpoint_ideogram", ""), _option("ideogram_model_path", ""))
 
 
 def _save_option(name: str, value):
@@ -110,13 +107,6 @@ def bind_preset(preset_component, checkpoint_component=None):
             fn=_sync_model_to_page,
             inputs=[preset_component, checkpoint_component],
             outputs=[_preset_components[0]],
-            queue=False,
-            show_progress=False,
-        )
-        _preset_components[0].change(
-            fn=_sync_model_to_quicksettings,
-            inputs=[preset_component, _preset_components[0]],
-            outputs=[checkpoint_component],
             queue=False,
             show_progress=False,
         )
@@ -293,12 +283,17 @@ def generate(
 
         return images, f"Ideogram 4 generated {len(images)} image(s)."
     except Exception as error:
+        # Callback exceptions bypass Diffusers' normal final offload hooks.
+        # Invalidate the failed pipeline rather than reusing partial hook state.
+        try:
+            unload()
+        except Exception:
+            logger.exception("Native pipeline cleanup failed")
         if isinstance(error, _IdeogramInterrupted):
             shared.state.textinfo = "Ideogram 4: interrupted"
             return [], "Ideogram 4 generation interrupted."
         if memory_management.is_oom(error):
             logger.exception("Ideogram 4 generation ran out of memory")
-            unload()
             if getattr(shared.opts, "forge_oom_retry_enabled", True):
                 raise
             shared.state.textinfo = "Ideogram 4: out of memory"
@@ -308,7 +303,7 @@ def generate(
         return [], f"Ideogram 4 error: {error}"
 
 
-def generate_from_preset(prompt: str, *, width=None, height=None, num_images=None, steps=None, guidance=None):
+def generate_from_preset(prompt: str, *, width=None, height=None, num_images=None, steps=None, guidance=None, seed=None):
     return generate(
         _model_path(),
         _option("ideogram_offload", "model"),
@@ -328,14 +323,15 @@ def generate_from_preset(prompt: str, *, width=None, height=None, num_images=Non
         _option("ideogram_std", 1.5),
         _option("ideogram_prompt_upsampling", False),
         _option("ideogram_prompt_temperature", 1.0),
-        _option("ideogram_seed", -1),
+        seed if seed is not None else _option("ideogram_seed", -1),
     )
 
 
 def create_ui():
-    global _preset_components
+    global _preset_components, _preset_bound
+    _preset_bound = False
 
-    from modules.call_queue import wrap_gradio_gpu_call
+    from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call
 
     with gr.Blocks(analytics_enabled=False) as interface:
         gr.Markdown(
@@ -430,7 +426,9 @@ def create_ui():
             seed: "ideogram_seed",
         }
         for component, key in settings_to_save.items():
-            component.change(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
+            if component is model_path:
+                continue  # The global checkpoint selector owns model persistence.
+            component.input(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
 
         inputs = [
             model_path,
@@ -453,12 +451,23 @@ def create_ui():
             prompt_temperature,
             seed,
         ]
-        generate_ideogram = wrap_gradio_gpu_call(
-            lambda *args, **kwargs: main_thread.run_and_wait_result(generate, *args, **kwargs),
-            extra_outputs=[None],
-        )
-        generate_button.click(generate_ideogram, inputs=inputs, outputs=[output, status])
-        prompt.submit(generate_ideogram, inputs=inputs, outputs=[output, status])
+        from modules_forge.native_requests import PageJobOwner
+        from uuid import uuid4
+
+        owner = PageJobOwner()
+        session = gr.State(value=lambda: uuid4().hex)
+
+        def run_page(session_id, *args):
+            with owner.active(session_id):
+                result = main_thread.run_and_wait_result(generate, *args)
+                if result is None:
+                    raise RuntimeError("Native generation failed")
+                output_value, message = result
+                return (output_value if output_value else gr.skip()), message
+
+        generate_ideogram = wrap_gradio_gpu_call(run_page, extra_outputs=[gr.skip()])
+        generate_button.click(generate_ideogram, inputs=[session, *inputs], outputs=[output, status])
+        prompt.submit(generate_ideogram, inputs=[session, *inputs], outputs=[output, status])
         auto_vae_tiling.change(
             fn=lambda enabled: gr.update(interactive=not enabled),
             inputs=[auto_vae_tiling],
@@ -466,7 +475,7 @@ def create_ui():
             queue=False,
             show_progress=False,
         )
-        interrupt_button.click(interrupt_generation, outputs=[])
-        unload_button.click(unload, outputs=[])
+        interrupt_button.click(lambda session_id: owner.interrupt(session_id, interrupt_generation), inputs=[session], outputs=[], queue=False, show_progress=False)
+        unload_button.click(wrap_queued_call(unload), outputs=[])
 
     return interface

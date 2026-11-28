@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import gradio as gr
 
 from modules import script_callbacks, scripts, sd_models, shared, shared_items, sysinfo, timer, ui_common
-from modules.call_queue import wrap_gradio_call_no_job
+from modules.call_queue import wrap_gradio_call_no_job, wrap_queued_call
 from modules.options import options_section
 from modules.shared import opts
 from modules.ui_components import FormRow
@@ -251,7 +251,7 @@ class UiSettings:
 
             license_tab.select(fn=None, _js="populateLicense")
 
-            unload_sd_model.click(fn=call_func_and_return_text(sd_models.unload_model_weights, "Unloaded all models"), outputs=[self.result])
+            unload_sd_model.click(fn=wrap_queued_call(call_func_and_return_text(sd_models.unload_model_weights, "Unloaded all models")), outputs=[self.result])
 
             list_loaded_model.click(fn=call_func_and_return_text(sd_models.list_loaded_weights, "List all models"), outputs=[self.result])
 
@@ -360,7 +360,7 @@ class UiSettings:
             return [gr.update(value=model.name), module_update]
 
         button_set_checkpoint.click(
-            fn=_change_model,
+            fn=wrap_queued_call(_change_model),
             inputs=[text_set_checkpoint, text_set_modules],
             outputs=[main_entry.ui_checkpoint, main_entry.ui_vae],
             queue=False,

@@ -1,3 +1,4 @@
+import inspect
 import json
 from contextlib import closing
 
@@ -5,14 +6,14 @@ import gradio as gr
 
 import modules.scripts
 import modules.shared as shared
-from modules import infotext_utils, processing
+from modules import infotext_utils, processing, ui_result_utils
 from modules.infotext_utils import (
     create_override_settings_dict,
     parse_generation_parameters,
 )
 from modules.shared import opts
 from modules.ui import plaintext_to_html
-from modules_forge import main_thread
+from modules_forge import main_thread, native_requests
 from modules_forge.presets import get_capabilities
 
 
@@ -104,13 +105,11 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
     if gallery_index < 0 or gallery_index >= len(gallery):
         return gallery, generation_info, f"Bad image index: {gallery_index}", ""
 
-    geninfo = json.loads(generation_info)
+    geninfo = ui_result_utils.decode_metadata(generation_info)
 
     # catch situation where user tries to hires-fix the grid: probably a mistake, results can be bad aspect ratio - just don't do it
-    first_image_index = geninfo.get("index_of_first_image", 0)
-    # catch if user tries to upscale a control image, this function will fail later trying to get infotext that doesn't exist
-    count_images = len(geninfo.get("infotexts"))  # note: we have batch_size in geninfo, but not batch_count
-    if len(gallery) > 1 and (gallery_index < first_image_index or gallery_index >= count_images):
+    first_image_index = ui_result_utils.first_image_index(geninfo)
+    if gallery_index < first_image_index or not ui_result_utils.image_infotext(geninfo, gallery_index):
         return gallery, generation_info, "Unable to upscale grid or control images.", ""
 
     p = txt2img_create_processing(id_task, request, *args, force_enable_hr=True)
@@ -146,24 +145,27 @@ def txt2img_upscale_function(id_task: str, request: gr.Request, gallery, gallery
     shared.total_tqdm.clear()
 
     insert = getattr(shared.opts, "hires_button_gallery_insert", False)
-    new_gallery = []
-    new_infotexts = []
+    first = processed.index_of_first_image
+    new_images = processed.images[first:]
+    new_texts = processed.infotexts[first:first + len(new_images)]
+    if not new_images or len(new_texts) != len(new_images) or any(not text for text in new_texts):
+        return gr.skip(), gr.skip(), gr.skip(), "No completed upscale result."
 
-    for i, image in enumerate(gallery):
-        if insert or i != gallery_index:
-            image[0].already_saved_as = image[0].filename.rsplit("?", 1)[0]
-            new_gallery.append(image)
-            if i >= len(geninfo["infotexts"]):  # e.g. ControlNet Detected Map
-                new_infotexts.append(None)
-            else:
-                new_infotexts.append(geninfo["infotexts"][i])
-        if i == gallery_index:
-            new_gallery.extend(processed.images)
-            new_infotexts.extend(processed.infotexts)
+    for image in gallery:
+        filename = getattr(image[0], "filename", None)
+        if filename:
+            image[0].already_saved_as = filename.rsplit("?", 1)[0]
 
-    geninfo["infotexts"] = new_infotexts
-
-    return gr.update(value=new_gallery, selected_index=gallery_index), json.dumps(geninfo), plaintext_to_html(processed.infotexts[0]), plaintext_to_html(processed.comments, classname="comments")
+    new_gallery = list(gallery)
+    start = gallery_index + int(insert)
+    end = start if insert else start + 1
+    new_gallery[start:end] = new_images
+    geninfo = ui_result_utils.splice_gallery_metadata(
+        geninfo, ui_result_utils.decode_metadata(processed.js()), len(gallery),
+        gallery_index, insert, new_texts,
+    )
+    selected = start if not insert or shared.opts.hires_insert_index else gallery_index
+    return gr.update(value=new_gallery, selected_index=selected), json.dumps(geninfo), plaintext_to_html(geninfo["infotexts"][selected]), plaintext_to_html(processed.comments, classname="comments")
 
 
 def txt2img_function(id_task: str, request: gr.Request, *args):
@@ -174,61 +176,51 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
     if not capabilities["txt2img"]:
         raise RuntimeError(f"The {opts.forge_preset} preset does not support txt2img.")
 
-    if opts.forge_preset == "ltx2":
-        from modules.ui_ltx2_video import generate_from_preset
+    if opts.forge_preset in ("ltx2", "ideogram"):
+        # Bind to the actual processing signature; script controls have a
+        # separate dynamic layout.
+        native = inspect.signature(txt2img_create_processing).bind(id_task, request, *args).arguments
+        runner = modules.scripts.scripts_txt2img
+        steps = native_requests.script_control(runner, native["args"], "ScriptSampler", "steps")
+        seed = native_requests.script_control(runner, native["args"], "ScriptSeed", "seed")
+        count = native_requests.positive_integer(native["n_iter"], "Batch Count")
+        batch_size = native_requests.positive_integer(native["batch_size"], "Batch Size / Frames")
+        prompt = shared.prompt_styles.apply_styles_to_prompt(native["prompt"], native["prompt_styles"] or [])
+        width, height = native["width"], native["height"]
+        guidance = native["cfg_scale"]
+        if opts.forge_preset == "ltx2":
+            from modules.ui_ltx2_video import generate_from_preset
 
-        if int(args[4] or 1) != 1:
-            status = "LTX-2.3 shared txt2img supports one video per request; set Batch Count to 1."
-            return gr.update(value=None, visible=False), gr.update(value=None, visible=False), json.dumps({"infotexts": [status]}), plaintext_to_html(status), ""
-
-        prompt, negative_prompt = args[1], args[2]
-        prompt_styles = args[3] or []
-        prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles)
-        negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(negative_prompt, prompt_styles)
-        video_path, status = generate_from_preset(
-            prompt,
-            negative_prompt,
-            width=args[9],
-            height=args[8],
-            frames=args[5],
-            guidance=args[6],
-            steps=args[27] if len(args) > 27 and isinstance(args[27], (int, float)) else None,
-        )
-        generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
-        return (
-            gr.update(value=None, visible=False),
-            gr.update(value=video_path, visible=bool(video_path)),
-            generation_info_js,
-            plaintext_to_html(status),
-            "",
-        )
-
-    if opts.forge_preset == "ideogram":
-        if int(args[4] or 1) == 0:
-            status = "Ideogram does not support infinite generation through the shared txt2img page."
-            return gr.update(value=None, visible=False), gr.update(value=None, visible=False), json.dumps({"infotexts": [status]}), plaintext_to_html(status), ""
+            if count != 1:
+                raise ValueError("LTX-2.3 supports one video per request; set Batch Count to 1.")
+            negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(native["negative_prompt"], native["prompt_styles"] or [])
+            video_path, status = generate_from_preset(
+                prompt, negative_prompt, width=width, height=height,
+                frames=batch_size, guidance=guidance, steps=steps, seed=seed,
+            )
+            if not video_path:
+                return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
+            generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
+            return gr.update(value=None, visible=False), gr.update(value=video_path, visible=True), generation_info_js, plaintext_to_html(status), ""
 
         from modules.ui_ideogram import generate_from_preset
 
-        prompt = args[1]
-        prompt_styles = args[3] or []
-        prompt = shared.prompt_styles.apply_styles_to_prompt(prompt, prompt_styles)
         images, status = generate_from_preset(
-            prompt,
-            width=args[9],
-            height=args[8],
-            num_images=int(args[4] or 1) * int(args[5] or 1),
-            steps=args[27] if len(args) > 27 and isinstance(args[27], (int, float)) else None,
-            guidance=args[6],
+            prompt, width=width, height=height,
+            num_images=count * batch_size, steps=steps, guidance=guidance, seed=seed,
         )
-        generation_info_js = json.dumps({"infotexts": [status] * max(len(images), 1), "prompt": prompt})
-        return (
-            gr.update(value=images, visible=bool(images)),
-            gr.update(value=None, visible=False),
-            generation_info_js,
-            plaintext_to_html(status),
-            "",
-        )
+        if not images:
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
+        # One RNG is used for the entire request. Do not invent per-image seeds.
+        generation_info_js = json.dumps({
+            "infotexts": [None] * len(images), "prompt": prompt,
+            "negative_prompt": "", "width": width, "height": height,
+            "batch_size": len(images), "steps": steps, "cfg_scale": guidance,
+            "sampler_name": "Ideogram 4", "index_of_first_image": 0,
+            "sd_model_name": getattr(opts, "forge_checkpoint_ideogram", ""),
+            "request_seed": seed, "all_seeds": [], "styles": native["prompt_styles"] or [],
+        })
+        return gr.update(value=images, visible=True), gr.update(value=None, visible=False), generation_info_js, plaintext_to_html(status), ""
 
     p = txt2img_create_processing(id_task, request, *args)
 
@@ -259,6 +251,14 @@ def txt2img_function(id_task: str, request: gr.Request, *args):
 
 def txt2img_upscale(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
     return main_thread.run_and_wait_result(txt2img_upscale_function, id_task, request, gallery, gallery_index, generation_info, *args)
+
+
+def txt2img_upscale_ui(id_task: str, request: gr.Request, gallery, gallery_index, generation_info, *args):
+    # Record the same five-field result contract used by normal txt2img restore.
+    result = txt2img_upscale(id_task, request, gallery, gallery_index, generation_info, *args)
+    if result is None:
+        raise RuntimeError("Upscale failed")
+    return result[0], gr.skip(), *result[1:]
 
 
 def txt2img(id_task: str, request: gr.Request, *args):

@@ -295,8 +295,9 @@ def restore_old_hires_fix_params(res: dict):
     res["Hires resize-2"] = height
 
 
-def _extract_styles(res: dict, prompt: str, negative_prompt: str) -> tuple[str, str]:
-    if shared.opts.infotext_styles == "Ignore":
+def _extract_styles(res: dict, prompt: str, negative_prompt: str, style_mode=None) -> tuple[str, str]:
+    style_mode = shared.opts.infotext_styles if style_mode is None else style_mode
+    if style_mode == "Ignore":
         return prompt, negative_prompt
 
     found_styles, prompt_no_styles, negative_prompt_no_styles = shared.prompt_styles.extract_styles_from_prompt(prompt, negative_prompt)
@@ -311,7 +312,7 @@ def _extract_styles(res: dict, prompt: str, negative_prompt: str) -> tuple[str, 
 
     if same_hr_styles:
         prompt, negative_prompt = prompt_no_styles, negative_prompt_no_styles
-        if (shared.opts.infotext_styles == "Apply if any" and found_styles) or shared.opts.infotext_styles == "Apply":
+        if (style_mode == "Apply if any" and found_styles) or style_mode == "Apply":
             res["Styles array"] = found_styles
 
     return prompt, negative_prompt
@@ -355,7 +356,7 @@ def _populate_defaults(res: dict):
         res["Rescale CFG"] = 0.0
 
 
-def parse_generation_parameters(x: str, skip_fields: list[str] | None = None):
+def parse_generation_parameters(x: str, skip_fields: list[str] | None = None, *, style_mode=None):
     """
     parses infotext (the string under the Gallery in UI)
     returns a dict with field values
@@ -405,7 +406,7 @@ def parse_generation_parameters(x: str, skip_fields: list[str] | None = None):
         except Exception:
             print(f'Error parsing "{k}: {v}"')
 
-    res["Prompt"], res["Negative prompt"] = prompt, negative_prompt = _extract_styles(res, prompt, negative_prompt)
+    res["Prompt"], res["Negative prompt"] = prompt, negative_prompt = _extract_styles(res, prompt, negative_prompt, style_mode)
 
     _populate_defaults(res)
 

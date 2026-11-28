@@ -55,8 +55,8 @@ class UiCheckpointMerger:
                         gr.Warning("Failed...", duration=5)
                         return str(e)
 
-                btn_save_unet_forge.click(partial(save_model, _unet=True), inputs=filename_forge, outputs=result_html)
-                btn_save_ckpt_forge.click(partial(save_model, _unet=False), inputs=filename_forge, outputs=result_html)
+                btn_save_unet_forge.click(call_queue.wrap_queued_call(partial(save_model, _unet=True)), inputs=filename_forge, outputs=result_html)
+                btn_save_ckpt_forge.click(call_queue.wrap_queued_call(partial(save_model, _unet=False)), inputs=filename_forge, outputs=result_html)
 
                 for comp in (filename_forge, btn_save_unet_forge, btn_save_ckpt_forge):
                     comp.do_not_save_to_config = True

@@ -4,7 +4,7 @@ import io
 import ipaddress
 import os
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from io import BytesIO
 from secrets import compare_digest
 from threading import Lock
@@ -26,8 +26,29 @@ import modules.textual_inversion.textual_inversion
 from modules import errors, images, infotext_utils, postprocessing, restart, script_callbacks, scripts, sd_models, sd_samplers, sd_schedulers, shared_items, ui
 from modules.api import models
 from modules.processing import StableDiffusionProcessingImg2Img, StableDiffusionProcessingTxt2Img, process_extra_images, process_images
-from modules.progress import add_task_to_queue, create_task_id, current_task, finish_task, start_task
+from modules import progress as generation_progress
+from modules.progress import add_task_to_queue, create_task_id, finish_task, start_task
 from modules.shared import cmd_opts, opts
+
+
+@contextmanager
+def api_generation_task(task_id, job):
+    """Finalize pending/active tasks even if construction or inference fails."""
+    started = False
+    try:
+        start_task(task_id)
+        shared.state.begin(job=job)
+        started = True
+        if opts.forge_preset in ("ltx2", "ideogram"):
+            raise HTTPException(status_code=422, detail="This native preset is not supported by the standard image generation API. Use its WebUI page.")
+        yield
+    finally:
+        try:
+            if started:
+                shared.state.end()
+                shared.total_tqdm.clear()
+        finally:
+            finish_task(task_id)
 
 
 def script_name_to_index(name, scripts):
@@ -466,27 +487,20 @@ class Api:
 
         add_task_to_queue(task_id)
 
-        with self.queue_lock:
+        with self.queue_lock, api_generation_task(task_id, "scripts_txt2img"):
             with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
                 p.is_api = True
                 p.scripts = script_runner
                 p.outpath_grids = opts.outdir_txt2img_grids
                 p.outpath_samples = opts.outdir_txt2img_samples
 
-                try:
-                    shared.state.begin(job="scripts_txt2img")
-                    start_task(task_id)
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_txt2img.run(p, *p.script_args)  # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args)  # Need to pass args as tuple here
-                        processed = process_images(p)
-                    process_extra_images(processed)
-                    finish_task(task_id)
-                finally:
-                    shared.state.end()
-                    shared.total_tqdm.clear()
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_txt2img.run(p, *p.script_args)  # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args)  # Need to pass args as tuple here
+                    processed = process_images(p)
+                process_extra_images(processed)
 
         b64images = list(map(encode_pil_to_base64, processed.images + processed.extra_images)) if send_images else []
 
@@ -539,7 +553,7 @@ class Api:
 
         add_task_to_queue(task_id)
 
-        with self.queue_lock:
+        with self.queue_lock, api_generation_task(task_id, "scripts_img2img"):
             with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
                 p.init_images = [decode_base64_to_image(x) for x in init_images]
                 p.is_api = True
@@ -547,20 +561,13 @@ class Api:
                 p.outpath_grids = opts.outdir_img2img_grids
                 p.outpath_samples = opts.outdir_img2img_samples
 
-                try:
-                    shared.state.begin(job="scripts_img2img")
-                    start_task(task_id)
-                    if selectable_scripts is not None:
-                        p.script_args = script_args
-                        processed = scripts.scripts_img2img.run(p, *p.script_args)  # Need to pass args as list here
-                    else:
-                        p.script_args = tuple(script_args)  # Need to pass args as tuple here
-                        processed = process_images(p)
-                    process_extra_images(processed)
-                    finish_task(task_id)
-                finally:
-                    shared.state.end()
-                    shared.total_tqdm.clear()
+                if selectable_scripts is not None:
+                    p.script_args = script_args
+                    processed = scripts.scripts_img2img.run(p, *p.script_args)  # Need to pass args as list here
+                else:
+                    p.script_args = tuple(script_args)  # Need to pass args as tuple here
+                    processed = process_images(p)
+                process_extra_images(processed)
 
         b64images = list(map(encode_pil_to_base64, processed.images + processed.extra_images)) if send_images else []
 
@@ -629,7 +636,7 @@ class Api:
         if shared.state.current_image and not req.skip_current_image:
             current_image = encode_pil_to_base64(shared.state.current_image)
 
-        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=shared.state.textinfo, current_task=current_task)
+        return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=shared.state.textinfo, current_task=generation_progress.current_task)
 
     def interruptapi(self):
         shared.state.interrupt()
@@ -637,7 +644,8 @@ class Api:
         return {}
 
     def unloadapi(self):
-        sd_models.unload_model_weights()
+        with self.queue_lock:
+            sd_models.unload_model_weights()
 
         return {}
 

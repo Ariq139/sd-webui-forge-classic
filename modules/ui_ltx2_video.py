@@ -10,7 +10,7 @@ import torch
 from backend import memory_management
 from modules import paths, shared
 from modules_forge import main_thread
-from modules_forge.native_models import is_compatible_model, resolve_model_path
+from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
@@ -51,10 +51,7 @@ def _auto_vae_tiling_value() -> bool:
 
 
 def _model_path():
-    for value in (_option("forge_checkpoint_ltx2", ""), _option("ltx2_model_path", "")):
-        if is_compatible_model(value, "LTX2"):
-            return value
-    return ""
+    return select_model_path("LTX2", _option("forge_checkpoint_ltx2", ""), _option("ltx2_model_path", ""))
 
 
 def _resolve_prunavaed_path(value: str) -> str:
@@ -184,13 +181,6 @@ def bind_preset(preset_component, checkpoint_component=None, decoder_component=N
             fn=_sync_model_to_page,
             inputs=[preset_component, checkpoint_component],
             outputs=[_ltx_components[0]],
-            queue=False,
-            show_progress=False,
-        )
-        _ltx_components[0].change(
-            fn=_sync_model_to_quicksettings,
-            inputs=[preset_component, _ltx_components[0]],
-            outputs=[checkpoint_component],
             queue=False,
             show_progress=False,
         )
@@ -436,12 +426,17 @@ def generate(
         shared.state.textinfo = "LTX-2.3: finished"
         return output_path, f"Saved: {output_path}"
     except Exception as error:
+        # Callback exceptions bypass Diffusers' normal final offload hooks.
+        # Invalidate the failed pipeline rather than reusing partial hook state.
+        try:
+            unload()
+        except Exception:
+            logger.exception("Native pipeline cleanup failed")
         if isinstance(error, _LTXInterrupted):
             shared.state.textinfo = "LTX-2.3: interrupted"
             return None, "LTX-2.3 generation interrupted."
         if memory_management.is_oom(error):
             logger.exception("LTX-2.3 generation ran out of memory")
-            unload()
             if getattr(shared.opts, "forge_oom_retry_enabled", True):
                 raise
             shared.state.textinfo = "LTX-2.3: out of memory"
@@ -451,7 +446,7 @@ def generate(
         return None, f"LTX-2.3 error: {error}"
 
 
-def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width=None, height=None, frames=None, steps=None, guidance=None):
+def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width=None, height=None, frames=None, steps=None, guidance=None, seed=None):
     """Run LTX with the values stored by the shared ``ltx2`` preset."""
     return generate(
         _model_path(),
@@ -479,15 +474,16 @@ def generate_from_preset(prompt: str, negative_prompt: str, image=None, *, width
         _option("ltx2_audio_modality", 3.0),
         _option("ltx2_guidance_rescale", 0.7),
         _option("ltx2_guidance_blocks", "28"),
-        _option("ltx2_seed", -1),
+        seed if seed is not None else _option("ltx2_seed", -1),
         _option("ltx2_include_audio", True),
     )
 
 
 def create_ui():
-    global _ltx_components
+    global _ltx_components, _preset_bound
+    _preset_bound = False
 
-    from modules.call_queue import wrap_gradio_gpu_call
+    from modules.call_queue import wrap_gradio_gpu_call, wrap_queued_call
 
     with gr.Blocks(analytics_enabled=False) as interface:
         gr.Markdown(
@@ -602,7 +598,9 @@ def create_ui():
             include_audio: "ltx2_include_audio",
         }
         for component, key in settings_to_save.items():
-            component.change(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
+            if component is model_path:
+                continue  # The global checkpoint selector owns model persistence.
+            component.input(fn=lambda value, key=key: _save_option(key, value), inputs=[component], outputs=[], queue=False, show_progress=False)
 
         inputs = [
             model_path,
@@ -633,12 +631,23 @@ def create_ui():
             seed,
             include_audio,
         ]
-        generate_ltx = wrap_gradio_gpu_call(
-            lambda *args, **kwargs: main_thread.run_and_wait_result(generate, *args, **kwargs),
-            extra_outputs=[None],
-        )
-        generate_button.click(generate_ltx, inputs=inputs, outputs=[video_output, status])
-        prompt.submit(generate_ltx, inputs=inputs, outputs=[video_output, status])
+        from modules_forge.native_requests import PageJobOwner
+        from uuid import uuid4
+
+        owner = PageJobOwner()
+        session = gr.State(value=lambda: uuid4().hex)
+
+        def run_page(session_id, *args):
+            with owner.active(session_id):
+                result = main_thread.run_and_wait_result(generate, *args)
+                if result is None:
+                    raise RuntimeError("Native generation failed")
+                output_value, message = result
+                return (output_value if output_value else gr.skip()), message
+
+        generate_ltx = wrap_gradio_gpu_call(run_page, extra_outputs=[gr.skip()])
+        generate_button.click(generate_ltx, inputs=[session, *inputs], outputs=[video_output, status])
+        prompt.submit(generate_ltx, inputs=[session, *inputs], outputs=[video_output, status])
         auto_vae_tiling.change(
             fn=lambda enabled: gr.update(interactive=not enabled),
             inputs=[auto_vae_tiling],
@@ -646,7 +655,7 @@ def create_ui():
             queue=False,
             show_progress=False,
         )
-        interrupt_button.click(interrupt_generation, outputs=[])
-        unload_button.click(unload, outputs=[])
+        interrupt_button.click(lambda session_id: owner.interrupt(session_id, interrupt_generation), inputs=[session], outputs=[], queue=False, show_progress=False)
+        unload_button.click(wrap_queued_call(unload), outputs=[])
 
     return interface

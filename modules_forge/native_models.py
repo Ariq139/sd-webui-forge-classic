@@ -42,5 +42,14 @@ def compatible_model_directories(marker: str) -> list[str]:
             continue
         for entry in os.scandir(root):
             if entry.is_dir() and is_compatible_model(entry.path, marker):
-                values.append(os.path.relpath(entry.path, root))
+                # Keep the root identity; equal names may contain different models.
+                values.append(os.path.abspath(entry.path))
     return sorted(set(values), key=str.casefold)
+
+
+def select_model_path(marker, *values):
+    for value in values:
+        if is_compatible_model(value, marker):
+            return os.path.abspath(resolve_model_path(value))
+    choices = compatible_model_directories(marker)
+    return choices[0] if choices else ""

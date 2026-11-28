@@ -22,7 +22,7 @@ from modules.processing import (
 from modules.sd_models import get_closet_checkpoint_match, model_data
 from modules.shared import opts, state
 from modules.ui import _STEP, plaintext_to_html, sRound
-from modules_forge import main_thread
+from modules_forge import main_thread, native_requests
 from modules_forge.presets import get_capabilities
 
 
@@ -60,6 +60,8 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
     batch_results = None
     discard_further_results = False
+    requested_batch_size, requested_n_iter = p.batch_size, p.n_iter
+    png_info_props = png_info_props or []
     for i, image in enumerate(batch_images):
         state.job = f"{i+1} out of {len(batch_images)}"
         if state.skipped:
@@ -87,7 +89,8 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
         if p.resize_mode < 4 and not (_w % _STEP == 0 and _h % _STEP == 0):
             img = images.resize_image(1, img, sRound(_w), sRound(_h))
 
-        p.init_images = [img] * p.batch_size
+        # The initializer repeats a single source to the active batch size.
+        p.init_images = [img]
 
         image_path = Path(image)
         if is_inpaint_batch:
@@ -117,10 +120,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
                     info_img_path = os.path.join(png_info_dir, os.path.basename(image))
                     info_img = images.read(info_img_path)
                 geninfo, _ = images.read_info_from_image(info_img)
-                _orig: str = shared.opts.infotext_styles
-                shared.opts.infotext_styles = "Ignore"
-                parsed_parameters = parse_generation_parameters(geninfo)
-                shared.opts.infotext_styles = _orig
+                parsed_parameters = parse_generation_parameters(geninfo or "", style_mode="Ignore")
                 parsed_parameters = {k: v for k, v in parsed_parameters.items() if k in (png_info_props or [])}
             except Exception:
                 parsed_parameters = {}
@@ -158,10 +158,13 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
             filename_pattern = f"{image_path.stem}-[generation_number]" if p.n_iter > 1 or p.batch_size > 1 else f"{image_path.stem}"
             p.override_settings["samples_filename_pattern"] = filename_pattern
 
-        proc = modules.scripts.scripts_img2img.run(p, *args)
-
-        if proc is None:
-            proc = process_images(p)
+        try:
+            proc = modules.scripts.scripts_img2img.run(p, *args)
+            if proc is None:
+                proc = process_images(p)
+        finally:
+            # A grouped single-image fallback must not shrink later inputs.
+            p.batch_size, p.n_iter = requested_batch_size, requested_n_iter
 
         if not discard_further_results and proc:
             if batch_results:
@@ -185,6 +188,7 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
         n_iter = int(n_iter)
     except (TypeError, ValueError):
         n_iter = 1
+    requested_n_iter = n_iter
     infinite_generation = n_iter == 0
     n_iter = max(1, n_iter)
     capabilities = get_capabilities(
@@ -246,8 +250,15 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
     mask = images.fix_image(mask)
 
     if opts.forge_preset == "ltx2":
-        if is_batch or infinite_generation or int(n_iter or 1) > 1:
+        if is_batch or requested_n_iter != 1:
             raise RuntimeError("LTX-2.3 image-to-video supports one video per request through the shared img2img flow; set Batch Count to 1.")
+        if mode not in (0, 1) or image is None:
+            raise ValueError("LTX image-to-video requires an input image in img2img or Sketch; masks are not supported.")
+        if selected_scale_tab == 1:
+            width, height = native_requests.scaled_video_dimensions(image.width, image.height, scale_by)
+        runner = modules.scripts.scripts_img2img
+        steps = native_requests.script_control(runner, args, "ScriptSampler", "steps")
+        seed = native_requests.script_control(runner, args, "ScriptSeed", "seed")
 
         from modules.ui_ltx2_video import generate_from_preset
 
@@ -260,9 +271,12 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
             width=width,
             height=height,
             frames=batch_size,
-            steps=args[0] if args and isinstance(args[0], (int, float)) else None,
+            steps=steps,
             guidance=cfg_scale,
+            seed=seed,
         )
+        if not video_path:
+            return gr.skip(), gr.skip(), gr.skip(), gr.skip(), plaintext_to_html(status)
         generation_info_js = json.dumps({"infotexts": [status], "prompt": prompt, "negative_prompt": negative_prompt})
         return (
             gr.update(value=None, visible=False),

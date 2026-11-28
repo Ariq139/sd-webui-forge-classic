@@ -96,13 +96,15 @@ def configure_offload(pipe, device: torch.device, offload: str, logger: logging.
         pipe.to(device)
         return "none"
 
-    if offload == "group" and hasattr(pipe, "enable_group_offload"):
-        try:
+    if offload == "group":
+        if not hasattr(pipe, "enable_group_offload"):
+            logger.warning("Group offload is unavailable; falling back to sequential offload")
+            offload = "sequential"
+        else:
+            # Failed setup can leave partially installed hooks. Do not stack
+            # another offload policy or silently load the pipeline to CUDA.
             _enable_group_offload(pipe, device)
             return "group"
-        except Exception:
-            logger.warning("Group offload is unavailable; falling back to model offload", exc_info=True)
-            offload = "model"
 
     if offload == "sequential":
         pipe.enable_sequential_cpu_offload(device=device)
@@ -111,8 +113,7 @@ def configure_offload(pipe, device: torch.device, offload: str, logger: logging.
         pipe.enable_model_cpu_offload(device=device)
         return "model"
 
-    pipe.to(device)
-    return "none"
+    raise ValueError(f"Unsupported native offload mode: {offload}")
 
 
 def compile_denoisers(pipe, enabled: bool, device: torch.device, offload: str, logger: logging.Logger) -> bool:

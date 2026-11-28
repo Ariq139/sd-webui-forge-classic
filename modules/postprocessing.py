@@ -126,7 +126,7 @@ def run_postprocessing_video(_mode, _img, _folder, _in_dir, _out_dir, _show, vid
         for frame in tqdm(container.decode(video=0), desc="Processing Video", total=frames, unit="frame"):
             yield frame.to_image()
 
-    infotext = None
+    infotext = ""
 
     shared.state.job_count = frames
 
@@ -146,14 +146,14 @@ def run_postprocessing_video(_mode, _img, _folder, _in_dir, _out_dir, _show, vid
         if shared.state.skipped:
             continue
 
-        if infotext is None:
+        if not infotext:
             infotext = ", ".join([k if k == v else f"{k}: {infotext_utils.quote(v)}" for k, v in initial_pp.info.items() if v is not None])
 
         shared.state.assign_current_image(initial_pp.image)
 
         outputs.append(np.array(initial_pp.image, dtype=np.uint8))
 
-    if not (shared.state.interrupted or shared.state.stopping_generation):
+    if outputs and save_output and not (shared.state.interrupted or shared.state.stopping_generation):
         images.save_video(
             os.path.splitext(os.path.basename(video_input))[0],
             outputs,
