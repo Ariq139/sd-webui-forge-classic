@@ -100,7 +100,13 @@ class KModel(torch.nn.Module):
                         extra = cast_condition(extra, o)
                 extra_conds[o] = extra
 
-            model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
+            graph_output = None
+            if c_concat is None and control is None and not shard and getattr(args.args, "resident_denoiser_graph_mib", 0) > 0:
+                from backend.resident_denoiser_graph import try_resident_graph
+                graph_output = try_resident_graph(self.diffusion_model, xc, t, context, transformer_options, extra_conds)
+            if graph_output is None:
+                graph_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds)
+            model_output = graph_output.float()
             return self.predictor.calculate_denoised(sigma, model_output, x)
         finally:
             if shard:

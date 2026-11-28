@@ -15,6 +15,7 @@ parser.add_argument("--native-shared-int8-rows", action="store_true", help="Exte
 parser.add_argument("--shared-qkv-output", action="store_true", help="Experimental disjoint shared native INT8 GEMM output allocation (requires shared CUDA INT8 rows)")
 parser.add_argument("--pack-int8-gate-up", action="store_true", help="Experimental load-time CPU INT8 gate/up coalescing for offloaded native projections; incompatible with quantized pinning")
 parser.add_argument("--segmented-int8-linear", action="store_true", help="Experimental SM86 Triton quantization of FLUX attention and MLP segments without a float concatenation (unrotated resident INT8 only)")
+parser.add_argument("--resident-denoiser-graph-mib", type=int, default=0, metavar="MIB", help="Experimental resident CFG1 FLUX/Z-Image CUDA graph admission/retention budget; 0 disables; requires --direct-full-area-cfg")
 parser.add_argument("--weight-prefetch-mib", type=int, default=0, metavar="MIB", help="Experimental bounded pinned CPU weight look-ahead for Anima, FLUX, Z-Image and Krea; 0 disables")
 parser.add_argument("--fused-denoiser-pointwise", action="store_true", help="Experimentally compile pure denoiser modulation and gated-MLP expressions; may slightly change rounding")
 parser.add_argument("--native-lumina-gqa", action="store_true", help="Use native PyTorch flash grouped-query attention in compatible unmasked Lumina/Z-Image layers")

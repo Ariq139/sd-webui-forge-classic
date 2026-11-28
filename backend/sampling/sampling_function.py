@@ -603,7 +603,11 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
         except TypeError:
             pass
     krea_key = invariant_key if invariant_scope_active() else None
-    with record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key), krea_text_fusion_condition(krea_key):
+    from backend.resident_denoiser_graph import graph_scope_active, graph_candidate
+    graph_ok = (graph_scope_active() and _native_full_area_cfg(model, x, model_options, condition_cache)
+                and _unit_full_area(item, x) and _standard_condition_fields(conditioning))
+    with (record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key),
+          krea_text_fusion_condition(krea_key), graph_candidate(graph_ok)):
         return model.apply_model(x, timestep, **c)
 
 
