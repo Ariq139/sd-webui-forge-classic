@@ -13,14 +13,22 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from backend.args import dynamic_args
-from backend.attention import attention_function
+from backend.attention import attention_function, attention_pytorch
 from backend.memory_management import cast_to
 from backend.misc.image_resize import adaptive_resize
-from backend.nn.flux import EmbedND, timestep_embedding
+from backend.nn.flux import EmbedND, timestep_embedding, run_native_mlp
 from backend.operations import repeat_kv_for_gqa
 from backend.performance import record_region
 from backend.quant_ops import ck
+from backend.weight_prefetch import weight_prefetch_scope
+from backend.activation_quantization import shared_activation_scope
+from backend.fused_pointwise import silu_gate, fusion_enabled
 from backend.sampling.krea_cache import cached_krea_text_features
+from backend.sampling.invariant_cache import cached_invariant, cache_dependencies_safe, invariants_enabled, retain_reference_sources
+from backend.single_gpu_fastpaths import single_gpu_flag, reference_signature
+from backend.operations_mixed_precision import try_native_int8_input_act
+from backend.native_gqa import try_flash_gqa
+from backend.gate_up_packing import try_packed_gate_up
 from backend.utils import pad_to_patch_size
 
 
@@ -137,7 +145,23 @@ class SwiGLU(nn.Module):
         self.down = nn.Linear(mlpdim, features, bias=bias)
 
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)).mul_(self.up(x)))
+        with shared_activation_scope(x, (self.gate, self.up)):
+            pair = try_packed_gate_up(x, self.gate, self.up)
+            gate = self.gate(x) if pair is None else pair[0]
+            def up_projection():
+                return self.up(x) if pair is None else pair[1]
+            if (single_gpu_flag("native_int8_mlp_activation") and gate.dtype == torch.bfloat16
+                    and type(self) is SwiGLU and cache_dependencies_safe(self)):
+                up = up_projection()
+                fused = try_native_int8_input_act(self.down, (gate, up), "swiglu")
+                if fused is not None:
+                    return fused
+                hidden = silu_gate(gate, up) if fusion_enabled(gate) else F.silu(gate).mul_(up)
+            elif fusion_enabled(gate):
+                hidden = silu_gate(gate, up_projection())
+            else:
+                hidden = F.silu(gate).mul_(up_projection())
+        return self.down(hidden)
 
 
 class Attention(nn.Module):
@@ -155,7 +179,8 @@ class Attention(nn.Module):
         self.wo = nn.Linear(dim, dim, bias=bias)
 
     def forward(self, x, freqs=None, mask=None, transformer_options={}):
-        q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
+        with shared_activation_scope(x, (self.wq, self.wk, self.wv, self.gate)):
+            q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
         q = q.unflatten(-1, (self.heads, self.headdim))
         k = k.unflatten(-1, (self.kvheads, self.headdim))
         v = v.unflatten(-1, (self.kvheads, self.headdim))
@@ -167,8 +192,14 @@ class Attention(nn.Module):
             q, k = self.qknorm(q.transpose(1, 2), k.transpose(1, 2))
             if freqs is not None:
                 q, k = ck.apply_rope(q, k, freqs)
-        k, v = repeat_kv_for_gqa(k, v.transpose(1, 2), self.heads, 1)
-        out = attention_function(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
+        v = v.transpose(1, 2)
+        out = None
+        if (type(self) is Attention and single_gpu_flag("native_krea_gqa")
+                and attention_function is attention_pytorch):
+            out = try_flash_gqa(q, k, v, mask, transformer_options)
+        if out is None:
+            k, v = repeat_kv_for_gqa(k, v, self.heads, 1)
+            out = attention_function(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
         return self.wo(out * F.sigmoid(gate))
 
 
@@ -323,36 +354,68 @@ class SingleStreamDiT(nn.Module):
 
         ref_latents: list[torch.Tensor] = dynamic_args.ref_latents
 
-        if (_edit := bool(ref_latents)) is True:
-            refs = []
-            ref_grids = []
-            for ref in ref_latents:
-                if x.shape[0] == 2:  # batch_cond_uncond
-                    ref = torch.cat((ref, ref), dim=0)
-                if ref.shape != x.shape:
-                    ref = adaptive_resize(ref, W, H, "area", "center")
-                refs.append(pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate"))
-                ref_grids.append((ref.shape[-2] // patch, ref.shape[-1] // patch))
+        # Preserve the ordinary reference path, including resize and projection
+        # order, unless the native immutable reference contract is established.
+        _edit = bool(ref_latents)
+        ref_key = None
+        if (_edit and type(self) is SingleStreamDiT and single_gpu_flag("krea_reference_cache")
+                and invariants_enabled(self, x, transformer_options)
+                and cache_dependencies_safe(self.first)
+                and not getattr(self.first, "weight_function", None)
+                and not getattr(self.first, "bias_function", None)):
+            ref_key = reference_signature(ref_latents)
+            if ref_key is not None and not retain_reference_sources(ref_latents):
+                ref_key = None
+
+        def prepare_reference(ref):
+            if x.shape[0] == 2:
+                ref = torch.cat((ref, ref), dim=0)
+            if ref.shape != x.shape:
+                ref = adaptive_resize(ref, W, H, "area", "center")
+            return (pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate"),
+                    (ref.shape[-2] // patch, ref.shape[-1] // patch))
+
+        if _edit and ref_key is None:
+            prepared = [prepare_reference(ref) for ref in ref_latents]
+            refs, ref_grids = map(list, zip(*prepared))
 
         img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
         img = self.first(img)
 
-        if _edit:
-            refs = [rearrange(r, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch) for r in refs]
-            refs = [self.first(r) for r in refs]
+        def project_reference(ref):
+            return self.first(rearrange(ref, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch))
 
-        t = self.tmlp(timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
+        if _edit:
+            if ref_key is None:
+                refs = [project_reference(ref) for ref in refs]
+            else:
+                refs, ref_grids = [], []
+                for ref, signature in zip(ref_latents, ref_key):
+                    def compute():
+                        prepared, grid = prepare_reference(ref)
+                        return project_reference(prepared), grid
+                    projected, grid = cached_invariant(
+                        self, "krea_reference_projection", ref, transformer_options, compute,
+                        geometry=(signature, tuple(x.shape), x.dtype, x.device, patch),
+                        geometry_only=True, dependencies=(self.first,))
+                    refs.append(projected)
+                    ref_grids.append(grid)
+
+        t = run_native_mlp(self.tmlp, timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
         tvec = self.tproj(t)
 
         def compute_text_features():
             with record_region("forge::krea_text_fusion"):
-                fused = self.txtfusion(context, mask=None, transformer_options=transformer_options)
+                # Text fusion has in-place residuals; preserve cached input ownership.
+                source = context.clone() if type(self) is SingleStreamDiT and single_gpu_flag("direct_full_area_cfg") else context
+                fused = self.txtfusion(source, mask=None, transformer_options=transformer_options)
                 return self.txtmlp(fused)
 
         if _edit:
             context = compute_text_features()
         else:
-            context = cached_krea_text_features(self, context, transformer_options, compute_text_features)
+            context = cached_krea_text_features(self, context, transformer_options, compute_text_features,
+                                                dependencies=(self.txtfusion, self.txtmlp))
 
         txtlen, imglen = context.shape[1], img.shape[1]
         if _edit:
@@ -366,13 +429,18 @@ class SingleStreamDiT(nn.Module):
         freqs = krea_position_frequencies(self.pe_embedder, txtlen, h_, w_, ref_grids if _edit else (), device)
 
         shard = getattr(self, "_anima_shard_devices", None)
-        for index, block in enumerate(self.blocks):
-            if shard and index == shard[2]:
-                combined = combined.to(shard[1])
-                tvec = tvec.to(shard[1])
-                freqs = freqs.to(shard[1])
-            with torch.cuda.device(combined.device) if shard else nullcontext():
-                combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+        with weight_prefetch_scope(combined.device, transformer_options, enabled=not shard and not _edit and not self.training) as prefetch:
+            for index, block in enumerate(self.blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.blocks[index + 1] if index + 1 < len(self.blocks) else None, combined.dtype)
+                if shard and index == shard[2]:
+                    combined = combined.to(shard[1])
+                    tvec = tvec.to(shard[1])
+                    freqs = freqs.to(shard[1])
+                with torch.cuda.device(combined.device) if shard else nullcontext():
+                    combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         combined = combined[:, txtlen + reflen : txtlen + reflen + imglen]
         if shard:

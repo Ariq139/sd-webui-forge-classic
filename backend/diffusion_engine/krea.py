@@ -8,6 +8,7 @@ from huggingface_guess import model_list
 
 from backend import memory_management
 from backend.args import dynamic_args
+from backend.single_gpu_fastpaths import version_reference_latents
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
 from backend.misc.image_resize import resize_reference
 from backend.patcher.clip import CLIP
@@ -124,7 +125,7 @@ class Krea2(ForgeDiffusionEngine):
             images_vl.append(v)
             ref_latents.append(r.squeeze(2))
 
-        dynamic_args.ref_latents = ref_latents.copy()
+        dynamic_args.ref_latents = version_reference_latents(ref_latents, flag="krea_reference_cache")
         return self.text_processing_engine_qwen(prompt, images=images_vl)
 
     @torch.inference_mode()

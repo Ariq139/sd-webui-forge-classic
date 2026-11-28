@@ -9,16 +9,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
 
-from backend.attention import attention_function
+from backend.attention import attention_function, attention_pytorch
+from backend.args import args
 from backend.nn.flux import EmbedND
 from backend.operations import main_stream_worker, weights_manual_cast
 from backend.quant_ops import ck
+from backend.sampling.invariant_cache import cached_invariant, invariants_enabled, native_bound_method
+from backend.activation_quantization import shared_activation_scope
+from backend.weight_prefetch import weight_prefetch_scope
+from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
+from backend.single_gpu_fastpaths import dense_tokenwise_head, single_gpu_flag, uniform_unpatchify
+from backend.sampling.invariant_cache import cache_dependencies_safe
+from backend.operations_mixed_precision import try_native_int8_input_act
+from backend.native_gqa import try_flash_gqa
+from backend.gate_up_packing import try_packed_gate_up
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
 
+_NATIVE_ROPE_FORWARD = EmbedND.forward
+
+
 def modulate(x, scale):
-    return x * (1 + scale.unsqueeze(1))
+    return scale_modulation(x, scale)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
@@ -103,10 +116,17 @@ class JointAttention(nn.Module):
             xq, xk = ck.apply_rope(xq, xk, freqs_cis)
 
         n_rep = self.n_local_heads // self.n_local_kv_heads
-        if n_rep > 1:
-            xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-            xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-        output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
+        output = None
+        if (n_rep > 1 and single_gpu_flag("native_lumina_gqa")
+                and type(self) is JointAttention and attention_function is attention_pytorch):
+            output = try_flash_gqa(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2),
+                                   x_mask, transformer_options)
+        if output is None:
+            if n_rep > 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+            output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask,
+                                        skip_reshape=True, transformer_options=transformer_options)
 
         return self.out(output)
 
@@ -123,10 +143,23 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def _forward_silu_gating(self, x1, x3):
-        return clamp_fp16(F.silu(x1) * x3)
+        return silu_gate(x1, x3, fix_fp16=True)
 
     def forward(self, x):
-        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+        with shared_activation_scope(x, (self.w1, self.w3)):
+            pair = try_packed_gate_up(x, self.w1, self.w3)
+            w1, w3 = (self.w1(x), self.w3(x)) if pair is None else pair
+        # BF16 has no FP16 clamp in the original gating function.
+        # Only the native ConvRot quantizer is eligible; do not concatenate
+        # separate projections for a backend that would apply SiLU eagerly.
+        fused = (try_native_int8_input_act(self.w2, (w1, w3), "swiglu")
+                 if type(self) is FeedForward and w1.dtype == torch.bfloat16
+                 and single_gpu_flag("native_int8_mlp_activation") and cache_dependencies_safe(self)
+                 and native_bound_method(self._forward_silu_gating, _NATIVE_LUMINA_GATING) else None)
+        return self.w2(self._forward_silu_gating(w1, w3)) if fused is None else fused
+
+
+_NATIVE_LUMINA_GATING = FeedForward._forward_silu_gating
 
 
 class JointTransformerBlock(nn.Module):
@@ -168,7 +201,7 @@ class JointTransformerBlock(nn.Module):
             x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(
                 clamp_fp16(
                     self.attention(
-                        modulate(self.attention_norm1(x), scale_msa),
+                        norm_scale(self.attention_norm1, x, scale_msa),
                         x_mask,
                         freqs_cis,
                         transformer_options=transformer_options,
@@ -178,7 +211,7 @@ class JointTransformerBlock(nn.Module):
             x = x + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
                 clamp_fp16(
                     self.feed_forward(
-                        modulate(self.ffn_norm1(x), scale_mlp),
+                        norm_scale(self.ffn_norm1, x, scale_mlp),
                     )
                 )
             )
@@ -345,6 +378,10 @@ class NextDiT(nn.Module):
 
     def unpatchify(self, x: torch.Tensor, img_size: list[tuple[int, int]], cap_size: list[int], return_tensor=False) -> list[torch.Tensor]:
         pH = pW = self.patch_size
+        if return_tensor and type(self) is NextDiT and single_gpu_flag("native_token_assembly"):
+            result = uniform_unpatchify(x, img_size, cap_size, pH, self.out_channels)
+            if result is not None:
+                return result
         imgs = []
         for i in range(x.size(0)):
             H, W = img_size[i]
@@ -361,10 +398,18 @@ class NextDiT(nn.Module):
         pH = pW = self.patch_size
         device = x[0].device
         dtype = x[0].dtype
+        fast_assembly = (type(self) is NextDiT and single_gpu_flag("native_token_assembly")
+                         and not self.training and not torch.is_grad_enabled()
+                         and transformer_options.keys() <= {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                                            "uncond_indices", "sampling_sigmas"}
+                         and cache_dependencies_safe(self))
 
         if self.pad_tokens_multiple is not None:
             pad_extra = (-cap_feats.shape[1]) % self.pad_tokens_multiple
-            cap_feats = torch.cat((cap_feats, self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=True).unsqueeze(0).repeat(cap_feats.shape[0], pad_extra, 1)), dim=1)
+            if pad_extra or not fast_assembly:
+                pad = self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=not fast_assembly).unsqueeze(0)
+                pad = pad.expand(cap_feats.shape[0], pad_extra, -1) if fast_assembly else pad.repeat(cap_feats.shape[0], pad_extra, 1)
+                cap_feats = torch.cat((cap_feats, pad), dim=1)
 
         cap_pos_ids = torch.zeros(bsz, cap_feats.shape[1], 3, dtype=torch.float32, device=device)
         cap_pos_ids[:, :, 0] = torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0
@@ -375,19 +420,53 @@ class NextDiT(nn.Module):
         H_tokens, W_tokens = H // pH, W // pW
         x_pos_ids = torch.zeros((bsz, x.shape[1], 3), dtype=torch.float32, device=device)
         x_pos_ids[:, :, 0] = cap_feats.shape[1] + 1
-        x_pos_ids[:, :, 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
-        x_pos_ids[:, :, 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+        if fast_assembly:
+            grid = x_pos_ids.view(bsz, H_tokens, W_tokens, 3)
+            grid[..., 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(1, -1, 1)
+            grid[..., 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, 1, -1)
+        else:
+            x_pos_ids[:, :, 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            x_pos_ids[:, :, 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 
         if self.pad_tokens_multiple is not None:
             pad_extra = (-x.shape[1]) % self.pad_tokens_multiple
-            x = torch.cat((x, self.x_pad_token.to(device=x.device, dtype=dtype, copy=True).unsqueeze(0).repeat(x.shape[0], pad_extra, 1)), dim=1)
-            x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
+            if pad_extra or not fast_assembly:
+                pad = self.x_pad_token.to(device=x.device, dtype=dtype, copy=not fast_assembly).unsqueeze(0)
+                pad = pad.expand(x.shape[0], pad_extra, -1) if fast_assembly else pad.repeat(x.shape[0], pad_extra, 1)
+                x = torch.cat((x, pad), dim=1)
+                x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
 
-        freqs_cis = self.rope_embedder(torch.cat((cap_pos_ids, x_pos_ids), dim=1)).movedim(1, 2).to(dtype)
+        position_ids = torch.cat((cap_pos_ids, x_pos_ids), dim=1)
+        geometry = None
 
-        # refine context
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_mask, freqs_cis[:, : cap_pos_ids.shape[1]], transformer_options=transformer_options)
+        def compute_rope():
+            return self.rope_embedder(position_ids).movedim(1, 2).to(dtype)
+
+        if (type(self.rope_embedder) is EmbedND
+                and native_bound_method(self.rope_embedder.forward, _NATIVE_ROPE_FORWARD)
+                and invariants_enabled(self.rope_embedder, position_ids, transformer_options)):
+            geometry = (H_tokens, W_tokens, cap_pos_ids.shape[1], self.pad_tokens_multiple,
+                        tuple(self.rope_embedder.axes_dim), self.rope_embedder.theta, dtype)
+            freqs_cis = cached_invariant(self.rope_embedder, "lumina_rope", position_ids, transformer_options,
+                                        compute_rope, geometry=geometry, geometry_only=True)
+            packed_rope_hook = getattr(self, "_forge_packed_rope_hook", None)
+            if packed_rope_hook is not None and single_gpu_flag("nunchaku_rope_cache"):
+                packed_rope_hook.bind_geometry(self, freqs_cis, geometry, transformer_options)
+        else:
+            freqs_cis = compute_rope()
+
+        def refine_context():
+            features = cap_feats
+            for layer in self.context_refiner:
+                features = layer(features, cap_mask, freqs_cis[:, : cap_pos_ids.shape[1]], transformer_options=transformer_options)
+            return features
+
+        # A dynamic mask can alter the context-refiner output; do not cache it.
+        if cap_mask is None and geometry is not None:
+            cap_feats = cached_invariant(self, "lumina_context_refiner", cap_feats, transformer_options,
+                                         refine_context, geometry=geometry, dependencies=(self.context_refiner,))
+        else:
+            cap_feats = refine_context()
 
         padded_img_mask = None
         for layer in self.noise_refiner:
@@ -409,7 +488,9 @@ class NextDiT(nn.Module):
         t = self.t_embedder(t * self.time_scale, dtype=x.dtype)  # (N, D)
         adaln_input = t
 
-        cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+        cap_feats = cached_invariant(self, "lumina_text_projection", cap_feats, transformer_options,
+                                     lambda: self.cap_embedder(cap_feats), geometry=(x.dtype, x.device),
+                                     dependencies=(self.cap_embedder,))
 
         if self.clip_text_pooled_proj is not None:
             pooled = kwargs.get("clip_text_pooled", None)
@@ -425,17 +506,36 @@ class NextDiT(nn.Module):
         freqs_cis = freqs_cis.to(x.device)
 
         shard = getattr(self, "_anima_shard_devices", None)
-        for i, layer in enumerate(self.layers):
-            if shard and i == shard[2]:
-                x = x.to(shard[1])
-                mask = mask.to(shard[1]) if mask is not None else None
-                freqs_cis = freqs_cis.to(shard[1])
-                adaln_input = adaln_input.to(shard[1])
-            with torch.cuda.device(x.device) if shard else nullcontext():
-                x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+        with weight_prefetch_scope(x.device, transformer_options, enabled=type(self) is NextDiT and not shard and not self.training) as prefetch:
+            for i, layer in enumerate(self.layers):
+                if prefetch is not None:
+                    prefetch.stage(self.layers[i + 1] if i + 1 < len(self.layers) else None, x.dtype)
+                if shard and i == shard[2]:
+                    x = x.to(shard[1])
+                    mask = mask.to(shard[1]) if mask is not None else None
+                    freqs_cis = freqs_cis.to(shard[1])
+                    adaln_input = adaln_input.to(shard[1])
+                with torch.cuda.device(x.device) if shard else nullcontext():
+                    x = layer(x, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+                if prefetch is not None:
+                    prefetch.discard(layer)
 
         if shard:
             x, adaln_input = x.to(shard[0]), adaln_input.to(shard[0])
+        if (type(self) is NextDiT and type(self.final_layer) is FinalLayer
+                and single_gpu_flag("target_only_output_head") and not self.training
+                and not torch.is_grad_enabled() and not shard
+                and adaln_input.ndim == 2 and img_size and cap_size
+                and all(size == img_size[0] for size in img_size)
+                and all(size == cap_size[0] for size in cap_size)
+                and transformer_options.keys() <= {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices",
+                                                   "uncond_indices", "sampling_sigmas"}
+                and dense_tokenwise_head(self.final_layer)):
+            ih, iw = img_size[0]
+            start = cap_size[0]
+            end = start + (ih // self.patch_size) * (iw // self.patch_size)
+            x = x[:, start:end]
+            cap_size = [0] * len(cap_size)
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]
 

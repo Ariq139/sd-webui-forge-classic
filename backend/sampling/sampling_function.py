@@ -19,6 +19,7 @@ from backend import memory_management, utils
 from backend.args import args, dynamic_args
 from backend.sampling.condition import (
     Condition,
+    ConditionCrossAttn,
     compile_conditions,
     compile_weighted_conditions,
     repeat_to_batch_size,
@@ -29,6 +30,10 @@ from backend.sampling.krea_cache import (
     krea_text_fusion_revision,
 )
 from backend.performance import record_region
+from backend.sampling.invariant_cache import (
+    cache_dependencies_safe, clear_invariants, invariant_condition,
+    invariant_revision, invariant_scope_active,
+)
 from modules import shared
 
 
@@ -106,7 +111,7 @@ def condition_cache_allowed(model_options):
     )
 
 
-def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
+def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None, direct_full_area=False):
     batch_size = x_in.shape[0]
     batch_indices = conds.get("batch_indices")
     if batch_indices is not None:
@@ -130,7 +135,9 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
 
     input_x = x_in[:, :, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
 
-    if "mask" in conds:
+    if direct_full_area:
+        mult = None
+    elif "mask" in conds:
         mask_strength = 1.0
         if "mask_strength" in conds:
             mask_strength = conds["mask_strength"]
@@ -154,7 +161,7 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
     else:
         mult = torch.full_like(input_x, strength)
 
-    if "mask" not in conds:
+    if not direct_full_area and "mask" not in conds:
         rr = 8
         if area[2] != 0:
             for t in range(rr):
@@ -248,6 +255,36 @@ def cond_cat(c_list):
     return out
 
 
+def _assembled_native_conditions(groups, model, x, model_options, condition_cache, key):
+    if (key is None or not single_gpu_flag("assembled_condition_cache")
+            or not invariant_scope_active()
+            or not _native_full_area_cfg(model, x, model_options, condition_cache)
+            or not groups or not all(_standard_condition_fields(group) for group in groups)
+            or not cache_dependencies_safe(model.diffusion_model)):
+        return cond_cat(groups)
+    names = tuple(groups[0])
+    if any(tuple(group) != names for group in groups):
+        return cond_cat(groups)
+    from backend.sampling.invariant_cache import cached_invariant
+    source = groups[0][names[0]].cond
+    def version(tensor):
+        try:
+            return tensor._version
+        except RuntimeError:
+            # Native inference tensors use the existing semantic schedule key.
+            return None
+    geometry = tuple(tuple((name, tuple(group[name].cond.shape), group[name].cond.dtype,
+                            group[name].cond.device, version(group[name].cond)) for name in names)
+                     for group in groups)
+    def assemble():
+        merged = cond_cat(groups)
+        return tuple(merged[name] for name in names)
+    with invariant_condition(key):
+        values = cached_invariant(model.diffusion_model, "assembled_conditioning", source,
+                                  model_options.get("transformer_options", {}), assemble, geometry=geometry)
+    return dict(zip(names, values))
+
+
 def compute_cond_mark(cond_or_uncond, sigmas):
     cond_or_uncond_size = int(sigmas.shape[0])
     return sigmas.new_tensor(cond_or_uncond).repeat_interleave(cond_or_uncond_size)
@@ -277,26 +314,77 @@ def _cached_cond_indices(cond_or_uncond, sigma_batch_size):
     return tuple(cond_indices), tuple(uncond_indices)
 
 
-def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
-    out_cond = torch.zeros_like(x_in)
-    out_count = torch.full_like(x_in, 1e-37)
+from backend.single_gpu_fastpaths import reference_signature, schedule_options_safe, single_gpu_flag
 
-    out_uncond = torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None
-    out_uncond_count = torch.full_like(x_in, 1e-37) if uncond is not None else None
+
+def _native_full_area_cfg(model, x, model_options, condition_cache):
+    if (not getattr(args, "direct_full_area_cfg", False) or condition_cache is None
+            or x.ndim not in (4, 5) or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or set(model_options) - {"transformer_options"}
+            or not schedule_options_safe(model_options.get("transformer_options", {}))
+            or dynamic_args.ref_latents or dynamic_args.context_handler is not None
+            or any(getattr(args, key, None) is not None for key in
+                   ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+        return False
+    from backend.modules.k_model import KModel
+    from backend.nn.anima import Anima
+    from backend.nn.flux import IntegratedFluxTransformer2DModel
+    from backend.nn.lumina import NextDiT
+    from backend.nn.krea import SingleStreamDiT
+    from modules import script_callbacks
+
+    diffusion = getattr(model, "diffusion_model", None)
+    native_shape = (x.ndim == 4 and type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, NextDiT)
+                    or x.ndim == 5 and x.shape[2] == 1 and type(diffusion) in (Anima, SingleStreamDiT))
+    return (type(model) is KModel and native_shape
+            and not getattr(diffusion, "_anima_shard_devices", None)
+            and not any(script_callbacks.callback_map.get(key) for key in
+                        ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")))
+
+
+def _standard_condition_fields(fields):
+    return (isinstance(fields, dict) and bool(fields)
+            and fields.keys() <= {"c_crossattn", "y", "guidance"}
+            and all(type(value) in (Condition, ConditionCrossAttn)
+                    and type(value.cond) is torch.Tensor and value.cond.ndim > 0
+                    for value in fields.values()))
+
+
+def _unit_full_area(item, x):
+    strength = item.get("strength", 1.0)
+    if (not _standard_condition_fields(item.get("model_conds"))
+            or item.keys() - {"cross_attn", "pooled_output", "model_conds", "strength", "area"}
+            or not isinstance(strength, (int, float)) or strength != 1.0):
+        return False
+    area = item.get("area")
+    # 5D full-frame path admits only implicit whole-latent areas.
+    return area is None or (x.ndim == 4 and tuple(area) == (x.shape[2], x.shape[3], 0, 0))
+
+
+def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
+    direct = (uncond is not None and len(cond) == len(uncond) == 1
+              and _native_full_area_cfg(model, x_in, model_options, condition_cache)
+              and _unit_full_area(cond[0], x_in) and _unit_full_area(uncond[0], x_in))
+    out_cond = None if direct else torch.zeros_like(x_in)
+    out_count = None if direct else torch.full_like(x_in, 1e-37)
+
+    out_uncond = None if direct else (torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None)
+    out_uncond_count = torch.full_like(x_in, 1e-37) if uncond is not None and not direct else None
 
     COND = 0
     UNCOND = 1
 
     to_run = []
+    area_kwargs = {"direct_full_area": True} if direct else {}
     for x in cond:
-        p = get_area_and_mult(x, x_in, timestep, condition_cache)
+        p = get_area_and_mult(x, x_in, timestep, condition_cache, **area_kwargs)
         if p is None:
             continue
 
         to_run += [(p, COND)]
     if uncond is not None:
         for x in uncond:
-            p = get_area_and_mult(x, x_in, timestep, condition_cache)
+            p = get_area_and_mult(x, x_in, timestep, condition_cache, **area_kwargs)
             if p is None:
                 continue
 
@@ -368,7 +456,6 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 
         batch_chunks = len(cond_or_uncond)
         input_x = torch.cat(input_x)
-        c = cond_cat(c)
         batch_indices = first[0].batch_indices
         batch_timestep = timestep if batch_indices is None else repeat_to_batch_size(timestep, x_in.shape[0])[batch_indices]
         timestep_ = torch.cat([batch_timestep] * batch_chunks)
@@ -394,8 +481,6 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
         transformer_options["cond_mark"] = compute_cond_mark(cond_or_uncond=cond_or_uncond, sigmas=batch_timestep)
         transformer_options["cond_indices"], transformer_options["uncond_indices"] = compute_cond_indices(cond_or_uncond=cond_or_uncond, sigmas=batch_timestep)
 
-        c["transformer_options"] = transformer_options
-
         krea_condition_key = None
         if condition_parts_valid and condition_parts:
             candidate = (id(model), getattr(model, "patches_uuid", None), tuple(condition_parts))
@@ -405,6 +490,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             except TypeError:
                 pass
 
+        c = _assembled_native_conditions(c, model, x_in, model_options, condition_cache, krea_condition_key)
+        c["transformer_options"] = transformer_options
         batch_context = contextlib.nullcontext() if batch_indices is None else conditioning_batch(control, batch_indices, x_in.shape[0])
         with batch_context:
             if control is not None:
@@ -425,9 +512,18 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
             if "model_function_wrapper" in model_options:
                 output = model_options["model_function_wrapper"](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
             else:
-                with krea_text_fusion_condition(krea_condition_key):
+                with krea_text_fusion_condition(krea_condition_key), invariant_condition(krea_condition_key):
                     output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
         del input_x
+
+        if direct:
+            for index, kind in enumerate(cond_or_uncond):
+                prediction = output[index].to(dtype=x_in.dtype)
+                if kind == COND:
+                    out_cond = prediction
+                else:
+                    out_uncond = prediction
+            continue
 
         rows = slice(None) if batch_indices is None else batch_indices
         for o in range(batch_chunks):
@@ -439,6 +535,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
                 out_uncond_count[rows, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
         del mult
 
+    if direct:
+        return out_cond, out_uncond
     out_cond /= out_count
     del out_count
     if out_uncond_count is not None:
@@ -448,8 +546,10 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 
 
 def single_condition_fast_path_eligible(model, cond, x, model_options, condition_cache):
-    if condition_cache is None or x.ndim != 4 or len(cond) != 1 or not condition_cache_allowed(model_options):
+    if condition_cache is None or len(cond) != 1 or not condition_cache_allowed(model_options):
         return False
+    if x.ndim != 4:
+        return _native_full_area_cfg(model, x, model_options, condition_cache) and _unit_full_area(cond[0], x)
     if model_options.get("model_function_wrapper"):
         return False
     if getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None):
@@ -476,7 +576,15 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
         name: value.process_cond(batch_size=x.shape[0], device=x.device, area=area, cache=condition_cache)
         for name, value in item["model_conds"].items()
     }
-    c = cond_cat([conditioning])
+    if (_native_full_area_cfg(model, x, model_options, condition_cache)
+            and _standard_condition_fields(item["model_conds"])
+            and _standard_condition_fields(conditioning)
+            and cache_dependencies_safe(model.diffusion_model)):
+        # Do not expose a reused conditioning tensor to extension hooks,
+        # subclasses, or custom condition implementations.
+        c = {name: value.cond for name, value in conditioning.items()}
+    else:
+        c = cond_cat([conditioning])
     transformer_options = model_options.get("transformer_options", {}).copy()
     transformer_options["cond_or_uncond"] = [0]
     transformer_options["sigmas"] = timestep
@@ -484,7 +592,22 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
     transformer_options["cond_indices"] = list(range(timestep.shape[0]))
     transformer_options["uncond_indices"] = []
     c["transformer_options"] = transformer_options
-    with record_region("forge::single_condition_cfg1"):
+    keys = tuple((name, getattr(value, "cache_key", None)) for name, value in item["model_conds"].items())
+    invariant_key = None
+    if (condition_cache is not None and condition_cache_allowed(model_options)
+            and keys and all(key is not None for _, key in keys)):
+        candidate = (id(model), getattr(model, "patches_uuid", None), ((keys, area, None, 0),))
+        try:
+            hash(candidate)
+            invariant_key = candidate
+        except TypeError:
+            pass
+    krea_key = invariant_key if invariant_scope_active() else None
+    from backend.resident_denoiser_graph import graph_scope_active, graph_candidate
+    graph_ok = (graph_scope_active() and _native_full_area_cfg(model, x, model_options, condition_cache)
+                and _unit_full_area(item, x) and _standard_condition_fields(conditioning))
+    with (record_region("forge::single_condition_cfg1"), invariant_condition(invariant_key),
+          krea_text_fusion_condition(krea_key), graph_candidate(graph_ok)):
         return model.apply_model(x, timestep, **c)
 
 
@@ -649,10 +772,45 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     if parallel_cfg is None and (batch_mode or (args.parallel_cfg is not None and not math.isclose(cond_scale, 1.0))):
         parallel_cfg = _load_parallel_cfg(unet_patcher, cond, uncond, model_options, x, batch_mode=batch_mode)
     try:
-        with krea_text_fusion_revision((id(unet_patcher), unet_patcher.patches_uuid)):
+        revision = (id(unet_patcher), unet_patcher.patches_uuid)
+        invariant_revision_key = None
+        ref_signature = None
+        if dynamic_args.ref_latents:
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            from backend.nn.krea import SingleStreamDiT
+            diffusion_type = type(getattr(model, "diffusion_model", None))
+            if ((diffusion_type is IntegratedFluxTransformer2DModel and single_gpu_flag("flux_reference_cache"))
+                    or (diffusion_type is SingleStreamDiT and single_gpu_flag("krea_reference_cache"))):
+                ref_signature = reference_signature(dynamic_args.ref_latents)
+        if (getattr(args, "invariant_cache_mib", 0) > 0 and condition_cache is not None
+                and cond_cache_key is not None and (uncond is None or math.isclose(cond_scale, 1.0) or uncond_cache_key is not None)
+                and parallel_cfg is None and control is None and extra_concat_condition is None
+                and not unet_patcher.object_patches and not unet_patcher.extra_model_patchers_during_sampling
+                and not getattr(unet_patcher, "weight_wrapper_patches", None)
+                and set(model_options) <= {"transformer_options"}
+                and not getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None)
+                and (not dynamic_args.ref_latents or ref_signature is not None) and dynamic_args.context_handler is None):
+            from modules import script_callbacks
+            from backend.nn.anima import Anima
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            from backend.nn.krea import SingleStreamDiT
+            from backend.nn.lumina import NextDiT
+            diffusion = getattr(model, "diffusion_model", None)
+            native = type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
+            packed_rope_only = False
+            if (not native and single_gpu_flag("nunchaku_rope_cache")
+                    and type(diffusion).__module__ == "backend.nn.svdq"):
+                from backend.nn.svdq import nunchaku_rope_cache_safe
+                packed_rope_only = nunchaku_rope_cache_safe(diffusion)
+            if ((native or packed_rope_only)
+                    and not any(script_callbacks.callback_map.get(key) for key in
+                                ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))):
+                invariant_revision_key = (revision, ref_signature) if ref_signature is not None else revision
+        with krea_text_fusion_revision(revision), invariant_revision(invariant_revision_key):
             return sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=return_full, condition_cache=condition_cache, parallel_cfg=parallel_cfg)
     except BaseException as error:
         clear_current_krea_cache()
+        clear_invariants()
         _release_parallel_cfg(unet_patcher)
         if parallel_cfg is not None and isinstance(error, Exception) and memory_management.is_oom(error):
             try:

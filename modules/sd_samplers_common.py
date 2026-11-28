@@ -527,8 +527,10 @@ class Sampler:
         state.sampling_step = 0
         state.preview_step = 0
 
+        from backend.resident_denoiser_graph import sampling_graph_scope
         try:
-            return func()
+            with sampling_graph_scope():
+                return func()
         except RecursionError:
             print("Encountered RecursionError during sampling; try to use a smaller rho value instead")
             return state.current_latent

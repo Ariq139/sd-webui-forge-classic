@@ -8,6 +8,7 @@ from backend import memory_management
 from backend.args import args as cli_args
 from backend.memory_management import cast_to_device, logger
 from backend.operations_lora import activation_space_lora_patches, apply_activation_space_lora
+from backend.activation_quantization import quantize_shared_activation, try_shared_int8_linear
 from backend.performance import record_region
 
 from .operations import (
@@ -381,7 +382,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                         scale = getattr(self, "input_scale", None)
                         if scale is not None:
                             scale = cast_to_device(scale, input.device, None)
-                        input = QuantizedTensor.from_float(input_reshaped, self.layout_type, scale=scale)
+                        input = quantize_shared_activation(input, input_reshaped, self.layout_type, scale, QuantizedTensor.from_float)
 
                 weight_only_quant = _use_quantized and not quantize_input and isinstance(self.weight, QuantizedTensor)
 
@@ -403,7 +404,17 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     with record_region(region):
                         if self._full_precision_mm and isinstance(weight, QuantizedTensor):
                             weight = weight.dequantize()
-                        output = torch.nn.functional.linear(input, weight, bias)
+                        output = None
+                        if (weight_only_quant and getattr(cli_args, "shared_activation_quantization", False)
+                                and isinstance(weight, QuantizedTensor) and weight._layout_cls == "TensorWiseINT8Layout"
+                                and getattr(weight._params, "is_weight", True)
+                                and getattr(weight._params, "convrot_groupsize", 256) == 256):
+                            raw_weight, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+                            output = try_shared_int8_linear(input, raw_weight, scale, bias,
+                                                            convrot=getattr(weight._params, "convrot", False),
+                                                            transposed=getattr(weight._params, "transposed", False), module=self)
+                        if output is None:
+                            output = torch.nn.functional.linear(input, weight, bias)
 
                 if reshaped_nd:
                     output = output.reshape((*input_shape[:-1], self.weight.shape[0]))
@@ -702,3 +713,90 @@ def linear_input_act(linear: torch.nn.Linear, x: torch.Tensor, input_act: str, a
                 residual=residual,
                 residual_scale=residual_scale,
             )
+
+
+def try_native_int8_input_act(linear, x, input_act):
+    """Opt-in activation fusion only for the pinned native ConvRot implementation.
+
+    Unlike linear_input_act, this helper deliberately does not bypass the
+    ordinary module forward for patched, offloaded or unsupported weights.
+    A tuple is a pair of separate gate/up outputs, packed only after eligibility.
+    """
+    from backend.single_gpu_fastpaths import single_gpu_flag
+    from backend.sampling.invariant_cache import cache_dependencies_safe
+
+    if not single_gpu_flag("native_int8_mlp_activation") or torch.is_grad_enabled():
+        return None
+    sample = x[0] if isinstance(x, tuple) else x
+    if (type(sample) is not torch.Tensor or not sample.is_cuda
+            or sample.dtype not in (torch.float16, torch.bfloat16)
+            or torch.is_autocast_enabled(sample.device.type)
+            or type(linear).__module__ != __name__
+            or type(linear).__qualname__ != "mixed_precision_ops.<locals>.MixedPrecisionOps.Linear"
+            or not cache_dependencies_safe(linear)
+            or linear.weight_function or linear.bias_function
+            or linear._full_precision_mm or getattr(linear, "forge_force_cast_weights", False)
+            or getattr(linear, "input_scale", None) is not None
+            or QUANT_ALGOS.get(getattr(linear, "quant_format", None), {}).get("quantize_input", True)):
+        return None
+    weight = linear.weight
+    if (not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout"
+            or weight.device != sample.device or weight.dtype != sample.dtype
+            or not getattr(weight._params, "is_weight", True)
+            or not getattr(weight._params, "convrot", False)
+            or getattr(weight._params, "transposed", False)
+            or getattr(weight._params, "convrot_groupsize", 256) != 256):
+        return None
+    if isinstance(x, tuple):
+        if (input_act != "swiglu" or len(x) != 2 or sample.dtype != torch.bfloat16
+                or any(type(t) is not torch.Tensor or t.shape != sample.shape
+                       or t.device != sample.device or t.dtype != sample.dtype for t in x)):
+            return None
+        k = sample.shape[-1]
+    else:
+        if input_act not in ("gelu_tanh", "swiglu"):
+            return None
+        if input_act == "swiglu" and sample.shape[-1] % 2:
+            return None
+        k = sample.shape[-1] // (2 if input_act == "swiglu" else 1)
+    if not k or k != linear.in_features or k % 256:
+        return None
+    raw, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    bias = linear.bias
+    if (raw.device != sample.device or scale.device != sample.device or raw.dtype != torch.int8
+            or raw.ndim != 2 or raw.shape != (linear.out_features, k)
+            or not raw.is_contiguous() or (bias is not None and
+                (bias.device != sample.device or bias.dtype != sample.dtype))):
+        return None
+    # The private capacity predicate is version-pinned. If it changes, retain
+    # the authoritative original module path rather than guess at fusion.
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+        if version("comfy-kitchen") != "0.2.40":
+            return None
+        from comfy_kitchen.backends import cuda
+        from comfy_kitchen import registry
+        from comfy_kitchen.exceptions import NoCapableBackendError
+        capacity = cuda._convrot_fused_shared_memory_fits
+        max_k = cuda._CONVROT_FUSED_MAX_K
+    except (ImportError, AttributeError, PackageNotFoundError):
+        return None
+    if k > max_k or not capacity(sample.reshape(-1, sample.shape[-1]), k, 256):
+        return None
+    if isinstance(x, tuple):
+        # Gate/up activations are small relative to the weights, but packing
+        # is still a measured experiment, not a guaranteed latency win.
+        if torch.cuda.mem_get_info(sample.device)[0] < 256 * 1024**2 + sum(t.numel() * t.element_size() for t in x):
+            return None
+        x = torch.cat(x, dim=-1)
+    kwargs = dict(x=x, weight=raw, weight_scale=scale, bias=bias,
+                  out_dtype=x.dtype, convrot=True, convrot_groupsize=256,
+                  input_act=input_act, input_act_weight=None, input_act_eps=0.0,
+                  residual=None, residual_scale=None)
+    try:
+        if registry.get_capable_backend("int8_linear", kwargs) != "cuda":
+            return None
+    except NoCapableBackendError:
+        return None
+    with record_region("forge::native_int8_mlp_activation"):
+        return ck.int8_linear(**kwargs)

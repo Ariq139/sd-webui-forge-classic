@@ -8,6 +8,7 @@ from weakref import WeakSet
 import torch
 
 from backend.performance import record_region
+from backend.sampling.invariant_cache import cache_dependencies_safe
 
 
 _MAX_CACHE_BYTES = 16 * 1024 * 1024
@@ -112,12 +113,16 @@ def _safe_transformer_options(options):
     return options.keys() <= allowed
 
 
-def cached_krea_text_features(module, context, transformer_options, compute):
+def cached_krea_text_features(module, context, transformer_options, compute, *, dependencies=()):
     """Return cached Krea text features when the semantic conditioning key is stable."""
     cache = _CACHE.get()
     condition_key = _CONDITION_KEY.get()
     if (cache is None or condition_key is None or not isinstance(context, torch.Tensor)
             or torch.is_grad_enabled() or module.training or not _safe_transformer_options(transformer_options)):
+        return compute()
+    if (module._forward_hooks or module._forward_pre_hooks or torch.is_autocast_enabled(context.device.type)
+            or not cache_dependencies_safe(*dependencies)):
+        cache.clear()
         return compute()
 
     try:

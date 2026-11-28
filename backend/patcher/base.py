@@ -177,6 +177,7 @@ class ModelPatcher:
         self.patches_uuid = uuid.uuid4()
         self.parent = None
         self.pinned = set()
+        self.pinned_quantized_sources = {}
 
         if not hasattr(self.model, "model_loaded_weight_memory"):
             self.model.model_loaded_weight_memory = 0
@@ -221,6 +222,7 @@ class ModelPatcher:
         n.backup = self.backup
         n.object_patches_backup = self.object_patches_backup
         n.pinned = self.pinned
+        n.pinned_quantized_sources = self.pinned_quantized_sources
 
         return n
 
@@ -498,14 +500,43 @@ class ModelPatcher:
             return set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key), return_weight=return_weight)
 
     def pin_weight_to_device(self, key):
+        if key in self.pinned:
+            return
         weight, _, _ = get_key_weight(self.model, key)
+        from backend.single_gpu_fastpaths import single_gpu_flag
+        if single_gpu_flag("pin_quantized_weights"):
+            from backend.quantized_storage import packed_storage
+            storage = packed_storage(weight)
+            if storage is not None:
+                # Retain only registrations we actually own, including partial success.
+                for source_part in storage.parts:
+                    # Registration owns the exact allocation even if the wrapper
+                    # later rebinds a scale or packed data tensor.
+                    part = source_part.detach()
+                    if memory_management.pin_raw_memory(part):
+                        self.pinned.add(key)
+                        self.pinned_quantized_sources.setdefault(key, []).append(part)
+                return
+        raw = memory_management.packed_gguf_pin_storage(weight)
         if memory_management.pin_memory(weight):
             self.pinned.add(key)
+            if raw is not None:
+                self.pinned_quantized_sources[key] = [raw]
 
     def unpin_weight(self, key):
         if key in self.pinned:
-            weight, _, _ = get_key_weight(self.model, key)
-            memory_management.unpin_memory(weight)
+            raw = self.pinned_quantized_sources.get(key)
+            if raw is not None:
+                # Retain the original registration owner even if the module's
+                # weight was replaced or repacked. Do not free it on failure.
+                while raw:
+                    if not memory_management.unpin_memory(raw[-1]):
+                        raise RuntimeError(f"Unable to unregister packed weight storage: {key}")
+                    raw.pop()
+                del self.pinned_quantized_sources[key]
+            else:
+                weight, _, _ = get_key_weight(self.model, key)
+                memory_management.unpin_memory(weight)
             self.pinned.remove(key)
 
     def unpin_all_weights(self):
@@ -647,6 +678,9 @@ class ModelPatcher:
 
         for x in load_completely:
             x[2].to(device_to)
+
+        from backend.gate_up_packing import pack_offloaded_gate_up
+        pack_offloaded_gate_up(self, offloaded)
 
         for x in offloaded:
             n = x[1]

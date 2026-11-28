@@ -1,0 +1,193 @@
+"""Opt-in, sampling-scoped storage for immutable single-GPU features."""
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+import torch
+
+from backend.performance import record_region
+
+_CACHE = ContextVar("forge_invariant_cache", default=None)
+_REVISION = ContextVar("forge_invariant_revision", default=None)
+_CONDITION = ContextVar("forge_invariant_condition", default=None)
+_SAFE_OPTIONS = frozenset({"cond_or_uncond", "sigmas", "cond_mark", "cond_indices", "uncond_indices", "sampling_sigmas"})
+
+
+def _bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.untyped_storage().nbytes() if value.device.type != "meta" else 0
+    if isinstance(value, tuple):
+        return sum(_bytes(item) for item in value)
+    return 0
+
+
+class InvariantCache:
+    def __init__(self, max_bytes):
+        self.max_bytes = max(0, int(max_bytes))
+        self.bytes_used = 0
+        self.entries = {}
+        self.sources = {}
+        self.revision = None
+
+    def put(self, key, value):
+        size = _bytes(value)
+        # Admission rather than LRU eviction avoids thrashing when all layers
+        # are visited in the same order on each denoising evaluation.
+        if key in self.entries or not size or self.bytes_used + size > self.max_bytes:
+            return False
+        # Avoid retaining additional GPU storage under pressure. The reserved
+        # allocator pool may be reusable, but the driver-only check is deliberately
+        # conservative for an experimental cache on an 8 GB GPU.
+        sample = value[0] if isinstance(value, tuple) and value else value
+        if isinstance(sample, torch.Tensor) and sample.is_cuda:
+            free, _ = torch.cuda.mem_get_info(sample.device)
+            if free < 256 * 1024 * 1024 + size:
+                return False
+        self.entries[key] = value
+        self.bytes_used += size
+        return True
+
+    def clear(self):
+        self.entries.clear()
+        self.sources.clear()
+        self.bytes_used = 0
+
+
+@contextmanager
+def sampling_invariant_scope(max_bytes):
+    cache = InvariantCache(max_bytes) if max_bytes > 0 else None
+    token = _CACHE.set(cache)
+    try:
+        yield cache
+    finally:
+        if cache is not None:
+            cache.clear()
+        _CACHE.reset(token)
+
+
+@contextmanager
+def invariant_revision(revision):
+    cache = _CACHE.get()
+    if cache is not None and cache.revision != revision:
+        cache.clear()
+        cache.revision = revision
+    token = _REVISION.set(revision)
+    try:
+        yield
+    finally:
+        _REVISION.reset(token)
+
+
+@contextmanager
+def invariant_condition(key):
+    token = _CONDITION.set(key)
+    try:
+        yield
+    finally:
+        _CONDITION.reset(token)
+
+
+def invariant_scope_active():
+    return _CACHE.get() is not None and _REVISION.get() is not None
+
+
+def retain_reference_sources(refs):
+    cache = _CACHE.get()
+    if cache is None or _REVISION.get() is None:
+        return False
+    # Keep source identities alive until the revision changes or sampling ends.
+    for ref in refs:
+        cache.sources[("reference", id(ref))] = ref
+    return True
+
+
+def clear_invariants():
+    cache = _CACHE.get()
+    if cache is not None:
+        cache.clear()
+
+
+def invariants_enabled(module, tensor, options):
+    return (_CACHE.get() is not None and _REVISION.get() is not None
+            and _CONDITION.get() is not None and not torch.is_grad_enabled()
+            and isinstance(tensor, torch.Tensor) and not module.training
+            and not any(name in vars(module) for name in ("forward", "_forward", "_call_impl"))
+            and not module._forward_hooks and not module._forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks
+            and not torch.is_autocast_enabled(tensor.device.type)
+            and isinstance(options, dict) and options.keys() <= _SAFE_OPTIONS)
+
+
+def native_bound_method(method, original):
+    """Reject instance replacements and class methods changed since import."""
+    return getattr(method, "__func__", None) is original
+
+
+def call_native_with_options(method, original, *args, transformer_options, **kwargs):
+    """Keep the legacy call shape unless the audited sampling path is active."""
+    if invariant_scope_active() and native_bound_method(method, original):
+        kwargs["transformer_options"] = transformer_options
+    return method(*args, **kwargs)
+
+
+def cache_dependencies_safe(*dependencies):
+    """Do not skip a module whose forward may be externally observable."""
+    if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
+        return False
+    return all(not child.training and not child._forward_hooks and not child._forward_pre_hooks
+               and not any(name in vars(child) for name in ("forward", "_forward", "_call_impl"))
+               for dependency in dependencies if dependency is not None
+               for child in dependency.modules())
+
+
+def cached_invariant(module, kind, tensor, options, compute, *, geometry=(), clone=False,
+                     geometry_only=False, dependencies=()):
+    """Cache only an explicitly proved invariant, never a denoiser output."""
+    if not invariants_enabled(module, tensor, options):
+        return compute()
+    cache = _CACHE.get()
+    if dependencies and not cache_dependencies_safe(*dependencies):
+        cache.clear()
+        return compute()
+    try:
+        version = tensor._version
+    except RuntimeError:
+        version = None  # only semantically keyed, native inference calls reach here
+    # Position embeddings depend on the audited geometry, not prompt contents
+    # or the latent's version. Retain the condition-scope eligibility check.
+    key = (_REVISION.get(), None if geometry_only else _CONDITION.get(), module, kind, tensor.device,
+           tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()),
+           None if geometry_only else version, geometry)
+    try:
+        hash(key)
+    except TypeError:
+        return compute()
+    value = cache.entries.get(key)
+    if value is not None:
+        with record_region("forge::invariant_cache_hit::" + kind):
+            return value.clone() if clone else value
+    with record_region("forge::invariant_cache_miss::" + kind):
+        value = compute()
+    if cache.put(key, value) and clone:
+        return value.clone()
+    return value
+
+
+def cached_adapter_cast(source, inputs, cast):
+    """Reuse a converted adapter only while its source/version is unchanged."""
+    cache = _CACHE.get()
+    if (cache is None or torch.is_grad_enabled() or not isinstance(source, torch.Tensor)
+            or (source.device == inputs.device and source.dtype == inputs.dtype)):
+        return cast(source, inputs.device, inputs.dtype)
+    try:
+        version = source._version
+    except RuntimeError:
+        return cast(source, inputs.device, inputs.dtype)
+    key = ("adapter", id(source), version, inputs.device, inputs.dtype)
+    value = cache.entries.get(key)
+    if value is not None and cache.sources.get(id(source)) is source:
+        return value
+    value = cast(source, inputs.device, inputs.dtype)
+    if cache.put(key, value):
+        cache.sources[id(source)] = source
+    return value

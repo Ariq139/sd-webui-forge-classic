@@ -416,6 +416,10 @@ class TransformerBlockGemma2(nn.Module):
         return x, present_key_value
 
 
+from backend.single_gpu_fastpaths import requested_layer_stop
+from backend.sampling.invariant_cache import cache_dependencies_safe
+
+
 class Llama2_(nn.Module):
     def __init__(self, config: Qwen3_06BConfig | Qwen3_4BConfig | Qwen3_8BConfig | Qwen25_7BVLI_Config | Gemma2_2B_Config):
         super().__init__()
@@ -440,7 +444,7 @@ class Llama2_(nn.Module):
         if getattr(config, "lm_head", False):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], input_ids=None, deepstack_embeds=None, visual_pos_masks=None, **kwargs):
+    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], input_ids=None, deepstack_embeds=None, visual_pos_masks=None, intermediate_only=False, **kwargs):
         if embeds is not None:
             x = embeds
         else:
@@ -469,6 +473,13 @@ class Llama2_(nn.Module):
             else:
                 mask = causal_mask
 
+        stop = None
+        if (intermediate_only and not final_layer_norm_intermediate and not torch.is_grad_enabled()
+                and type(self.config) in (Qwen3_4BConfig, Qwen3_8BConfig)
+                and deepstack_embeds is None and visual_pos_masks is None
+                and cache_dependencies_safe(self)):
+            stop = requested_layer_stop(intermediate_output, len(self.layers))
+
         intermediate = None
         all_intermediate = None
         only_layers = None
@@ -486,6 +497,8 @@ class Llama2_(nn.Module):
             if all_intermediate is not None:
                 if only_layers is None or (i in only_layers):
                     all_intermediate.append(x.unsqueeze(1).clone())
+            if stop == (i, True):
+                return None, torch.cat(all_intermediate, dim=1)
 
             x, _ = layer(
                 x=x,
@@ -500,6 +513,8 @@ class Llama2_(nn.Module):
 
             if i == intermediate_output:
                 intermediate = x.clone()
+            if stop == (i, False):
+                return None, intermediate
 
         if self.norm is not None:
             x = self.norm(x)

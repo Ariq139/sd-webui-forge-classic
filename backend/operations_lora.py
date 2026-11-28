@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as functional
 from backend import memory_management
+from backend.sampling.invariant_cache import cached_adapter_cast
 
 _activation_lora_logged = False
 
@@ -58,8 +59,8 @@ def apply_activation_space_lora(output, inputs, patches):
     for up, down, scale in patches:
         if scale == 0:
             continue
-        down = memory_management.cast_to_device(down, inputs.device, inputs.dtype)
-        up = memory_management.cast_to_device(up, inputs.device, inputs.dtype)
+        down = cached_adapter_cast(down, inputs, memory_management.cast_to_device)
+        up = cached_adapter_cast(up, inputs, memory_management.cast_to_device)
         hidden = functional.linear(inputs, down)
         delta = functional.linear(hidden, up)
         if scale != 1:

@@ -6,6 +6,7 @@ import torch
 
 import modules.shared as shared
 from backend.sampling.sampling_function import sampling_cleanup, sampling_prepare
+from backend.single_gpu_fastpaths import versioned_schedule
 from modules import devices, sd_samplers_cfg_denoiser, sd_samplers_common, sd_samplers_extra, sd_schedulers
 from modules.script_callbacks import ExtraNoiseParams, extra_noise_callback
 from modules.sd_samplers_cfg_denoiser import CFGDenoiser  # noqa: F401
@@ -145,7 +146,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         steps, t_enc = sd_samplers_common.setup_img2img_steps(p, steps)
 
-        sigmas = self.get_sigmas(p, steps).to(x.device)
+        sigmas = versioned_schedule(self.get_sigmas(p, steps).to(x.device))
         sigma_sched = sigmas[steps - t_enc - 1 :]
 
         x = x.to(noise)
@@ -210,7 +211,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         steps = steps or p.steps
 
-        sigmas = self.get_sigmas(p, steps).to(x.device)
+        sigmas = versioned_schedule(self.get_sigmas(p, steps).to(x.device))
 
         if opts.sgm_noise_multiplier:
             p.extra_generation_params["SGM noise multiplier"] = True

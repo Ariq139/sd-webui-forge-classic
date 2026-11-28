@@ -70,16 +70,46 @@ class KModel(torch.nn.Module):
 
             xc = xc.to(dtype)
             t = self.predictor.timestep(t).float()
-            context = context.to(dtype)
+            from backend.single_gpu_fastpaths import single_gpu_flag
+            from backend.sampling.invariant_cache import cached_invariant, invariants_enabled, cache_dependencies_safe
+            typed_cache = False
+            if (single_gpu_flag("assembled_condition_cache") and type(self) is KModel
+                    and c_concat is None and control is None and not shard
+                    and kwargs.keys() <= {"y", "guidance"}
+                    and type(context) is torch.Tensor
+                    and invariants_enabled(self.diffusion_model, context, transformer_options)):
+                from backend.nn.anima import Anima
+                from backend.nn.flux import IntegratedFluxTransformer2DModel
+                from backend.nn.lumina import NextDiT
+                # Krea text fusion has in-place residuals; keep its casts separate.
+                typed_cache = (type(self.diffusion_model) in (Anima, IntegratedFluxTransformer2DModel, NextDiT)
+                               and cache_dependencies_safe(self.diffusion_model))
+
+            def cast_condition(value, name):
+                if typed_cache and type(value) is torch.Tensor and value.dtype != dtype:
+                    return cached_invariant(self.diffusion_model, "typed_condition_" + name, value,
+                                            transformer_options, lambda: value.to(dtype), geometry=(dtype,))
+                return value.to(dtype)
+
+            context = cast_condition(context, "context")
             extra_conds = {}
             for o in kwargs:
                 extra = kwargs[o]
                 if hasattr(extra, "dtype"):
                     if extra.dtype != torch.int and extra.dtype != torch.long:
-                        extra = extra.to(dtype)
+                        extra = cast_condition(extra, o)
                 extra_conds[o] = extra
 
-            model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()
+            graph_output = None
+            if getattr(args.args, "resident_denoiser_graph_mib", 0) > 0:
+                from backend.resident_denoiser_graph import discard_resident_graph, try_resident_graph
+                if c_concat is None and control is None and not shard:
+                    graph_output = try_resident_graph(self.diffusion_model, xc, t, context, transformer_options, extra_conds)
+                else:
+                    discard_resident_graph()
+            if graph_output is None:
+                graph_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds)
+            model_output = graph_output.float()
             return self.predictor.calculate_denoised(sigma, model_output, x)
         finally:
             if shard:

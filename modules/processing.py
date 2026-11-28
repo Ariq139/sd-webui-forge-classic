@@ -27,6 +27,7 @@ import modules.shared as shared
 from backend import args, memory_management
 from backend.logging import setup_logger
 from backend.performance import record_region
+from backend.image_postprocessing import can_decode_direct_pixels, chw_to_uint8
 from backend.modules.k_prediction import rescale_zero_terminal_snr_sigmas
 from backend.utils import hash_tensor
 from modules.latent_retention import retain_latents, scripts_require_latents
@@ -1257,6 +1258,8 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
             from backend.sampling.krea_cache import sampling_krea_cache_scope
+            from backend.sampling.invariant_cache import sampling_invariant_scope
+            from backend.args import args as backend_args
 
             unet_patcher = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
             model = getattr(unet_patcher, "model", None)
@@ -1266,7 +1269,10 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 getattr(unet_patcher, "patches_uuid", None),
             )
             position_embedder = getattr(getattr(model, "diffusion_model", None), "pe_embedder", None)
-            with sampling_krea_cache_scope(cache_namespace, position_embedder=position_embedder):
+            invariant_mib = getattr(backend_args, "invariant_cache_mib", 0)
+            if any(getattr(backend_args, key, None) is not None for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch")):
+                invariant_mib = 0
+            with sampling_krea_cache_scope(cache_namespace, position_embedder=position_embedder), sampling_invariant_scope(invariant_mib * 1024 * 1024):
                 samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
             for sample_index, x_sample in enumerate(samples_ddim):
@@ -1284,12 +1290,25 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 samples_ddim = ps.samples
                 del ps  # Do not retain this batch through the next sampling call.
 
+            direct_pixels = False
             if getattr(samples_ddim, "already_decoded", False):
                 x_samples_ddim = samples_ddim
             else:
                 if opts.sd_vae_decode_method != "Full":
                     p.extra_generation_params["VAE Decoder"] = opts.sd_vae_decode_method
-                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True, as_tensor=True)
+                if (getattr(backend_args, "vae_direct_pixels", False)
+                        and opts.sd_vae_decode_method == "Full"
+                        and not (state.interrupted or state.skipped or state.stopping_generation)
+                        and not any(getattr(backend_args, key, None) is not None for key in
+                                    ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+                    from backend.diffusion_engine.base import ForgeDiffusionEngine
+                    from backend.patcher.vae import VAE
+                    direct_pixels = can_decode_direct_pixels(p.sd_model, samples_ddim, ForgeDiffusionEngine, VAE)
+                if direct_pixels:
+                    with record_region("forge::vae_direct_pixels"):
+                        x_samples_ddim = p.sd_model.decode_first_stage_pixels(samples_ddim, output_device=devices.cpu)
+                else:
+                    x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True, as_tensor=True)
 
             if not isinstance(x_samples_ddim, torch.Tensor):
                 x_samples_ddim = torch.stack(x_samples_ddim)
@@ -1301,7 +1320,10 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
             ):
                 # Passthrough decoders and views must not mutate retained samples.
                 x_samples_ddim = x_samples_ddim.clone()
-            x_samples_ddim.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
+            with record_region("forge::cpu_pixel_normalization"):
+                if not direct_pixels:
+                    x_samples_ddim.add_(1.0).mul_(0.5)
+                x_samples_ddim.clamp_(0.0, 1.0)
 
             if len(x_samples_ddim.shape) == 5:
                 x_samples_ddim = x_samples_ddim.reshape(-1, *x_samples_ddim.shape[-3:])
@@ -1365,10 +1387,14 @@ def _process_images_inner(p: StableDiffusionProcessing) -> Processed:
                         f"Decoded image has invalid shape {tuple(x_sample.shape)}; "
                         "the selected VAE/model did not return an RGB/RGBA image."
                     )
-                if x_sample.shape[0] == 1:
-                    x_sample = np.repeat(x_sample, 3, axis=0)
-                x_sample = 255.0 * np.moveaxis(x_sample, 0, 2)
-                x_sample = x_sample.astype(np.uint8)
+                with record_region("forge::cpu_pixel_uint8"):
+                    if getattr(backend_args, "fast_image_postprocess", False):
+                        x_sample = chw_to_uint8(x_sample)
+                    else:
+                        if x_sample.shape[0] == 1:
+                            x_sample = np.repeat(x_sample, 3, axis=0)
+                        x_sample = 255.0 * np.moveaxis(x_sample, 0, 2)
+                        x_sample = x_sample.astype(np.uint8)
                 if _is_video:
                     frames.append(x_sample)
 

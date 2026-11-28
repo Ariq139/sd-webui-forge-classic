@@ -4,6 +4,7 @@ import torch
 
 from backend.args import dynamic_args
 from backend.text_processing import emphasis
+from backend.text_processing.qwen_batch import encode_prompt_pairs
 
 from ._comfy import EMBEDDINGS, INF, SDClipModel, SDTokenizer
 
@@ -11,6 +12,7 @@ from ._comfy import EMBEDDINGS, INF, SDClipModel, SDTokenizer
 class Qwen34BEngine:
     def __init__(self, text_encoder, tokenizer):
         self.text_encoder = SDClipModel(text_encoder, layer="hidden", layer_idx=-2, special_tokens={"pad": 151643}, layer_norm_hidden_state=False, enable_attention_masks=True, return_attention_masks=True)
+        self.text_encoder.intermediate_only = True
         self.tokenizer = SDTokenizer(tokenizer, pad_with_end=False, has_start_token=False, has_end_token=False, pad_to_max_length=False, max_length=INF, min_length=1, pad_token=151643)
 
         self.llama_template = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
@@ -28,6 +30,13 @@ class Qwen34BEngine:
     def __call__(self, texts: list[str]) -> list[torch.Tensor]:
         if any(emphasis.uses_emphasis(text) for text in texts):
             dynamic_args.last_extra_generation_params["Emphasis"] = "None"
+
+        def format_condition(cond):
+            return cond
+
+        paired = encode_prompt_pairs(self.text_encoder, self.tokenizer, [self.llama_template.format(line) for line in texts], format_condition)
+        if paired is not None:
+            return paired
 
         zs: list[torch.Tensor] = []
         cache: dict[str, torch.Tensor] = {}

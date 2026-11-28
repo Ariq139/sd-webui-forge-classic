@@ -26,6 +26,10 @@ from backend.operations import (
     weights_manual_cast,
 )
 from backend.quant_ops import ck
+from backend.sampling.invariant_cache import cached_invariant, invariants_enabled, call_native_with_options
+from backend.activation_quantization import shared_activation_scope
+from backend.weight_prefetch import weight_prefetch_scope
+from backend.fused_pointwise import norm_affine
 from backend.utils import pad_to_patch_size
 
 BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
@@ -36,7 +40,7 @@ BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
 
 
 def _fn(x: torch.Tensor, _norm: nn.Module, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    return torch.addcmul(z, _norm(x), 1 + y)
+    return norm_affine(_norm, x, y, z)
 
 
 # region DiT
@@ -67,7 +71,19 @@ class VideoRopePosition3DEmb(nn.Module):
         self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2))
         self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2))
 
-    def forward(self, x_B_T_H_W_C: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def forward(self, x_B_T_H_W_C: torch.Tensor, device: torch.device, transformer_options=None) -> torch.Tensor:
+        if invariants_enabled(self, x_B_T_H_W_C, transformer_options):
+            try:
+                geometry = (device, self.h_ntk_factor, self.w_ntk_factor, self.t_ntk_factor,
+                            id(self.dim_spatial_range), self.dim_spatial_range._version,
+                            id(self.dim_temporal_range), self.dim_temporal_range._version)
+            except RuntimeError:
+                return self._compute_positions(x_B_T_H_W_C, device)
+            return cached_invariant(self, "anima_rope", x_B_T_H_W_C, transformer_options,
+                                    lambda: self._compute_positions(x_B_T_H_W_C, device), geometry=geometry, geometry_only=True)
+        return self._compute_positions(x_B_T_H_W_C, device)
+
+    def _compute_positions(self, x_B_T_H_W_C: torch.Tensor, device: torch.device) -> torch.Tensor:
         B, T, H, W, _ = x_B_T_H_W_C.shape
 
         h_theta = 10000.0 * self.h_ntk_factor
@@ -138,9 +154,16 @@ class SelfCrossAttention(nn.Module):
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
     def compute_qkv(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.q_proj(x)
-        k = self.k_proj(x if context is None else context)
-        v = self.v_proj(x if context is None else context)
+        if context is None:
+            with shared_activation_scope(x, (self.q_proj, self.k_proj, self.v_proj)):
+                q = self.q_proj(x)
+                k = self.k_proj(x)
+                v = self.v_proj(x)
+        else:
+            q = self.q_proj(x)
+            with shared_activation_scope(context, (self.k_proj, self.v_proj)):
+                k = self.k_proj(context)
+                v = self.v_proj(context)
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
             (q, k, v),
@@ -173,7 +196,23 @@ class SelfCrossAttention(nn.Module):
         return self.output_dropout(self.output_proj(result))
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
-        q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
+        if (not self.is_SelfAttn and context is not None and not self.training
+                and invariants_enabled(self, context, transformer_options)):
+            def project(value):
+                return rearrange(value, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim)
+
+            def compute_kv():
+                with shared_activation_scope(context, (self.k_proj, self.v_proj)):
+                    k = project(self.k_proj(context))
+                    v = project(self.v_proj(context))
+                return self.k_norm(k), self.v_norm(v)
+
+            q = self.q_norm(project(self.q_proj(x)))
+            k, v = cached_invariant(self, "anima_cross_kv", context, transformer_options,
+                                    compute_kv, geometry=(x.dtype, x.device),
+                                    dependencies=(self.k_proj, self.v_proj, self.k_norm, self.v_norm))
+        else:
+            q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
         return self.compute_attention(q, k, v, transformer_options=transformer_options)
 
 
@@ -451,7 +490,7 @@ class Anima(nn.Module):
 
         self.t_embedding_norm = nn.RMSNorm(model_channels, eps=1e-6)
 
-    def prepare_embedded_sequence(self, x_B_C_T_H_W: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def prepare_embedded_sequence(self, x_B_C_T_H_W: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, transformer_options=None) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if padding_mask is None:
             padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
         else:
@@ -459,7 +498,14 @@ class Anima(nn.Module):
         x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).expand(-1, -1, x_B_C_T_H_W.shape[2], -1, -1)], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
-        return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device), None
+        # Invoke the module (not forward directly) to preserve hooks and dispatch.
+        if (type(self.pos_embedder) is VideoRopePosition3DEmb
+                and getattr(self.pos_embedder.forward, "__func__", None) is _NATIVE_ANIMA_POSITION_FORWARD
+                and invariants_enabled(self.pos_embedder, x_B_T_H_W_D, transformer_options)):
+            positions = self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device, transformer_options=transformer_options)
+        else:
+            positions = self.pos_embedder(x_B_T_H_W_D, device=x_B_C_T_H_W.device)
+        return x_B_T_H_W_D, positions, None
 
     def unpatchify(self, x_B_T_H_W_M: torch.Tensor) -> torch.Tensor:
         x_B_C_Tt_Hp_Wp = rearrange(
@@ -484,7 +530,9 @@ class Anima(nn.Module):
         timesteps_B_T = timesteps
         crossattn_emb = context
 
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_None = self.prepare_embedded_sequence(x_B_C_T_H_W, padding_mask=padding_mask)
+        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_None = call_native_with_options(
+            self.prepare_embedded_sequence, _NATIVE_ANIMA_PREPARE, x_B_C_T_H_W,
+            padding_mask=padding_mask, transformer_options=kwargs.get("transformer_options", {}))
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
@@ -504,23 +552,28 @@ class Anima(nn.Module):
 
         shard = getattr(self, "_anima_shard_devices", None)
 
-        for index, block in enumerate(self.blocks):
-            if shard and index == shard[2]:
-                secondary = shard[1]
-                x_B_T_H_W_D = x_B_T_H_W_D.to(secondary)
-                t_embedding_B_T_D = t_embedding_B_T_D.to(secondary)
-                crossattn_emb = crossattn_emb.to(secondary)
-                for name in ("rope_emb_L_1_1_D", "adaln_lora_B_T_3D", "extra_per_block_pos_emb"):
-                    value = block_kwargs[name]
-                    if value is not None:
-                        block_kwargs[name] = value.to(secondary)
-            with torch.cuda.device(x_B_T_H_W_D.device) if shard else nullcontext():
-                x_B_T_H_W_D = block(
-                    x_B_T_H_W_D,
-                    t_embedding_B_T_D,
-                    crossattn_emb,
-                    **block_kwargs,
-                )
+        with weight_prefetch_scope(x_B_T_H_W_D.device, block_kwargs['transformer_options'], enabled=not shard and not self.training) as prefetch:
+            for index, block in enumerate(self.blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.blocks[index + 1] if index + 1 < len(self.blocks) else None, t_embedding_B_T_D.dtype)
+                if shard and index == shard[2]:
+                    secondary = shard[1]
+                    x_B_T_H_W_D = x_B_T_H_W_D.to(secondary)
+                    t_embedding_B_T_D = t_embedding_B_T_D.to(secondary)
+                    crossattn_emb = crossattn_emb.to(secondary)
+                    for name in ("rope_emb_L_1_1_D", "adaln_lora_B_T_3D", "extra_per_block_pos_emb"):
+                        value = block_kwargs[name]
+                        if value is not None:
+                            block_kwargs[name] = value.to(secondary)
+                with torch.cuda.device(x_B_T_H_W_D.device) if shard else nullcontext():
+                    x_B_T_H_W_D = block(
+                        x_B_T_H_W_D,
+                        t_embedding_B_T_D,
+                        crossattn_emb,
+                        **block_kwargs,
+                    )
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         if shard:
             primary = shard[0]
@@ -692,3 +745,7 @@ class LLMAdapter(nn.Module):
         for block in self.blocks:
             x = block(x, context, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings_context)
         return self.norm(self.out_proj(x))
+
+
+_NATIVE_ANIMA_PREPARE = Anima.prepare_embedded_sequence
+_NATIVE_ANIMA_POSITION_FORWARD = VideoRopePosition3DEmb.forward

@@ -1792,14 +1792,44 @@ def discard_cuda_async_error():
         pass
 
 
+def packed_gguf_pin_storage(tensor):
+    # GGUF exposes a logical matrix shape; only register the actual original
+    # packed storage, never the logical/dequantized size or a baked buffer.
+    if (not getattr(args, "pin_quantized_weights", False)
+            or type(tensor).__name__ != "ParameterGGUF"
+            or any(getattr(args, key, None) is not None
+                   for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+        return None
+    from backend.operations_gguf import ParameterGGUF
+    if (type(tensor) is not ParameterGGUF or tensor.device.type != "cpu"
+            or tensor.gguf_cls is None or tensor.baked):
+        return None
+    raw = tensor.data
+    if (type(raw) is not torch.Tensor or raw.dtype != torch.uint8
+            or not raw.is_contiguous() or raw.storage_offset() != 0
+            or raw.numel() != raw.untyped_storage().nbytes()):
+        return None
+    return raw
+
+
 def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY
     if not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0:
         return False
 
     if type(tensor).__name__ != PINNING_ALLOWED_TYPES:
-        return False
+        raw = packed_gguf_pin_storage(tensor)
+        if raw is None:
+            return False
+        tensor = raw
+    return pin_raw_memory(tensor)
 
+
+def pin_raw_memory(tensor):
+    global TOTAL_PINNED_MEMORY
+    if (not PINNING_ENABLED or MAX_PINNED_MEMORY <= 0
+            or type(tensor) not in (torch.Tensor, torch.nn.Parameter)):
+        return False
     if not is_device_cpu(tensor.device):
         return False
 
@@ -1821,7 +1851,10 @@ def pin_memory(tensor):
         return False
 
     ptr = tensor.data_ptr()
-    if ptr == 0:
+    if ptr == 0 or ptr in PINNED_MEMORY or size == 0:
+        return False
+    # Reject overlapping registrations, including distinct views of storage.
+    if any(ptr < other + length and other < ptr + size for other, length in PINNED_MEMORY.items()):
         return False
 
     if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:

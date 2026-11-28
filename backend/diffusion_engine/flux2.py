@@ -8,6 +8,7 @@ from huggingface_guess import model_list
 
 from backend import memory_management
 from backend.args import dynamic_args
+from backend.single_gpu_fastpaths import version_reference_latents
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
@@ -51,7 +52,7 @@ class Flux2(ForgeDiffusionEngine):
                 if self.ini_latent is not None:
                     _references.insert(0, self.ini_latent)
                     self.ini_latent = None
-                dynamic_args.ref_latents = _references.copy()
+                dynamic_args.ref_latents = version_reference_latents(_references)
 
         return self.text_processing_engine_qwen(prompt)
 
