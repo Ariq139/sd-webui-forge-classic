@@ -223,7 +223,7 @@ def _to_cpu(value):
 
 def _to_device(value, device):
     if isinstance(value, torch.Tensor):
-        return value.to(device)
+        return value.to(device, copy=True)
     if isinstance(value, tuple):
         return tuple(_to_device(item, device) for item in value)
     if isinstance(value, list):

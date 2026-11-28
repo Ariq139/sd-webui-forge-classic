@@ -61,6 +61,7 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
     sd_model_checkpoint_override = get_closet_checkpoint_match(override_settings.get("sd_model_checkpoint", None))
     gallery = BatchGallery(shared.opts.img2img_batch_show_results_limit)
     requested_batch_size, requested_n_iter = p.batch_size, p.n_iter
+    requested_full_res = p.inpaint_full_res
     png_info_props = png_info_props or []
     for i, image in enumerate(batch_images):
         state.job = f"{i+1} out of {len(batch_images)}"
@@ -89,7 +90,12 @@ def process_batch(p: StableDiffusionProcessingImg2Img, input, output_dir, inpain
         if p.resize_mode < 4 and not (_w % _STEP == 0 and _h % _STEP == 0):
             img = images.resize_image(1, img, sRound(_w), sRound(_h))
 
-        # The initializer repeats a single source to the active batch size.
+        # Each input owns its latents, masks and crop geometry. In particular,
+        # a previous grouped img2img run must not look like a supplied latent.
+        p.init_latent = p.image_conditioning = None
+        p.mask = p.nmask = p.mask_for_overlay = None
+        p.overlay_images = p.color_corrections = p.paste_to = None
+        p.inpaint_full_res = requested_full_res
         p.init_images = [img]
 
         image_path = Path(image)
