@@ -21,6 +21,7 @@ from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
 from backend.single_gpu_fastpaths import dense_tokenwise_head, single_gpu_flag, uniform_unpatchify
 from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
+from backend.native_gqa import try_flash_gqa
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -111,28 +112,17 @@ class JointAttention(nn.Module):
             xq, xk = ck.apply_rope(xq, xk, freqs_cis)
 
         n_rep = self.n_local_heads // self.n_local_kv_heads
-        native_gqa = False
-        if (n_rep > 1 and self.n_local_heads % self.n_local_kv_heads == 0
-                and getattr(args, "native_lumina_gqa", False)
-                and xq.is_cuda and xq.dtype == xk.dtype == xv.dtype
-                and xq.device == xk.device == xv.device
-                and x_mask is None and attention_function is attention_pytorch
-                and "optimized_attention_override" not in transformer_options
-                and not any(getattr(args, key, None) is not None
-                            for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
-            try:
-                params = torch.backends.cuda.SDPAParams(xq.movedim(1, 2), xk.movedim(1, 2),
-                                                        xv.movedim(1, 2), None, 0.0, False, True)
-                native_gqa = (torch.backends.cuda.flash_sdp_enabled()
-                              and torch.backends.cuda.can_use_flash_attention(params))
-            except (AttributeError, TypeError):
-                native_gqa = False
-        if n_rep > 1 and not native_gqa:
-            xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-            xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-        extra = {"enable_gqa": True} if native_gqa else {}
-        output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask,
-                                    skip_reshape=True, transformer_options=transformer_options, **extra)
+        output = None
+        if (n_rep > 1 and single_gpu_flag("native_lumina_gqa")
+                and type(self) is JointAttention and attention_function is attention_pytorch):
+            output = try_flash_gqa(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2),
+                                   x_mask, transformer_options)
+        if output is None:
+            if n_rep > 1:
+                xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+            output = attention_function(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask,
+                                        skip_reshape=True, transformer_options=transformer_options)
 
         return self.out(output)
 

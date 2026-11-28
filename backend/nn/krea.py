@@ -192,7 +192,7 @@ class Attention(nn.Module):
         out = None
         if (type(self) is Attention and single_gpu_flag("native_krea_gqa")
                 and attention_function is attention_pytorch):
-            out = try_flash_gqa(q, k, v, mask, transformer_options, attention_function)
+            out = try_flash_gqa(q, k, v, mask, transformer_options)
         if out is None:
             k, v = repeat_kv_for_gqa(k, v, self.heads, 1)
             out = attention_function(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
@@ -402,7 +402,9 @@ class SingleStreamDiT(nn.Module):
 
         def compute_text_features():
             with record_region("forge::krea_text_fusion"):
-                fused = self.txtfusion(context, mask=None, transformer_options=transformer_options)
+                # Text fusion has in-place residuals; preserve cached input ownership.
+                source = context.clone() if type(self) is SingleStreamDiT and single_gpu_flag("direct_full_area_cfg") else context
+                fused = self.txtfusion(source, mask=None, transformer_options=transformer_options)
                 return self.txtmlp(fused)
 
         if _edit:

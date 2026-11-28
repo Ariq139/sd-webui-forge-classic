@@ -16,7 +16,7 @@ def compatible_gqa(q, k, v, mask, options):
             and all(t.stride(-1) == 1 for t in (q, k, v)))
 
 
-def try_flash_gqa(q, k, v, mask, options, attention):
+def try_flash_gqa(q, k, v, mask, options):
     if (not compatible_gqa(q, k, v, mask, options) or not q.is_cuda
             or torch.is_grad_enabled() or torch.is_autocast_enabled(q.device.type)):
         return None
@@ -31,5 +31,6 @@ def try_flash_gqa(q, k, v, mask, options, attention):
     # Explicit opt-in. Do not accidentally dispatch a math kernel which
     # materializes the very KV expansion this path is intended to avoid.
     with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-        return attention(q, k, v, q.shape[1], mask=None, skip_reshape=True,
-                         transformer_options=options, enable_gqa=True)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0,
+                                                               is_causal=False, enable_gqa=True)
+    return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)

@@ -319,7 +319,7 @@ from backend.single_gpu_fastpaths import reference_signature, schedule_options_s
 
 def _native_full_area_cfg(model, x, model_options, condition_cache):
     if (not getattr(args, "direct_full_area_cfg", False) or condition_cache is None
-            or x.ndim != 4 or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or x.ndim not in (4, 5) or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
             or set(model_options) - {"transformer_options"}
             or not schedule_options_safe(model_options.get("transformer_options", {}))
             or dynamic_args.ref_latents or dynamic_args.context_handler is not None
@@ -330,10 +330,13 @@ def _native_full_area_cfg(model, x, model_options, condition_cache):
     from backend.nn.anima import Anima
     from backend.nn.flux import IntegratedFluxTransformer2DModel
     from backend.nn.lumina import NextDiT
+    from backend.nn.krea import SingleStreamDiT
     from modules import script_callbacks
 
     diffusion = getattr(model, "diffusion_model", None)
-    return (type(model) is KModel and type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, NextDiT)
+    native_shape = (x.ndim == 4 and type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, NextDiT)
+                    or x.ndim == 5 and x.shape[2] == 1 and type(diffusion) in (Anima, SingleStreamDiT))
+    return (type(model) is KModel and native_shape
             and not getattr(diffusion, "_anima_shard_devices", None)
             and not any(script_callbacks.callback_map.get(key) for key in
                         ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")))
@@ -354,7 +357,8 @@ def _unit_full_area(item, x):
             or not isinstance(strength, (int, float)) or strength != 1.0):
         return False
     area = item.get("area")
-    return area is None or tuple(area) == (x.shape[2], x.shape[3], 0, 0)
+    # 5D full-frame path admits only implicit whole-latent areas.
+    return area is None or (x.ndim == 4 and tuple(area) == (x.shape[2], x.shape[3], 0, 0))
 
 
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
@@ -542,8 +546,10 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
 
 
 def single_condition_fast_path_eligible(model, cond, x, model_options, condition_cache):
-    if condition_cache is None or x.ndim != 4 or len(cond) != 1 or not condition_cache_allowed(model_options):
+    if condition_cache is None or len(cond) != 1 or not condition_cache_allowed(model_options):
         return False
+    if x.ndim != 4:
+        return _native_full_area_cfg(model, x, model_options, condition_cache) and _unit_full_area(cond[0], x)
     if model_options.get("model_function_wrapper"):
         return False
     if getattr(getattr(model, "diffusion_model", None), "_anima_shard_devices", None):
