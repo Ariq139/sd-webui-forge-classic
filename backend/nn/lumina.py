@@ -154,8 +154,12 @@ class FeedForward(nn.Module):
         # separate projections for a backend that would apply SiLU eagerly.
         fused = (try_native_int8_input_act(self.w2, (w1, w3), "swiglu")
                  if type(self) is FeedForward and w1.dtype == torch.bfloat16
-                 and single_gpu_flag("native_int8_mlp_activation") and cache_dependencies_safe(self) else None)
+                 and single_gpu_flag("native_int8_mlp_activation") and cache_dependencies_safe(self)
+                 and native_bound_method(self._forward_silu_gating, _NATIVE_LUMINA_GATING) else None)
         return self.w2(self._forward_silu_gating(w1, w3)) if fused is None else fused
+
+
+_NATIVE_LUMINA_GATING = FeedForward._forward_silu_gating
 
 
 class JointTransformerBlock(nn.Module):

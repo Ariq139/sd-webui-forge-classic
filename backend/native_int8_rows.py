@@ -52,11 +52,17 @@ def shared_rows(source, convrot, stream, cache, quantize, *, budget=None):
     size = source.numel() + 4 * m
     budget = MAX_ROW_BYTES if budget is None else min(budget, MAX_ROW_BYTES)
     if size > budget or (cache and size + sum(
-            q.numel() * q.element_size() + s.numel() * s.element_size()
+            q.untyped_storage().nbytes() + s.untyped_storage().nbytes()
             for q, s in cache.values()) > budget):
         return None
+    # Use the actual allocation size, including backing storage of views.
+    if source.device.type == "cuda" and torch.cuda.mem_get_info(source.device)[0] < 384 * 1024**2 + size:
+        return None
     value = quantize(source.reshape(m, source.shape[-1]), convrot)
-    cache[key] = value
+    retained = sum(t.untyped_storage().nbytes() for pair in cache.values() for t in pair)
+    actual = sum(t.untyped_storage().nbytes() for t in value)
+    if retained + actual <= budget:
+        cache[key] = value
     return value
 
 

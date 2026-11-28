@@ -108,7 +108,8 @@ class YakMLP(nn.Module):
                 return self.up_proj(x) if pair is None else pair[1]
             if (single_gpu_flag("native_int8_mlp_activation") and gate.dtype == torch.bfloat16
                     and type(self) is YakMLP and type(self.act_fn) is nn.SiLU
-                    and not self.act_fn.inplace and cache_dependencies_safe(self)):
+                    and not self.act_fn.inplace and cache_dependencies_safe(self)
+                    and native_bound_method(self.act_fn.forward, _NATIVE_SILU_FORWARD)):
                 up = up_projection()
                 fused = try_native_int8_input_act(self.down_proj, (gate, up), "swiglu")
                 if fused is not None:

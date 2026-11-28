@@ -98,3 +98,12 @@ def test_quantized_buffer_and_scale_storage_accounted():
         _qdata = torch.ones(8, dtype=torch.int8)
         _params = type("Params", (), {"scale": torch.ones(2)})()
     assert aq._storage_bytes(QuantizedTensor()) == 16
+
+
+
+def test_native_rows_charge_actual_backing_storage(monkeypatch):
+    x = torch.ones(2, 16)
+    rows = (torch.empty(512, dtype=torch.int8)[:32].reshape(2, 16), torch.ones(2, 1))
+    cache = {}
+    assert nr.shared_rows(x, False, 0, cache, lambda *_: rows, budget=40) is rows
+    assert not cache

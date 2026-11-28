@@ -279,12 +279,15 @@ def test_full_area_cfg_rejects_custom_conditions_and_unknown_fields():
 
 @pytest.mark.parametrize("cache_enabled", [False, True])
 def test_legacy_anima_prepare_override_and_native_pos_embedder_call(cache_enabled):
-    from backend.nn.anima import Anima
-    from backend.sampling.invariant_cache import call_native_with_options
+    from backend.nn import anima
+    Anima = anima.Anima
+
+    class ReachedLegacyPrepare(Exception):
+        pass
 
     class LegacyAnima(Anima):
         def prepare_embedded_sequence(self, x, padding_mask=None):
-            return x, padding_mask, None
+            raise ReachedLegacyPrepare
 
     class LegacyPos(torch.nn.Module):
         def forward(self, x, device):
@@ -294,8 +297,9 @@ def test_legacy_anima_prepare_override_and_native_pos_embedder_call(cache_enable
     with torch.no_grad(), sampling_invariant_scope(4096 if cache_enabled else 0), invariant_revision(1), invariant_condition(1):
         model = LegacyAnima.__new__(LegacyAnima)
         torch.nn.Module.__init__(model)
-        assert call_native_with_options(model.prepare_embedded_sequence, Anima.prepare_embedded_sequence,
-                                        x, padding_mask=None, transformer_options={})[0] is x
+        model.patch_temporal = model.patch_spatial = 1
+        with mock.patch.object(anima.dynamic_args, "ref_latents", []), pytest.raises(ReachedLegacyPrepare):
+            model(x, torch.ones(1), torch.zeros(1, 1, 2), transformer_options={})
         model = Anima.__new__(Anima)
         torch.nn.Module.__init__(model)
         model.x_embedder = torch.nn.Identity()
@@ -339,4 +343,18 @@ def test_native_mlp_preserves_instance_forward_overrides(target):
     x = torch.ones(1, 2)
     with torch.no_grad(), mock.patch.object(flux, "single_gpu_flag", return_value=True), mock.patch.object(flux, "try_native_int8_input_act", return_value=None) as fused:
         torch.testing.assert_close(flux.run_native_mlp(module, x), module(x))
+        fused.assert_not_called()
+
+
+
+def test_lumina_native_mlp_preserves_custom_gating():
+    from backend.nn import lumina
+    module = lumina.FeedForward.__new__(lumina.FeedForward)
+    torch.nn.Module.__init__(module)
+    module.w1 = module.w3 = module.w2 = torch.nn.Identity()
+    module.eval()
+    module._forward_silu_gating = lambda gate, up: gate + up + 10
+    x = torch.ones(1, 2, dtype=torch.bfloat16)
+    with torch.no_grad(), mock.patch.object(lumina, "single_gpu_flag", return_value=True), mock.patch.object(lumina, "try_native_int8_input_act", return_value=torch.zeros_like(x)) as fused:
+        torch.testing.assert_close(module(x), x + x + 10)
         fused.assert_not_called()
