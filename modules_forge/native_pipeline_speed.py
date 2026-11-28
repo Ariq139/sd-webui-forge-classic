@@ -8,6 +8,8 @@ from functools import wraps
 
 import torch
 
+from modules_forge import native_runtime
+
 
 ATTENTION_BACKEND_CHOICES = ("automatic", "native", "sage", "flash")
 OFFLOAD_CHOICES = ("none", "model", "group", "sequential")
@@ -54,7 +56,9 @@ def native_quantization_kwargs(model_path, mode, dtype, device, offload, denoise
 
 
 def load_native_pipeline(pipeline_class, model_path: str, pipeline_kwargs: dict, dtype: torch.dtype, logger: logging.Logger, label: str):
-    return pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs))
+    # The model selector accepts complete local pipeline directories only.
+    # Missing weights must never trigger an implicit Hub download.
+    return pipeline_class.from_pretrained(model_path, **dict(pipeline_kwargs, local_files_only=True))
 
 
 def resolve_vae_tiling_mode(auto: bool, force: bool) -> str:
@@ -180,6 +184,17 @@ def compile_denoisers(pipe, enabled: bool, device: torch.device, offload: str, l
 def configure_pipeline(pipe, device: torch.device, offload: str, attention: str, compile_enabled: bool, logger: logging.Logger):
     backend = configure_attention(pipe, attention, device, logger)
     actual_offload = configure_offload(pipe, device, offload, logger)
+    if getattr(pipe, "unconditional_transformer", None) is not None:
+        # Ideogram alternates denoisers and accesses encoder submodules
+        # directly; the generic linear/sequential hooks are insufficient.
+        import diffusers
+        if actual_offload in ("model", "sequential") and diffusers.__version__ != "0.39.0":
+            raise RuntimeError("Ideogram offload adapters require Diffusers 0.39.0.")
+        if actual_offload == "model":
+            native_runtime.install_alternating_offload(pipe)
+        elif actual_offload == "sequential":
+            from accelerate.hooks import remove_hook_from_module
+            native_runtime.keep_sequential_prompt_on_cpu(pipe, remove_hook_from_module, device)
     compiled = compile_denoisers(pipe, compile_enabled, device, actual_offload, logger)
     pipe._forge_runtime = dict(attention_backend=backend, offload=actual_offload, compiled=compiled)
     return backend, actual_offload, compiled

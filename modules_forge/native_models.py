@@ -1,5 +1,6 @@
-import json
 import os
+
+from modules_forge.native_runtime import require_pipeline_directory
 
 from modules import paths
 
@@ -23,15 +24,10 @@ def resolve_model_path(value: str) -> str:
 
 
 def is_compatible_model(value: str, marker: str) -> bool:
-    model_path = resolve_model_path(value)
-    model_index = os.path.join(model_path, "model_index.json")
-    if not os.path.isdir(model_path) or not os.path.isfile(model_index):
-        return False
-
     try:
-        with open(model_index, encoding="utf-8") as file:
-            return marker in str(json.load(file).get("_class_name", ""))
-    except (OSError, ValueError):
+        require_pipeline_directory(resolve_model_path(value), marker)
+        return True
+    except ValueError:
         return False
 
 

@@ -1,4 +1,5 @@
 import gc
+import sys
 import logging
 import threading
 
@@ -7,7 +8,7 @@ import torch
 
 from backend import memory_management
 from modules import shared
-from modules_forge import main_thread, native_requests, native_validation, native_recipes, native_outputs
+from modules_forge import main_thread, native_requests, native_validation, native_recipes, native_outputs, native_runtime
 from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
@@ -121,6 +122,8 @@ def bind_preset(preset_component, checkpoint_component=None):
 
 
 def _default_dtype(precision: str) -> torch.dtype:
+    if precision == "automatic" and _device().type == "cpu":
+        return torch.float32
     if precision == "float16":
         return torch.float16
     if precision == "bfloat16":
@@ -142,7 +145,7 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
 
     from diffusers import Ideogram4Pipeline
 
-    model_path = resolve_model_path(model_path)
+    model_path = native_runtime.require_pipeline_directory(resolve_model_path(model_path), "Ideogram4")
     device = _device()
     dtype = _default_dtype(precision)
     key = (model_path, str(dtype), str(device), offload, attention_backend, bool(compile_enabled), bool(prompt_cache), quantization, enhancer_path)
@@ -152,6 +155,11 @@ def _get_pipeline(model_path: str, precision: str, offload: str, attention_backe
             return _pipeline
 
         unload()
+        # The caller owns the generation queue. Release the other native
+        # pipeline before loading this one, including dedicated-page calls.
+        peer = sys.modules.get("modules.ui_ltx2_video")
+        if peer is not None:
+            peer.unload()
         unload_forge_model()
         pipeline_kwargs = {"torch_dtype": dtype}
         pipeline_kwargs.update(native_quantization_kwargs(model_path, quantization, dtype, device, offload, ("transformer", "unconditional_transformer")))
@@ -178,14 +186,14 @@ def unload():
             _pipeline_key = None
             return
 
-        try:
-            _pipeline.to("cpu")
-        except Exception:
-            pass
-        _pipeline = None
+        pipe, _pipeline = _pipeline, None
         _pipeline_key = None
-        gc.collect()
-        memory_management.soft_empty_cache(force=True)
+        try:
+            native_runtime.release_runtime(pipe)
+        finally:
+            del pipe
+            gc.collect()
+            memory_management.soft_empty_cache(force=True)
 
 
 def unload_forge_model():
@@ -259,9 +267,15 @@ def generate(
         if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             raise _IdeogramInterrupted()
 
+        shared.state.job_count = 1
+        shared.state.job_no = 0
+        shared.state.sampling_step = 0
+        shared.state.sampling_steps = steps
         pipeline_attempted = True
         shared.state.textinfo = "Ideogram 4: loading model"
         pipe = _get_pipeline(model_path, precision, offload, attention_backend, compile_enabled, prompt_cache, quantization, enhancer_path)
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _IdeogramInterrupted()
         divisor = pipe.vae_scale_factor * pipe.patch_size
         if width % divisor or height % divisor:
             return [], f"Ideogram 4 width and height must be divisible by {divisor} for this model."
@@ -290,13 +304,17 @@ def generate(
         effective_prompt = prompt
         if prompt_upsampling:
             shared.state.textinfo = "Ideogram 4: enhancing prompt"
-            with torch.inference_mode():
+            from accelerate.hooks import remove_hook_from_module
+            with native_runtime.ideogram_enhancement_device(pipe, remove_hook_from_module) as enhancer_device, torch.inference_mode():
                 enhanced = pipe.upsample_prompt(prompt, height=height, width=width, temperature=prompt_temperature,
-                                                generator=torch.Generator(device=_device()).manual_seed(seed), device=pipe._execution_device)
+                                                generator=torch.Generator(device=enhancer_device).manual_seed(seed), device=enhancer_device)
             effective_prompt = enhanced[0] if isinstance(enhanced, list) else enhanced
             import json
-            if not isinstance(json.loads(effective_prompt), dict):
-                raise ValueError("Prompt enhancer did not produce a structured caption.")
+            caption = json.loads(effective_prompt)
+            if not isinstance(caption, dict) or not isinstance(caption.get("high_level_description"), str) or not isinstance(caption.get("compositional_deconstruction"), dict):
+                raise ValueError("Prompt enhancer did not produce the expected structured caption.")
+            if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                raise _IdeogramInterrupted()
 
         def on_step_end(_pipe, step, _timestep, callback_kwargs):
             if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
@@ -551,6 +569,10 @@ def create_ui():
             # Resolve random seeds once, before the worker's optional OOM retry.
             import inspect
             bound = inspect.signature(generate).bind(*args)
+            if shared.opts.forge_preset != "ideogram":
+                return gr.skip(), "The active preset changed; select ideogram before generating."
+            # Do not trust an asynchronously updated hidden checkpoint mirror.
+            bound.arguments["model_path"] = _model_path()
             bound.arguments["seed"] = native_validation.actual_seed(bound.arguments["seed"])
             with owner.active(session_id):
                 result = main_thread.run_and_wait_result(generate, *bound.args, **bound.kwargs)

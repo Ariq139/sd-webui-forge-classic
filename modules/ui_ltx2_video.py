@@ -1,4 +1,5 @@
 import gc
+import sys
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import torch
 
 from backend import memory_management
 from modules import paths, shared
-from modules_forge import main_thread, native_validation, native_recipes, pruna_decoder
+from modules_forge import main_thread, native_validation, native_recipes, pruna_decoder, native_runtime
 from modules_forge.native_models import resolve_model_path, select_model_path
 from modules_forge.native_pipeline_speed import (
     ATTENTION_BACKEND_CHOICES,
@@ -81,35 +82,23 @@ def _prunavaed_choices() -> list[str]:
                 for config_name in ("config.json", "model_index.json")
             )
             if entry.is_dir() and has_config:
-                values.append(entry.name)
+                values.append(os.path.abspath(entry.path))
             elif entry.is_file() and os.path.splitext(entry.name)[1].lower() in _DECODER_EXTENSIONS:
-                values.append(entry.name)
+                values.append(os.path.abspath(entry.path))
 
     configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
-    if configured and os.path.exists(configured):
-        configured_path = os.path.abspath(configured)
-        for root in _DECODER_ROOTS:
-            if os.path.dirname(configured_path).lower() == os.path.abspath(root).lower():
-                configured = os.path.basename(configured_path)
-                break
-        if configured not in values:
-            values.append(configured)
+    if configured:
+        # Preserve invalid persisted paths so a missing decoder does not
+        # silently switch the generation to the bundled VAE.
+        resolved = _resolve_prunavaed_path(configured)
+        if resolved not in values:
+            values.append(resolved)
     return sorted(set(values), key=shared.natural_sort_key)
 
 
 def _prunavaed_value() -> str | None:
     configured = str(_option("ltx2_prunavaed_path", "") or "").strip()
-    choices = _prunavaed_choices()
-    if configured in choices:
-        return configured
-    configured_path = _resolve_prunavaed_path(configured)
-    if os.path.exists(configured_path):
-        configured_path = os.path.abspath(configured_path)
-        for choice in choices:
-            if os.path.abspath(_resolve_prunavaed_path(choice)) == configured_path:
-                return choice
-    return None
-
+    return _resolve_prunavaed_path(configured) if configured else None
 
 def _save_option(name: str, value):
     if value is None:
@@ -203,6 +192,8 @@ def bind_preset(preset_component, checkpoint_component=None, decoder_component=N
 
 
 def _default_dtype(precision: str) -> torch.dtype:
+    if precision == "automatic" and _device().type == "cpu":
+        return torch.float32
     if precision == "float16":
         return torch.float16
     if precision == "bfloat16":
@@ -252,7 +243,7 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
 
     from diffusers import LTX2ImageToVideoPipeline, LTX2Pipeline
 
-    model_path = resolve_model_path(model_path)
+    model_path = native_runtime.require_pipeline_directory(resolve_model_path(model_path), "LTX2")
     prunavaed_path = _resolve_prunavaed_path(prunavaed_path)
     device = _device()
     dtype = _default_dtype(precision)
@@ -263,6 +254,11 @@ def _get_pipeline(model_path: str, prunavaed_path: str, precision: str, offload:
             return _pipeline
 
         unload()
+        # The caller owns the generation queue. Release the other native
+        # pipeline before loading this one, including dedicated-page calls.
+        peer = sys.modules.get("modules.ui_ideogram")
+        if peer is not None:
+            peer.unload()
         unload_forge_model()
 
         vae = None
@@ -291,15 +287,14 @@ def unload():
             _pipeline_key = None
             return
 
-        if _pipeline is not None:
-            try:
-                _pipeline.to("cpu")
-            except Exception:
-                pass
-        _pipeline = None
+        pipe, _pipeline = _pipeline, None
         _pipeline_key = None
-        gc.collect()
-        memory_management.soft_empty_cache(force=True)
+        try:
+            native_runtime.release_runtime(pipe)
+        finally:
+            del pipe
+            gc.collect()
+            memory_management.soft_empty_cache(force=True)
 
 
 def unload_forge_model():
@@ -380,7 +375,7 @@ def generate(
         if two_stage:
             if offload != "model" or compile_enabled:
                 raise ValueError("Two-stage LTX currently requires model CPU offload and compile disabled.")
-            upsampler_path = os.path.abspath(upsampler_path or os.path.join(resolve_model_path(model_path), "latent_upsampler"))
+            upsampler_path = os.path.abspath(resolve_model_path(upsampler_path) if upsampler_path else os.path.join(resolve_model_path(model_path), "latent_upsampler"))
             if not os.path.isfile(os.path.join(upsampler_path, "config.json")):
                 raise ValueError("Choose a compatible local latent upsampler directory.")
             if not distilled:
@@ -408,13 +403,25 @@ def generate(
         if blocks and (min(blocks) < 0 or len(set(blocks)) != len(blocks)):
             raise ValueError("STG block indices must be unique and nonnegative.")
         seed = native_validation.actual_seed(seed)
-        if shared.state.interrupted or shared.state.stopping_generation:
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             raise _LTXInterrupted()
 
+        shared.state.job_count = 1
+        shared.state.job_no = 0
+        shared.state.sampling_step = 0
+        shared.state.sampling_steps = steps + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
+        shared.state.textinfo = "LTX-2.3: loading model"
         pipeline_attempted = True
         pipe = _get_pipeline(model_path, prunavaed_path, precision, offload, attention_backend, compile_enabled, prompt_cache, image is not None, quantization)
         temporal_ratio = getattr(pipe, "vae_temporal_compression_ratio", 8)
+        spatial_ratio = getattr(pipe, "vae_spatial_compression_ratio", 32)
         native_validation.ltx_dimensions(width, height, frames, fps, steps, temporal_ratio)
+        if width % spatial_ratio or height % spatial_ratio:
+            raise ValueError(f"LTX dimensions must be divisible by the model VAE spatial ratio ({spatial_ratio}).")
+        if two_stage and not distilled and (getattr(pipe.transformer, "is_quantized", False) or getattr(pipe.transformer, "hf_quantizer", None) is not None):
+            raise ValueError("Refinement LoRA is not supported on a quantized transformer in this workflow.")
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+            raise _LTXInterrupted()
         cross_timestep = native_validation.ltx_cross_timestep(pipe.transformer.config, cross_timestep_mode)
         num_layers = getattr(pipe.transformer.config, "num_layers", None)
         if blocks and num_layers is not None and max(blocks) >= num_layers:
@@ -494,15 +501,19 @@ def generate(
                     upsampler = LTX2LatentUpsamplerModel.from_pretrained(
                         upsampler_path, torch_dtype=_default_dtype(precision), local_files_only=True)
                     try:
+                        from types import SimpleNamespace
+                        before = SimpleNamespace(shape=tuple(video.shape))
                         upsampler.to(_device())
                         with torch.inference_mode():
                             video = upsampler(video.to(device=_device(), dtype=_default_dtype(precision)))
+                        native_runtime.refinement_geometry(before, video, audio, width=width, height=height, frames=frames,
+                                                           spatial_ratio=spatial_ratio, temporal_ratio=temporal_ratio)
                     finally:
                         del upsampler
                         memory_management.soft_empty_cache(force=True)
+                    if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
+                        raise _LTXInterrupted()
                     if not distilled:
-                        if getattr(pipe.transformer, "is_quantized", False) or getattr(pipe.transformer, "hf_quantizer", None) is not None:
-                            raise ValueError("Refinement LoRA is not supported on a quantized transformer in this workflow.")
                         pipe.load_lora_weights(os.path.dirname(refine_lora), weight_name=os.path.basename(refine_lora), adapter_name="forge_stage2")
                         loaded_adapter = True
                         pipe.set_adapters("forge_stage2", adapter_weights=1.0)
@@ -801,6 +812,11 @@ def create_ui():
             # Resolve random seeds once, before the worker's optional OOM retry.
             import inspect
             bound = inspect.signature(generate).bind(*args)
+            if shared.opts.forge_preset != "ltx2":
+                return gr.skip(), "The active preset changed; select ltx2 before generating."
+            # Do not trust an asynchronously updated hidden checkpoint mirror.
+            bound.arguments["model_path"] = _model_path()
+            bound.arguments["prunavaed_path"] = _prunavaed_value() or ""
             bound.arguments["seed"] = native_validation.actual_seed(bound.arguments["seed"])
             with owner.active(session_id):
                 result = main_thread.run_and_wait_result(generate, *bound.args, **bound.kwargs)

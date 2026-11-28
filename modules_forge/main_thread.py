@@ -85,6 +85,9 @@ class Task:
                 last_exception = "OOM"
                 return
 
+            # The failed generation's traceback retains local pipeline/tensor
+            # references. Drop completed frame locals before recovery/retry.
+            traceback.clear_frames(e.__traceback__)
             logger.warning("Encountered Out of Memory; clearing model state and retrying once")
             try:
                 from modules import shared
