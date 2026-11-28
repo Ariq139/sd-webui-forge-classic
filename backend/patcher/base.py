@@ -679,6 +679,9 @@ class ModelPatcher:
         for x in load_completely:
             x[2].to(device_to)
 
+        from backend.gate_up_packing import pack_offloaded_gate_up
+        pack_offloaded_gate_up(self, offloaded)
+
         for x in offloaded:
             n = x[1]
             params = x[3]

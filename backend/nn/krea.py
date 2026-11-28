@@ -28,6 +28,7 @@ from backend.sampling.invariant_cache import cached_invariant, cache_dependencie
 from backend.single_gpu_fastpaths import single_gpu_flag, reference_signature
 from backend.operations_mixed_precision import try_native_int8_input_act
 from backend.native_gqa import try_flash_gqa
+from backend.gate_up_packing import try_packed_gate_up
 from backend.utils import pad_to_patch_size
 
 
@@ -145,18 +146,21 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         with shared_activation_scope(x, (self.gate, self.up)):
-            gate = self.gate(x)
+            pair = try_packed_gate_up(x, self.gate, self.up)
+            gate = self.gate(x) if pair is None else pair[0]
+            def up_projection():
+                return self.up(x) if pair is None else pair[1]
             if (single_gpu_flag("native_int8_mlp_activation") and gate.dtype == torch.bfloat16
                     and type(self) is SwiGLU and cache_dependencies_safe(self)):
-                up = self.up(x)
+                up = up_projection()
                 fused = try_native_int8_input_act(self.down, (gate, up), "swiglu")
                 if fused is not None:
                     return fused
                 hidden = silu_gate(gate, up) if fusion_enabled(gate) else F.silu(gate).mul_(up)
             elif fusion_enabled(gate):
-                hidden = silu_gate(gate, self.up(x))
+                hidden = silu_gate(gate, up_projection())
             else:
-                hidden = F.silu(gate).mul_(self.up(x))
+                hidden = F.silu(gate).mul_(up_projection())
         return self.down(hidden)
 
 

@@ -22,6 +22,7 @@ from backend.single_gpu_fastpaths import dense_tokenwise_head, single_gpu_flag, 
 from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
 from backend.native_gqa import try_flash_gqa
+from backend.gate_up_packing import try_packed_gate_up
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -143,7 +144,8 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         with shared_activation_scope(x, (self.w1, self.w3)):
-            w1, w3 = self.w1(x), self.w3(x)
+            pair = try_packed_gate_up(x, self.w1, self.w3)
+            w1, w3 = (self.w1(x), self.w3(x)) if pair is None else pair
         # BF16 has no FP16 clamp in the original gating function.
         # Only the native ConvRot quantizer is eligible; do not concatenate
         # separate projections for a backend that would apply SiLU eagerly.

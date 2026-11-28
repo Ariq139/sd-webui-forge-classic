@@ -22,6 +22,7 @@ from backend.single_gpu_fastpaths import dense_tokenwise_head, reference_signatu
 from backend.sampling.invariant_cache import invariant_scope_active, retain_reference_sources, invariants_enabled
 from backend.sampling.invariant_cache import cache_dependencies_safe
 from backend.operations_mixed_precision import try_native_int8_input_act
+from backend.gate_up_packing import try_packed_gate_up
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor, mask=None, transformer_options={}) -> torch.Tensor:
@@ -100,19 +101,22 @@ class YakMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with shared_activation_scope(x, (self.gate_proj, self.up_proj)):
-            gate = self.gate_proj(x)
+            pair = try_packed_gate_up(x, self.gate_proj, self.up_proj)
+            gate = self.gate_proj(x) if pair is None else pair[0]
+            def up_projection():
+                return self.up_proj(x) if pair is None else pair[1]
             if (single_gpu_flag("native_int8_mlp_activation") and gate.dtype == torch.bfloat16
                     and type(self) is YakMLP and type(self.act_fn) is nn.SiLU
                     and not self.act_fn.inplace and cache_dependencies_safe(self)):
-                up = self.up_proj(x)
+                up = up_projection()
                 fused = try_native_int8_input_act(self.down_proj, (gate, up), "swiglu")
                 if fused is not None:
                     return fused
                 hidden = self.act_fn(gate) * up
             elif can_fuse_silu(self.act_fn, gate):
-                hidden = silu_gate(gate, self.up_proj(x))
+                hidden = silu_gate(gate, up_projection())
             else:
-                hidden = self.act_fn(gate) * self.up_proj(x)
+                hidden = self.act_fn(gate) * up_projection()
         down_proj = self.down_proj(hidden)
         return down_proj
 
