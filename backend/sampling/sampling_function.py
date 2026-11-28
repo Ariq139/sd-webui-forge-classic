@@ -284,11 +284,14 @@ def _cached_cond_indices(cond_or_uncond, sigma_batch_size):
     return tuple(cond_indices), tuple(uncond_indices)
 
 
+from backend.single_gpu_fastpaths import schedule_options_safe
+
+
 def _native_full_area_cfg(model, x, model_options, condition_cache):
     if (not getattr(args, "direct_full_area_cfg", False) or condition_cache is None
             or x.ndim != 4 or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
             or set(model_options) - {"transformer_options"}
-            or model_options.get("transformer_options")
+            or not schedule_options_safe(model_options.get("transformer_options", {}))
             or dynamic_args.ref_latents or dynamic_args.context_handler is not None
             or any(getattr(args, key, None) is not None for key in
                    ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):

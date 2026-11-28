@@ -17,6 +17,9 @@ parser.add_argument("--native-lumina-gqa", action="store_true", help="Use native
 parser.add_argument("--direct-full-area-cfg", action="store_true", help="Skip redundant condition copies and unit-weight CFG accumulation for native full-area denoising")
 parser.add_argument("--vae-direct-pixels", action="store_true", help="Use native full VAE float32 pixels directly; avoids latent-dtype rounding and may slightly change output")
 parser.add_argument("--fast-image-postprocess", action="store_true", help="Convert CHW float images directly into contiguous HWC uint8 output")
+parser.add_argument("--native-token-assembly", action="store_true", help="Experimental native Z-Image token assembly and uniform unpatchification")
+parser.add_argument("--static-sigma-control", action="store_true", help="Experimental versioned CPU sigma control flow; GPU arithmetic is unchanged")
+parser.add_argument("--qwen-intermediate-only", action="store_true", help="Skip unused final Qwen text encoder layers for native Z-Image and Klein conditioning")
 
 parser.add_argument("--text-enc-device", type=str, default=None, metavar="DEVICE", help='Set the device to load text encoder (e.g. "cuda:1")')
 parser.add_argument("--vae-device", type=str, default=None, metavar="DEVICE", help='Set the device to load VAE (e.g. "cuda:1")')

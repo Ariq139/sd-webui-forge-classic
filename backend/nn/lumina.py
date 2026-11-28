@@ -18,6 +18,7 @@ from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
 from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
+from backend.single_gpu_fastpaths import single_gpu_flag, uniform_unpatchify
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -370,6 +371,10 @@ class NextDiT(nn.Module):
 
     def unpatchify(self, x: torch.Tensor, img_size: list[tuple[int, int]], cap_size: list[int], return_tensor=False) -> list[torch.Tensor]:
         pH = pW = self.patch_size
+        if return_tensor and type(self) is NextDiT and single_gpu_flag("native_token_assembly"):
+            result = uniform_unpatchify(x, img_size, cap_size, pH, self.out_channels)
+            if result is not None:
+                return result
         imgs = []
         for i in range(x.size(0)):
             H, W = img_size[i]
@@ -386,10 +391,14 @@ class NextDiT(nn.Module):
         pH = pW = self.patch_size
         device = x[0].device
         dtype = x[0].dtype
+        fast_assembly = type(self) is NextDiT and single_gpu_flag("native_token_assembly") and not self.training and not torch.is_grad_enabled()
 
         if self.pad_tokens_multiple is not None:
             pad_extra = (-cap_feats.shape[1]) % self.pad_tokens_multiple
-            cap_feats = torch.cat((cap_feats, self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=True).unsqueeze(0).repeat(cap_feats.shape[0], pad_extra, 1)), dim=1)
+            if pad_extra or not fast_assembly:
+                pad = self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=not fast_assembly).unsqueeze(0)
+                pad = pad.expand(cap_feats.shape[0], pad_extra, -1) if fast_assembly else pad.repeat(cap_feats.shape[0], pad_extra, 1)
+                cap_feats = torch.cat((cap_feats, pad), dim=1)
 
         cap_pos_ids = torch.zeros(bsz, cap_feats.shape[1], 3, dtype=torch.float32, device=device)
         cap_pos_ids[:, :, 0] = torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0
@@ -400,13 +409,21 @@ class NextDiT(nn.Module):
         H_tokens, W_tokens = H // pH, W // pW
         x_pos_ids = torch.zeros((bsz, x.shape[1], 3), dtype=torch.float32, device=device)
         x_pos_ids[:, :, 0] = cap_feats.shape[1] + 1
-        x_pos_ids[:, :, 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
-        x_pos_ids[:, :, 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+        if fast_assembly:
+            grid = x_pos_ids.view(bsz, H_tokens, W_tokens, 3)
+            grid[..., 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(1, -1, 1)
+            grid[..., 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, 1, -1)
+        else:
+            x_pos_ids[:, :, 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            x_pos_ids[:, :, 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 
         if self.pad_tokens_multiple is not None:
             pad_extra = (-x.shape[1]) % self.pad_tokens_multiple
-            x = torch.cat((x, self.x_pad_token.to(device=x.device, dtype=dtype, copy=True).unsqueeze(0).repeat(x.shape[0], pad_extra, 1)), dim=1)
-            x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
+            if pad_extra or not fast_assembly:
+                pad = self.x_pad_token.to(device=x.device, dtype=dtype, copy=not fast_assembly).unsqueeze(0)
+                pad = pad.expand(x.shape[0], pad_extra, -1) if fast_assembly else pad.repeat(x.shape[0], pad_extra, 1)
+                x = torch.cat((x, pad), dim=1)
+                x_pos_ids = torch.nn.functional.pad(x_pos_ids, (0, 0, 0, pad_extra))
 
         position_ids = torch.cat((cap_pos_ids, x_pos_ids), dim=1)
         geometry = (H_tokens, W_tokens, cap_pos_ids.shape[1], self.pad_tokens_multiple,

@@ -81,15 +81,6 @@ class SVDQFluxTransformer2DModel(nn.Module):
         self._cache_context = None
 
     def forward(self, x, timestep, context, y, guidance, control=None, transformer_options={}, **kwargs):
-        if isinstance(timestep, torch.Tensor):
-            if timestep.numel() == 1:
-                timestep_float = timestep.item()
-            else:
-                timestep_float = timestep.flatten()[0].item()
-        else:
-            assert isinstance(timestep, float)
-            timestep_float = timestep
-
         model = self.model
         assert isinstance(model, NunchakuFluxTransformer2dModel)
 
@@ -157,6 +148,8 @@ class SVDQFluxTransformer2DModel(nn.Module):
         controlnet_single_block_samples = None if control is None else [y.to(x.dtype) for y in control["output"]]
 
         if getattr(model, "_is_cached", False) or getattr(model, "residual_diff_threshold_multi", 0) != 0:
+            # Read a device scalar only when first-block caching actually needs it.
+            timestep_float = timestep.flatten()[0].item() if isinstance(timestep, torch.Tensor) else timestep
             # A more robust caching strategy
             cache_invalid = False
 
@@ -184,6 +177,8 @@ class SVDQFluxTransformer2DModel(nn.Module):
                     controlnet_single_block_samples=controlnet_single_block_samples,
                 ).sample
         else:
+            self._prev_timestep = None
+            self._cache_context = None
             out = model(
                 hidden_states=img,
                 encoder_hidden_states=context,
@@ -200,7 +195,6 @@ class SVDQFluxTransformer2DModel(nn.Module):
         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=patch_size, pw=patch_size)
         out = out[:, :, :h_orig, :w_orig]
 
-        self._prev_timestep = timestep_float
         return out
 
     def load_state_dict(self, *args, **kwargs):
