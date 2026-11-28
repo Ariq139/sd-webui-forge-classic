@@ -9,7 +9,8 @@ from scipy import integrate
 from tqdm.auto import trange
 
 from backend.patcher.base import set_model_options_post_cfg_function
-from backend.single_gpu_fastpaths import AncestralControl, SigmaControl
+from backend.single_gpu_fastpaths import AncestralControl, SigmaControl, single_gpu_flag, versioned_schedule
+from backend.sampling.sigma_transform import SigmaTransform
 
 from . import utils
 
@@ -153,7 +154,7 @@ def offset_first_sigma_for_snr(sigmas, model_sampling, percent_offset=1e-4):
         return sigmas
     if _is_const(model_sampling):
         if sigmas[0] >= 1:
-            sigmas = sigmas.clone()
+            sigmas = versioned_schedule(sigmas.clone())
             sigmas[0] = model_sampling.percent_to_sigma(percent_offset)
     return sigmas
 
@@ -463,6 +464,7 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
     sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
 
     sigma_control = SigmaControl(sigmas)
+    sigma_transform = SigmaTransform(sigmas, lambda_fn, single_gpu_flag("static_sigma_control") and sigmas.is_cuda, revision=lambda: model_sampling.prediction_type)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
@@ -472,7 +474,7 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
             x = denoised
         else:
             # DPM-Solver++
-            lambda_s, lambda_t = lambda_fn(sigmas[i]), lambda_fn(sigmas[i + 1])
+            lambda_s, lambda_t = sigma_transform.value(i), sigma_transform.value(i + 1)
             h = lambda_t - lambda_s
             lambda_s_1 = lambda_s + r * h
             fac = 1 / (2 * r)
@@ -513,16 +515,17 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
     old_denoised = None
     sigma_control = SigmaControl(sigmas)
 
+    sigma_transform = SigmaTransform(sigmas, t_fn, single_gpu_flag("static_sigma_control") and sigmas.is_cuda)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
-        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        t, t_next = sigma_transform.value(i), sigma_transform.value(i + 1)
         h = t_next - t
         if old_denoised is None or sigma_control.value(i + 1) == 0:
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
         else:
-            h_last = t - t_fn(sigmas[i - 1])
+            h_last = t - sigma_transform.value(i - 1)
             r = h_last / h
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
@@ -553,6 +556,7 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
     h, h_last = None, None
 
     sigma_control = SigmaControl(sigmas)
+    sigma_transform = SigmaTransform(sigmas, lambda_fn, single_gpu_flag("static_sigma_control") and sigmas.is_cuda, revision=lambda: model_sampling.prediction_type)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
@@ -562,7 +566,7 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
             x = denoised
         else:
             # DPM-Solver++(2M) SDE
-            lambda_s, lambda_t = lambda_fn(sigmas[i]), lambda_fn(sigmas[i + 1])
+            lambda_s, lambda_t = sigma_transform.value(i), sigma_transform.value(i + 1)
             h = lambda_t - lambda_s
             h_eta = h * (eta + 1)
 
@@ -606,6 +610,7 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
     h, h_1, h_2 = None, None, None
 
     sigma_control = SigmaControl(sigmas)
+    sigma_transform = SigmaTransform(sigmas, lambda_fn, single_gpu_flag("static_sigma_control") and sigmas.is_cuda, revision=lambda: model_sampling.prediction_type)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
@@ -614,7 +619,7 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
             # Denoising step
             x = denoised
         else:
-            lambda_s, lambda_t = lambda_fn(sigmas[i]), lambda_fn(sigmas[i + 1])
+            lambda_s, lambda_t = sigma_transform.value(i), sigma_transform.value(i + 1)
             h = lambda_t - lambda_s
             h_eta = h * (eta + 1)
 
@@ -740,6 +745,7 @@ def sample_dpmpp_2m_cfg_pp(model, x, sigmas, extra_args=None, callback=None, dis
     extra_args["model_options"] = set_model_options_post_cfg_function(model_options, post_cfg_function, disable_cfg1_optimization=True)
 
     sigma_control = SigmaControl(sigmas)
+    sigma_transform = SigmaTransform(sigmas, t_fn, single_gpu_flag("static_sigma_control") and sigmas.is_cuda, revision=lambda: model_sampling.prediction_type)
     for i in trange(len(sigmas) - 1, disable=disable):
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         if callback is not None:
@@ -749,7 +755,7 @@ def sample_dpmpp_2m_cfg_pp(model, x, sigmas, extra_args=None, callback=None, dis
             if sigma_control.value(i + 1) == 0:
                 x = denoised
             else:
-                t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+                t, t_next = sigma_transform.value(i), sigma_transform.value(i + 1)
                 h = t_next - t
                 alpha_s = sigmas[i] * torch.exp(t)
                 alpha_t = sigmas[i + 1] * torch.exp(t_next)
@@ -758,18 +764,18 @@ def sample_dpmpp_2m_cfg_pp(model, x, sigmas, extra_args=None, callback=None, dis
                 if old_uncond_denoised is None:
                     denoised_mix = -sigma_ratio * alpha_s * uncond_denoised
                 else:
-                    h_last = t - t_fn(sigmas[i - 1])
+                    h_last = t - sigma_transform.value(i - 1)
                     r = h_last / h
                     denoised_mix = -sigma_ratio * alpha_s * uncond_denoised - alpha_t * torch.expm1(-h) * (1 / (2 * r)) * (denoised - old_uncond_denoised)
 
                 x = alpha_t * denoised + denoised_mix + sigma_ratio * x
         else:
-            t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+            t, t_next = sigma_transform.value(i), sigma_transform.value(i + 1)
             h = t_next - t
             if old_uncond_denoised is None or sigma_control.value(i + 1) == 0:
                 denoised_mix = -torch.exp(-h) * uncond_denoised
             else:
-                h_last = t - t_fn(sigmas[i - 1])
+                h_last = t - sigma_transform.value(i - 1)
                 r = h_last / h
                 denoised_mix = -torch.exp(-h) * uncond_denoised - torch.expm1(-h) * (1 / (2 * r)) * (denoised - old_uncond_denoised)
             x = denoised + denoised_mix + torch.exp(-h) * x

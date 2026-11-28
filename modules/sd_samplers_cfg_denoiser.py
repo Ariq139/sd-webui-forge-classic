@@ -1,6 +1,8 @@
 import torch
 
 from backend.performance import record_region
+from backend.sampling.reconstruction_cache import ReconstructionCache, condition_source_key
+from backend.single_gpu_fastpaths import schedule_options_safe, single_gpu_flag
 from backend.sampling.sampling_function import sampling_function, should_skip_unconditional
 from modules import prompt_parser, script_callbacks, sd_samplers_common
 from modules.script_callbacks import AfterCFGCallbackParams, CFGDenoiserParams, cfg_after_cfg_callback, cfg_denoiser_callback
@@ -61,6 +63,7 @@ class CFGDenoiser(torch.nn.Module):
 
         self._refiner_pass = False
         self._conditioning_device_cache = {}
+        self._reconstruction_cache = ReconstructionCache()
         self._conditioning_schedule_key = None
 
     @staticmethod
@@ -74,17 +77,23 @@ class CFGDenoiser(torch.nn.Module):
     def _cond_cache_key(cls, cond, step):
         if cond is None:
             return None
-        return tuple(id(cls._selected_schedule_entry(schedule, step).cond) for schedule in cond)
+        keys = tuple(condition_source_key(cls._selected_schedule_entry(schedule, step).cond,
+                                          prompt_parser.DictWithShape) for schedule in cond)
+        return keys if all(key is not None for key in keys) else None
 
     @classmethod
     def _multicond_cache_key(cls, cond, step):
-        return tuple(
-            tuple((id(cls._selected_schedule_entry(item.schedules, step).cond), item.weight) for item in batch)
+        keys = tuple(
+            tuple((condition_source_key(cls._selected_schedule_entry(item.schedules, step).cond,
+                                        prompt_parser.DictWithShape), item.weight) for item in batch)
             for batch in cond.batch
         )
+        return keys if all(key is not None and type(weight) in (int, float)
+                           for batch in keys for key, weight in batch) else None
 
     def clear_conditioning_cache(self):
         self._conditioning_device_cache.clear()
+        self._reconstruction_cache.clear()
         self._conditioning_schedule_key = None
 
     @property
@@ -149,8 +158,39 @@ class CFGDenoiser(torch.nn.Module):
         if schedule_key != self._conditioning_schedule_key:
             self.clear_conditioning_cache()
             self._conditioning_schedule_key = schedule_key
-        cond_composition, cond = prompt_parser.reconstruct_multicond_batch(cond, self.step)
-        uncond = prompt_parser.reconstruct_cond_batch(uncond, self.step) if uncond is not None else None
+        def reconstruct():
+            composition, text = prompt_parser.reconstruct_multicond_batch(cond, self.step)
+            negative = prompt_parser.reconstruct_cond_batch(uncond, self.step) if uncond is not None else None
+            return composition, text, negative
+
+        eligible = False
+        if (single_gpu_flag("conditioning_reconstruction_cache") and cond_cache_key is not None
+                and (uncond is None or uncond_cache_key is not None)
+                and self.mask is None and not torch.is_grad_enabled()
+                and not any(script_callbacks.callback_map.get(key) for key in
+                            ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg"))
+                and not kwargs.get("model_options")):
+            from backend.args import dynamic_args
+            from backend.modules.k_model import KModel
+            from backend.nn.anima import Anima
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            from backend.nn.krea import SingleStreamDiT
+            from backend.nn.lumina import NextDiT
+            from backend.sampling.invariant_cache import cache_dependencies_safe
+            patcher = self.inner_model.inner_model.forge_objects.unet
+            model = patcher.model
+            options = patcher.model_options
+            eligible = (type(model) is KModel and type(model.diffusion_model) in
+                        (Anima, IntegratedFluxTransformer2DModel, SingleStreamDiT, NextDiT)
+                        and not self.inner_model.inner_model.is_inpaint
+                        and not dynamic_args.ref_latents and dynamic_args.context_handler is None
+                        and not patcher.object_patches and not patcher.extra_model_patchers_during_sampling
+                        and patcher.controlnet_linked_list is None and patcher.extra_concat_condition is None
+                        and set(options) <= {"transformer_options"}
+                        and schedule_options_safe(options.get("transformer_options", {}))
+                        and cache_dependencies_safe(model.diffusion_model))
+        cond_composition, cond, uncond = self._reconstruction_cache.get(
+            schedule_key, cond, uncond, reconstruct, enabled=eligible)
 
         if self.mask is not None:
             predictor = self.inner_model.inner_model.forge_objects.unet.model.predictor
