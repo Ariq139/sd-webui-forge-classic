@@ -602,12 +602,18 @@ class IntegratedFluxTransformer2DModel(nn.Module):
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.guidance_embed:
             if guidance is not None:
-                vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
+                projected_guidance = cached_invariant(self, "flux_guidance_projection", guidance, transformer_options,
+                                                      lambda: self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype)),
+                                                      geometry=(img.dtype, img.device), dependencies=(self.guidance_in,))
+                vec = vec + projected_guidance
 
         if hasattr(self, "vec_in_dim"):
             if y is None:
                 y = torch.zeros((img.shape[0], self.vec_in_dim), device=img.device, dtype=img.dtype)
-            vec = vec + self.vector_in(y[:, : self.vec_in_dim])
+            projected_y = cached_invariant(self, "flux_pooled_projection", y, transformer_options,
+                                            lambda: self.vector_in(y[:, : self.vec_in_dim]),
+                                            geometry=(self.vec_in_dim, img.dtype, img.device), dependencies=(self.vector_in,))
+            vec = vec + projected_y
 
         def project_text():
             features = self.txt_norm(txt) if self.txt_norm is not None else txt

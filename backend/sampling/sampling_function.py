@@ -765,9 +765,12 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
         revision = (id(unet_patcher), unet_patcher.patches_uuid)
         invariant_revision_key = None
         ref_signature = None
-        if dynamic_args.ref_latents and single_gpu_flag("flux_reference_cache"):
+        if dynamic_args.ref_latents:
             from backend.nn.flux import IntegratedFluxTransformer2DModel
-            if type(getattr(model, "diffusion_model", None)) is IntegratedFluxTransformer2DModel:
+            from backend.nn.krea import SingleStreamDiT
+            diffusion_type = type(getattr(model, "diffusion_model", None))
+            if ((diffusion_type is IntegratedFluxTransformer2DModel and single_gpu_flag("flux_reference_cache"))
+                    or (diffusion_type is SingleStreamDiT and single_gpu_flag("krea_reference_cache"))):
                 ref_signature = reference_signature(dynamic_args.ref_latents)
         if (getattr(args, "invariant_cache_mib", 0) > 0 and condition_cache is not None
                 and cond_cache_key is not None and (uncond is None or math.isclose(cond_scale, 1.0) or uncond_cache_key is not None)

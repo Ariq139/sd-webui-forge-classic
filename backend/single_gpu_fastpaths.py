@@ -124,9 +124,9 @@ def dense_tokenwise_head(module):
     return True
 
 
-def version_reference_latents(refs):
+def version_reference_latents(refs, flag="flux_reference_cache"):
     """Create versioned immutable job inputs once, not once per denoiser call."""
-    if not single_gpu_flag("flux_reference_cache"):
+    if not single_gpu_flag(flag):
         return list(refs)
     result = []
     for ref in refs:
