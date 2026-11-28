@@ -54,3 +54,30 @@ def test_cuda_slot_replays_changed_inputs_and_owns_output():
             torch.testing.assert_close(third, torch.full_like(x, 7))
     finally:
         slot.clear()
+
+
+def test_dead_owner_and_shape_change_disable_slot_without_cuda():
+    import weakref
+    weight = torch.ones(1)
+    slot = ReplaySlot(1024)
+    slot.key = 'shape'
+    slot.owner_refs = (weakref.ref(weight),)
+    del weight
+    assert slot.run('shape', torch.device('cpu'), {}, lambda _: pytest.fail('dead owner')) is None
+    assert slot.disabled and slot.key is None
+    slot = ReplaySlot(1024)
+    slot.key = 'shape'
+    assert slot.run('other', torch.device('cpu'), {}, lambda _: pytest.fail('changed shape')) is None
+    assert slot.disabled and slot.key is None
+
+
+def test_ineligible_call_discards_previous_slot():
+    from backend import resident_denoiser_graph as graph
+    slot = ReplaySlot(1024)
+    slot.key = 'shape'
+    token = graph._SLOT.set(slot)
+    try:
+        graph.discard_resident_graph()
+        assert slot.disabled and slot.key is None
+    finally:
+        graph._SLOT.reset(token)

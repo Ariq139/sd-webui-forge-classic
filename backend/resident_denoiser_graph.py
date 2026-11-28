@@ -1,6 +1,8 @@
 """Single-job, single-slot CUDA graph replay for audited resident denoisers."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+import logging
+import weakref
 
 import torch
 
@@ -57,18 +59,32 @@ class ReplaySlot:
         self.budget = budget
         self.disabled = False
         self.key = self.stream = self.graph = self.inputs = self.output = None
+        self.owner_refs = ()
 
     def clear(self):
-        if self.stream is not None:
-            self.stream.synchronize()
-        self.key = self.stream = self.graph = self.inputs = self.output = None
+        try:
+            if self.stream is not None:
+                self.stream.synchronize()
+        finally:
+            self.key = self.stream = self.graph = self.inputs = self.output = None
+            self.owner_refs = ()
 
-    def run(self, key, device, values, invoke):
+    def disable(self):
+        self.disabled = True
+        self.clear()
+
+    def run(self, key, device, values, invoke, *, owners=()):
         if self.disabled:
             return None
-        if key != self.key:
-            self.clear()
+        if self.key is not None and (key != self.key or any(ref() is None for ref in self.owner_refs)):
+            # Do not accumulate graph pools or recapture after a model/shape
+            # change. Dead weak owners detect allocator/Python identity reuse
+            # without holding offloaded model weights alive.
+            self.disable()
+            return None
+        if self.key is None:
             self.key = key
+            self.owner_refs = owners
         if self.graph is None and torch.cuda.mem_get_info(device)[0] < self.budget + _HEADROOM:
             self.clear()
             self.disabled = True
@@ -125,12 +141,24 @@ def sampling_graph_scope():
     token = _SLOT.set(slot)
     try:
         yield
-    finally:
-        try:
-            if slot is not None:
+    except BaseException:
+        if slot is not None:
+            try:
                 slot.clear()
-        finally:
-            _SLOT.reset(token)
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to release CUDA graph after sampling error")
+        raise
+    else:
+        if slot is not None:
+            slot.clear()
+    finally:
+        _SLOT.reset(token)
+
+
+def discard_resident_graph():
+    slot = _SLOT.get()
+    if slot is not None and slot.key is not None:
+        slot.disable()
 
 
 def graph_scope_active():
@@ -152,7 +180,7 @@ def model_stamp(model, device):
     from backend.sampling.invariant_cache import cache_dependencies_safe
     if not cache_dependencies_safe(model):
         return None
-    stamps = []
+    stamps, owners = [], []
     for child in model.modules():
         namespace = type(child).__module__
         if (not (namespace in ("backend.nn.flux", "backend.nn.lumina", "backend.operations", "backend.operations_mixed_precision")
@@ -162,9 +190,11 @@ def model_stamp(model, device):
                 or getattr(child, "forge_force_cast_weights", False) or getattr(child, "weight_scale", None) is not None):
             return None
         stamps.append((id(child), type(child), type(child).forward))
+        owners.append(weakref.ref(child))
     for name, value in (*model.named_parameters(), *model.named_buffers()):
         if value.device != device or value.requires_grad:
             return None
+        owners.append(weakref.ref(value))
         if type(value) is QuantizedTensor:
             p = value._params
             if (value._layout_cls != "TensorWiseINT8Layout" or type(p) is not TensorWiseINT8Layout.Params
@@ -174,13 +204,14 @@ def model_stamp(model, device):
             raw, scale = tensor_stamp(value._qdata, storage=True), tensor_stamp(p.scale, storage=True)
             if raw is None or scale is None:
                 return None
+            owners.extend((weakref.ref(value._qdata), weakref.ref(p.scale)))
             stamp = (id(value), raw, scale, p.orig_dtype, tuple(p.orig_shape), p.convrot, p.convrot_groupsize)
         else:
             stamp = tensor_stamp(value, storage=True)
             if stamp is None:
                 return None
         stamps.append((name, stamp))
-    return tuple(stamps)
+    return tuple(stamps), tuple(owners)
 
 
 _SAFE_OPTIONS = {"cond_or_uncond", "sigmas", "cond_mark", "cond_indices", "uncond_indices", "sampling_sigmas"}
@@ -193,8 +224,15 @@ _INCOMPATIBLE_FLAGS = ("invariant_cache_mib", "weight_prefetch_mib", "shared_act
 
 def try_resident_graph(model, x, t, context, options, extra):
     slot = _SLOT.get()
-    if slot is None or slot.disabled or not _CANDIDATE.get():
+    if slot is None or slot.disabled:
         return None
+
+    def decline():
+        discard_resident_graph()
+        return None
+
+    if not _CANDIDATE.get():
+        return decline()
     from backend.args import args, dynamic_args
     from backend import attention
     from backend.performance import profiler_enabled, record_region
@@ -209,18 +247,19 @@ def try_resident_graph(model, x, t, context, options, extra):
             or getattr(model, "_anima_shard_devices", None) or attention.attention_function is not attention.attention_pytorch
             or any(getattr(args, flag, False) for flag in _INCOMPATIBLE_FLAGS)
             or type(options) is not dict or options.keys() - _SAFE_OPTIONS or extra.keys() - {"y", "guidance"}):
-        return None
+        return decline()
     values = dict(x=x, t=t, context=context, **extra)
     values.update({"option:" + k: v for k, v in options.items()})
     if any(type(v) is torch.Tensor and v.device != x.device for v in values.values()):
-        return None
+        return decline()
     signature = input_signature(values)
     if signature is None:
-        return None
+        return decline()
     weights = model_stamp(model, x.device)
     if weights is None:
-        return None
-    key = (id(model), weights, signature)
+        return decline()
+    stamps, owners = weights
+    key = (id(model), stamps, signature)
 
     def invoke(inputs):
         kwargs = {k: inputs[k] for k in extra}
@@ -229,4 +268,4 @@ def try_resident_graph(model, x, t, context, options, extra):
                      transformer_options=transformer_options, **kwargs)
 
     with record_region("forge::resident_denoiser_graph"):
-        return slot.run(key, x.device, values, invoke)
+        return slot.run(key, x.device, values, invoke, owners=owners)

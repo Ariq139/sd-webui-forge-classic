@@ -36,3 +36,25 @@ def test_output_views_are_disjoint_and_single_use():
     assert q.eq(1).all() and k.eq(2).all() and v.eq(3).all()
     assert group.take('q') is None
     assert ProjectionDestinations(x, [('q', 32)], budget=1).take('q') is None
+
+
+def test_pinned_dependency_parameter_views_preserve_weight_values():
+    import pytest
+    from backend.quantized_storage import _layout_types
+    types = _layout_types()
+    if types is None:
+        pytest.skip('requires Comfy-Kitchen 0.2.40')
+    cls, params = types
+    qa = torch.randint(-127, 128, (16, 32), dtype=torch.int8)
+    qb = torch.randint(-127, 128, (16, 32), dtype=torch.int8)
+    a = cls(qa, 'TensorWiseINT8Layout', params(scale=torch.ones(16), orig_dtype=torch.bfloat16, orig_shape=(16, 32)))
+    b = cls(qb, 'TensorWiseINT8Layout', params(scale=torch.full((16,), 2.0), orig_dtype=torch.bfloat16, orig_shape=(16, 32)))
+    views = coalesce_rows(a._qdata, b._qdata)
+    packed_a, packed_b = [torch.nn.Parameter(cls(view, w._layout_cls, w._params), requires_grad=False)
+                          for w, view in zip((a, b), views)]
+    assert joined_rows(packed_a._qdata, packed_b._qdata) is not None
+    for new, old in ((packed_a, a), (packed_b, b)):
+        assert tuple(new.shape) == tuple(old.shape)
+        assert torch.equal(new._qdata, old._qdata)
+        assert torch.equal(new._params.scale, old._params.scale)
+        torch.testing.assert_close(new.dequantize(), old.dequantize(), rtol=0, atol=0)
