@@ -29,7 +29,7 @@ from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant, invariants_enabled
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
-from backend.fused_pointwise import affine_modulation
+from backend.fused_pointwise import norm_affine
 from backend.utils import pad_to_patch_size
 
 BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
@@ -40,7 +40,7 @@ BLOCK_MAPPINGS: Final[dict[tuple[int, int], list[int]]] = {
 
 
 def _fn(x: torch.Tensor, _norm: nn.Module, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    return affine_modulation(_norm(x), y, z)
+    return norm_affine(_norm, x, y, z)
 
 
 # region DiT
@@ -155,13 +155,13 @@ class SelfCrossAttention(nn.Module):
 
     def compute_qkv(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if context is None:
-            with shared_activation_scope(x):
+            with shared_activation_scope(x, (self.q_proj, self.k_proj, self.v_proj)):
                 q = self.q_proj(x)
                 k = self.k_proj(x)
                 v = self.v_proj(x)
         else:
             q = self.q_proj(x)
-            with shared_activation_scope(context):
+            with shared_activation_scope(context, (self.k_proj, self.v_proj)):
                 k = self.k_proj(context)
                 v = self.v_proj(context)
         q, k, v = map(
@@ -202,7 +202,7 @@ class SelfCrossAttention(nn.Module):
                 return rearrange(value, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim)
 
             def compute_kv():
-                with shared_activation_scope(context):
+                with shared_activation_scope(context, (self.k_proj, self.v_proj)):
                     k = project(self.k_proj(context))
                     v = project(self.v_proj(context))
                 return self.k_norm(k), self.v_norm(v)

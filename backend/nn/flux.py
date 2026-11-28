@@ -16,7 +16,7 @@ from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
-from backend.fused_pointwise import silu_gate, affine_modulation
+from backend.fused_pointwise import silu_gate, norm_affine, can_fuse_silu
 from backend.utils import fp16_fix, pad_to_patch_size
 
 
@@ -95,9 +95,13 @@ class YakMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with shared_activation_scope(x):
-            gate, up = self.gate_proj(x), self.up_proj(x)
-        down_proj = self.down_proj(silu_gate(gate, up))
+        with shared_activation_scope(x, (self.gate_proj, self.up_proj)):
+            gate = self.gate_proj(x)
+            if can_fuse_silu(self.act_fn, gate):
+                hidden = silu_gate(gate, self.up_proj(x))
+            else:
+                hidden = self.act_fn(gate) * self.up_proj(x)
+        down_proj = self.down_proj(hidden)
         return down_proj
 
 
@@ -176,10 +180,10 @@ class Modulation(nn.Module):
         )
 
 
-def apply_scale_shift(tensor, scale, shift, modulation_dims=None):
+def apply_norm_scale_shift(norm, tensor, scale, shift, modulation_dims=None):
     if modulation_dims is None and shift is not None:
-        return affine_modulation(tensor, scale, shift)
-    return apply_mod(tensor, 1 + scale, shift, modulation_dims)
+        return norm_affine(norm, tensor, scale, shift)
+    return apply_mod(norm(tensor), 1 + scale, shift, modulation_dims)
 
 
 def apply_mod(tensor: torch.Tensor, m_mult: float, m_add: bool = None, modulation_dims: torch.Tensor = None) -> torch.Tensor:
@@ -203,7 +207,7 @@ class SiLUActivation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = x.chunk(2, dim=-1)
-        return silu_gate(x1, x2)
+        return silu_gate(x1, x2) if can_fuse_silu(self.gate_fn, x1) else self.gate_fn(x1) * x2
 
 
 class DoubleStreamBlock(nn.Module):
@@ -243,8 +247,7 @@ class DoubleStreamBlock(nn.Module):
             (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
         # prepare image for attention
-        img_modulated = self.img_norm1(img)
-        img_modulated = apply_scale_shift(img_modulated, img_mod1.scale, img_mod1.shift, modulation_dims_img)
+        img_modulated = apply_norm_scale_shift(self.img_norm1, img, img_mod1.scale, img_mod1.shift, modulation_dims_img)
         img_qkv = self.img_attn.qkv(img_modulated)
         del img_modulated
         img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -252,8 +255,7 @@ class DoubleStreamBlock(nn.Module):
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
         # prepare txt for attention
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = apply_scale_shift(txt_modulated, txt_mod1.scale, txt_mod1.shift, modulation_dims_txt)
+        txt_modulated = apply_norm_scale_shift(self.txt_norm1, txt, txt_mod1.scale, txt_mod1.shift, modulation_dims_txt)
         txt_qkv = self.txt_attn.qkv(txt_modulated)
         del txt_modulated
         txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -275,12 +277,12 @@ class DoubleStreamBlock(nn.Module):
         # calculate the img blocks
         img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
         del img_attn
-        img += apply_mod(self.img_mlp(apply_scale_shift(self.img_norm2(img), img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+        img += apply_mod(self.img_mlp(apply_norm_scale_shift(self.img_norm2, img, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
         # calculate the txt blocks
         txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
         del txt_attn
-        txt += apply_mod(self.txt_mlp(apply_scale_shift(self.txt_norm2(txt), txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+        txt += apply_mod(self.txt_mlp(apply_norm_scale_shift(self.txt_norm2, txt, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
 
         txt = fp16_fix(txt)
 
@@ -330,7 +332,7 @@ class SingleStreamBlock(nn.Module):
         else:
             mod = vec
 
-        qkv, mlp = torch.split(self.linear1(apply_scale_shift(self.pre_norm(x), mod.scale, mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
+        qkv, mlp = torch.split(self.linear1(apply_norm_scale_shift(self.pre_norm, x, mod.scale, mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
 
         q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         del qkv
@@ -341,7 +343,8 @@ class SingleStreamBlock(nn.Module):
         del q, k, v
         # compute activation in mlp stream, cat again and run second linear layer
         if self.yak_mlp:
-            mlp = silu_gate(mlp[..., self.mlp_hidden_dim_first // 2 :], mlp[..., : self.mlp_hidden_dim_first // 2])
+            gate, up = mlp[..., self.mlp_hidden_dim_first // 2 :], mlp[..., : self.mlp_hidden_dim_first // 2]
+            mlp = silu_gate(gate, up) if can_fuse_silu(self.mlp_act, gate) else self.mlp_act(gate) * up
         else:
             mlp = self.mlp_act(mlp)
         output = self.linear2(torch.cat((attn, mlp), 2))
@@ -364,7 +367,7 @@ class LastLayer(nn.Module):
             vec = vec[:, None, :]
 
         shift, scale = self.adaLN_modulation(vec).chunk(2, dim=-1)
-        x = apply_scale_shift(self.norm_final(x), scale, shift, modulation_dims)
+        x = apply_norm_scale_shift(self.norm_final, x, scale, shift, modulation_dims)
         x = self.linear(x)
         return x
 

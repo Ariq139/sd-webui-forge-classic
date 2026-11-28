@@ -39,7 +39,7 @@ class WeightPrefetch:
         with torch.cuda.stream(self.stream):
             for module in block.modules():
                 source = getattr(module, "weight", None)
-                if (source is None or source.device.type != "cpu"
+                if (not isinstance(source, torch.Tensor) or source.device.type != "cpu"
                         or getattr(module, "weight_function", None)
                         or getattr(module, "bias_function", None)
                         or getattr(module, "weight_scale", None) is not None

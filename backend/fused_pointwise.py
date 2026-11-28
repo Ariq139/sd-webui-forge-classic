@@ -16,12 +16,24 @@ def _compile(fn):
     return torch.compile(fn, fullgraph=True, dynamic=True)
 
 
+def fusion_enabled(x):
+    return (getattr(args, "fused_denoiser_pointwise", False)
+            and x.device.type == "cuda" and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch.is_autocast_enabled(x.device.type)
+            and not any(getattr(args, key, None) is not None
+                        for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch")))
+
+
+def can_fuse_silu(module, x):
+    return (fusion_enabled(x) and type(module) is torch.nn.SiLU and not module.inplace
+            and not module._forward_hooks and not module._forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks)
+
+
 def _run(fn, x, *others):
-    if (not getattr(args, "fused_denoiser_pointwise", False)
-            or x.device.type != "cuda" or torch.is_grad_enabled()
-            or fn in _FAILED or torch.compiler.is_compiling()
-            or any(getattr(args, key, None) is not None
-                   for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+    if not fusion_enabled(x) or fn in _FAILED:
         return fn(x, *others)
     from torch._dynamo.exc import TorchDynamoException
     try:
@@ -66,3 +78,41 @@ def affine_modulation(x, scale, shift):
 
 def scale_modulation(x, scale):
     return _run(_scale_modulation, x, scale)
+
+
+def _layer_norm_affine(x, scale, shift, shape, weight, bias, eps):
+    normalized = F.layer_norm(x, shape, weight, bias, eps)
+    return torch.addcmul(shift, normalized, 1 + scale)
+
+
+def _rms_norm_scale(x, scale, shape, weight, eps):
+    normalized = F.rms_norm(x, shape, weight, eps)
+    return normalized * (1 + scale.unsqueeze(1))
+
+
+def _resident_native_norm(norm, x, rms):
+    if not fusion_enabled(x):
+        return False
+    from backend.operations import ForgeOperations
+    supported = (torch.nn.RMSNorm, ForgeOperations.RMSNorm) if rms else (torch.nn.LayerNorm, ForgeOperations.LayerNorm)
+    if (type(norm) not in supported or getattr(norm, "add", False)
+            or getattr(norm, "weight_function", None) or getattr(norm, "bias_function", None)
+            or norm._forward_hooks or norm._forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_forward_pre_hooks):
+        return False
+    return all(p is None or (type(p) in (torch.Tensor, torch.nn.Parameter)
+                             and p.device == x.device and p.dtype == x.dtype)
+               for p in (getattr(norm, "weight", None), getattr(norm, "bias", None)))
+
+
+def norm_affine(norm, x, scale, shift):
+    if _resident_native_norm(norm, x, rms=False):
+        return _run(_layer_norm_affine, x, scale, shift, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
+    return affine_modulation(norm(x), scale, shift)
+
+
+def norm_scale(norm, x, scale):
+    if _resident_native_norm(norm, x, rms=True):
+        return _run(_rms_norm_scale, x, scale, norm.normalized_shape, norm.weight, norm.eps)
+    return scale_modulation(norm(x), scale)

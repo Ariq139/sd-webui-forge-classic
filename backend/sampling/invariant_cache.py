@@ -26,6 +26,7 @@ class InvariantCache:
         self.bytes_used = 0
         self.entries = {}
         self.sources = {}
+        self.revision = None
 
     def put(self, key, value):
         size = _bytes(value)
@@ -65,6 +66,10 @@ def sampling_invariant_scope(max_bytes):
 
 @contextmanager
 def invariant_revision(revision):
+    cache = _CACHE.get()
+    if cache is not None and cache.revision != revision:
+        cache.clear()
+        cache.revision = revision
     token = _REVISION.set(revision)
     try:
         yield
@@ -91,6 +96,9 @@ def invariants_enabled(module, tensor, options):
     return (_CACHE.get() is not None and _REVISION.get() is not None
             and _CONDITION.get() is not None and not torch.is_grad_enabled()
             and isinstance(tensor, torch.Tensor) and not module.training
+            and not module._forward_hooks and not module._forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks
             and not torch.is_autocast_enabled(tensor.device.type)
             and isinstance(options, dict) and options.keys() <= _SAFE_OPTIONS)
 
@@ -100,8 +108,12 @@ def cached_invariant(module, kind, tensor, options, compute, *, geometry=(), clo
     if not invariants_enabled(module, tensor, options):
         return compute()
     cache = _CACHE.get()
+    try:
+        version = tensor._version
+    except RuntimeError:
+        version = None  # only semantically keyed, native inference calls reach here
     key = (_REVISION.get(), _CONDITION.get(), module, kind, tensor.device,
-           tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()), geometry)
+           tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()), version, geometry)
     try:
         hash(key)
     except TypeError:

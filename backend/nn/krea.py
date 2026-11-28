@@ -20,6 +20,9 @@ from backend.nn.flux import EmbedND, timestep_embedding
 from backend.operations import repeat_kv_for_gqa
 from backend.performance import record_region
 from backend.quant_ops import ck
+from backend.weight_prefetch import weight_prefetch_scope
+from backend.activation_quantization import shared_activation_scope
+from backend.fused_pointwise import silu_gate, fusion_enabled
 from backend.sampling.krea_cache import cached_krea_text_features
 from backend.utils import pad_to_patch_size
 
@@ -137,7 +140,13 @@ class SwiGLU(nn.Module):
         self.down = nn.Linear(mlpdim, features, bias=bias)
 
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)).mul_(self.up(x)))
+        with shared_activation_scope(x, (self.gate, self.up)):
+            gate = self.gate(x)
+            if fusion_enabled(gate):
+                hidden = silu_gate(gate, self.up(x))
+            else:
+                hidden = F.silu(gate).mul_(self.up(x))
+        return self.down(hidden)
 
 
 class Attention(nn.Module):
@@ -366,13 +375,18 @@ class SingleStreamDiT(nn.Module):
         freqs = krea_position_frequencies(self.pe_embedder, txtlen, h_, w_, ref_grids if _edit else (), device)
 
         shard = getattr(self, "_anima_shard_devices", None)
-        for index, block in enumerate(self.blocks):
-            if shard and index == shard[2]:
-                combined = combined.to(shard[1])
-                tvec = tvec.to(shard[1])
-                freqs = freqs.to(shard[1])
-            with torch.cuda.device(combined.device) if shard else nullcontext():
-                combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+        with weight_prefetch_scope(combined.device, transformer_options, enabled=not shard and not _edit and not self.training) as prefetch:
+            for index, block in enumerate(self.blocks):
+                if prefetch is not None:
+                    prefetch.stage(self.blocks[index + 1] if index + 1 < len(self.blocks) else None, combined.dtype)
+                if shard and index == shard[2]:
+                    combined = combined.to(shard[1])
+                    tvec = tvec.to(shard[1])
+                    freqs = freqs.to(shard[1])
+                with torch.cuda.device(combined.device) if shard else nullcontext():
+                    combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+                if prefetch is not None:
+                    prefetch.discard(block)
 
         combined = combined[:, txtlen + reflen : txtlen + reflen + imglen]
         if shard:

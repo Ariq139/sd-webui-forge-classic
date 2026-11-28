@@ -11,10 +11,13 @@ _ACTIVE = ContextVar("forge_shared_activation_quantization", default=None)
 
 
 @contextmanager
-def shared_activation_scope(source):
+def shared_activation_scope(source, modules=()):
     enabled = (getattr(args, "shared_activation_quantization", False)
                and type(source) is torch.Tensor and source.is_cuda
                and not torch.is_grad_enabled()
+               and not torch.nn.modules.module._global_forward_hooks
+               and not torch.nn.modules.module._global_forward_pre_hooks
+               and not any(m._forward_hooks or m._forward_pre_hooks for m in modules)
                and not any(getattr(args, key, None) is not None
                            for key in ("multi_gpu_anima", "parallel_cfg", "parallel_batch")))
     # Only retain a single activation within an explicitly read-only group.
@@ -30,7 +33,11 @@ def quantize_shared_activation(source, reshaped, layout, scale, quantize):
     if (active is None or active[0] is not source
             or layout != "TensorWiseINT8Layout" or scale is not None):
         return quantize(reshaped, layout, scale=scale)
-    key = (layout, source.dtype, source.device, tuple(reshaped.shape), tuple(reshaped.stride()))
+    try:
+        version = source._version
+    except RuntimeError:
+        version = None
+    key = (layout, source.dtype, source.device, tuple(reshaped.shape), tuple(reshaped.stride()), version)
     if key not in active[1]:
         active[1][key] = quantize(reshaped, layout, scale=scale)
     else:

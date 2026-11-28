@@ -17,7 +17,7 @@ from backend.quant_ops import ck
 from backend.sampling.invariant_cache import cached_invariant
 from backend.activation_quantization import shared_activation_scope
 from backend.weight_prefetch import weight_prefetch_scope
-from backend.fused_pointwise import silu_gate, scale_modulation
+from backend.fused_pointwise import silu_gate, scale_modulation, norm_scale
 from backend.utils import fp16_fix as clamp_fp16
 from backend.utils import pad_to_patch_size
 
@@ -146,7 +146,7 @@ class FeedForward(nn.Module):
         return silu_gate(x1, x3, fix_fp16=True)
 
     def forward(self, x):
-        with shared_activation_scope(x):
+        with shared_activation_scope(x, (self.w1, self.w3)):
             w1, w3 = self.w1(x), self.w3(x)
         return self.w2(self._forward_silu_gating(w1, w3))
 
@@ -190,7 +190,7 @@ class JointTransformerBlock(nn.Module):
             x = x + gate_msa.unsqueeze(1).tanh() * self.attention_norm2(
                 clamp_fp16(
                     self.attention(
-                        modulate(self.attention_norm1(x), scale_msa),
+                        norm_scale(self.attention_norm1, x, scale_msa),
                         x_mask,
                         freqs_cis,
                         transformer_options=transformer_options,
@@ -200,7 +200,7 @@ class JointTransformerBlock(nn.Module):
             x = x + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
                 clamp_fp16(
                     self.feed_forward(
-                        modulate(self.ffn_norm1(x), scale_mlp),
+                        norm_scale(self.ffn_norm1, x, scale_mlp),
                     )
                 )
             )
