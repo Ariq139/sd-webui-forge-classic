@@ -19,6 +19,7 @@ from backend import memory_management, utils
 from backend.args import args, dynamic_args
 from backend.sampling.condition import (
     Condition,
+    ConditionCrossAttn,
     compile_conditions,
     compile_weighted_conditions,
     repeat_to_batch_size,
@@ -107,7 +108,7 @@ def condition_cache_allowed(model_options):
     )
 
 
-def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
+def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None, direct_full_area=False):
     batch_size = x_in.shape[0]
     batch_indices = conds.get("batch_indices")
     if batch_indices is not None:
@@ -131,7 +132,9 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
 
     input_x = x_in[:, :, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
 
-    if "mask" in conds:
+    if direct_full_area:
+        mult = None
+    elif "mask" in conds:
         mask_strength = 1.0
         if "mask_strength" in conds:
             mask_strength = conds["mask_strength"]
@@ -155,7 +158,7 @@ def get_area_and_mult(conds, x_in, timestep_in, condition_cache=None):
     else:
         mult = torch.full_like(input_x, strength)
 
-    if "mask" not in conds:
+    if not direct_full_area and "mask" not in conds:
         rr = 8
         if area[2] != 0:
             for t in range(rr):
@@ -278,26 +281,63 @@ def _cached_cond_indices(cond_or_uncond, sigma_batch_size):
     return tuple(cond_indices), tuple(uncond_indices)
 
 
-def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
-    out_cond = torch.zeros_like(x_in)
-    out_count = torch.full_like(x_in, 1e-37)
+def _native_full_area_cfg(model, x, model_options, condition_cache):
+    if (not getattr(args, "direct_full_area_cfg", False) or condition_cache is None
+            or x.ndim != 4 or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or set(model_options) - {"transformer_options"}
+            or model_options.get("transformer_options")
+            or dynamic_args.ref_latents or dynamic_args.context_handler is not None
+            or any(getattr(args, key, None) is not None for key in
+                   ("multi_gpu_anima", "parallel_cfg", "parallel_batch"))):
+        return False
+    from backend.modules.k_model import KModel
+    from backend.nn.anima import Anima
+    from backend.nn.flux import IntegratedFluxTransformer2DModel
+    from backend.nn.lumina import NextDiT
+    from modules import script_callbacks
 
-    out_uncond = torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None
-    out_uncond_count = torch.full_like(x_in, 1e-37) if uncond is not None else None
+    diffusion = getattr(model, "diffusion_model", None)
+    return (type(model) is KModel and type(diffusion) in (Anima, IntegratedFluxTransformer2DModel, NextDiT)
+            and not getattr(diffusion, "_anima_shard_devices", None)
+            and not any(script_callbacks.callback_map.get(key) for key in
+                        ("callbacks_cfg_denoiser", "callbacks_cfg_denoised", "callbacks_cfg_after_cfg")))
+
+
+def _unit_full_area(item, x):
+    strength = item.get("strength", 1.0)
+    if (not isinstance(item.get("model_conds"), dict)
+            or any(key in item for key in ("mask", "mask_strength", "batch_indices", "timestep_start",
+                                           "timestep_end", "control", "patches"))
+            or not isinstance(strength, (int, float)) or strength != 1.0):
+        return False
+    area = item.get("area")
+    return area is None or tuple(area) == (x.shape[2], x.shape[3], 0, 0)
+
+
+def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, condition_cache=None, materialize_uncond=True):
+    direct = (uncond is not None and len(cond) == len(uncond) == 1
+              and _native_full_area_cfg(model, x_in, model_options, condition_cache)
+              and _unit_full_area(cond[0], x_in) and _unit_full_area(uncond[0], x_in))
+    out_cond = None if direct else torch.zeros_like(x_in)
+    out_count = None if direct else torch.full_like(x_in, 1e-37)
+
+    out_uncond = None if direct else (torch.zeros_like(x_in) if uncond is not None or materialize_uncond else None)
+    out_uncond_count = torch.full_like(x_in, 1e-37) if uncond is not None and not direct else None
 
     COND = 0
     UNCOND = 1
 
     to_run = []
+    area_kwargs = {"direct_full_area": True} if direct else {}
     for x in cond:
-        p = get_area_and_mult(x, x_in, timestep, condition_cache)
+        p = get_area_and_mult(x, x_in, timestep, condition_cache, **area_kwargs)
         if p is None:
             continue
 
         to_run += [(p, COND)]
     if uncond is not None:
         for x in uncond:
-            p = get_area_and_mult(x, x_in, timestep, condition_cache)
+            p = get_area_and_mult(x, x_in, timestep, condition_cache, **area_kwargs)
             if p is None:
                 continue
 
@@ -430,6 +470,15 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
                     output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
         del input_x
 
+        if direct:
+            for index, kind in enumerate(cond_or_uncond):
+                prediction = output[index].to(dtype=x_in.dtype)
+                if kind == COND:
+                    out_cond = prediction
+                else:
+                    out_uncond = prediction
+            continue
+
         rows = slice(None) if batch_indices is None else batch_indices
         for o in range(batch_chunks):
             if cond_or_uncond[o] == COND:
@@ -440,6 +489,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options, c
                 out_uncond_count[rows, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
         del mult
 
+    if direct:
+        return out_cond, out_uncond
     out_cond /= out_count
     del out_count
     if out_uncond_count is not None:
@@ -477,7 +528,14 @@ def calc_single_condition(model, cond, x, timestep, model_options, condition_cac
         name: value.process_cond(batch_size=x.shape[0], device=x.device, area=area, cache=condition_cache)
         for name, value in item["model_conds"].items()
     }
-    c = cond_cat([conditioning])
+    if _native_full_area_cfg(model, x, model_options, condition_cache):
+        # The audited native KModel forwards these fields read-only; keep
+        # custom condition subclasses and other inputs on their concat path.
+        c = {name: value.cond if name in ("c_crossattn", "y", "guidance")
+             and type(value) in (Condition, ConditionCrossAttn) else value.concat([])
+             for name, value in conditioning.items()}
+    else:
+        c = cond_cat([conditioning])
     transformer_options = model_options.get("transformer_options", {}).copy()
     transformer_options["cond_or_uncond"] = [0]
     transformer_options["sigmas"] = timestep

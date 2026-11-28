@@ -213,7 +213,8 @@ class CFGDenoiser(torch.nn.Module):
         cfg_after_cfg_callback(after_cfg_callback_params)
         denoised = after_cfg_callback_params.x
 
-        sd_samplers_common.store_latent(denoised.detach().clone())
+        with record_region("forge::preview_snapshot"):
+            sd_samplers_common.store_latent(denoised.detach().clone())
 
         self.step += 1
 
